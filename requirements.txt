@@ -1,0 +1,7 @@
+runpod
+boto3
+TTS
+torch
+torchaudio
+requests
+openai
