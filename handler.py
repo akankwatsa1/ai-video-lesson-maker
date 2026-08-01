@@ -1,4 +1,7 @@
-import os
+﻿import os
+
+# Auto-agree to Coqui TTS Terms of Service to prevent interactive prompt crash
+os.environ['COQUI_TOS_AGREED'] = '1'
 import json
 import runpod
 import torch
@@ -60,7 +63,7 @@ def create_presentation_slide_file(slide_notes, output_sub_path):
     
     formatted_bullets = ""
     for note in slide_notes:
-        formatted_bullets += f"• {note}\\N"
+        formatted_bullets += f"â€¢ {note}\\N"
         
     event_line = f"Dialogue: 0,0:00:00.00,0:00:30.00,SlideStyle,,0,0,0,,{formatted_bullets}\n"
     
@@ -161,3 +164,4 @@ def handler(job):
     }
 
 runpod.serverless.start({"handler": handler})
+
