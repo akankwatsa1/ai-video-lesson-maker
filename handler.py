@@ -1,8 +1,4 @@
 ﻿import os
-
-# Auto-agree to Coqui TTS Terms of Service to prevent interactive prompt crash
-os.environ['COQUI_TOS_AGREED'] = '1'
-
 import json
 import runpod
 import torch
@@ -10,9 +6,10 @@ import requests
 import subprocess
 import boto3
 import time
-from TTS.api import TTS
+import soundfile as sf
+from qwen_tts import Qwen3TTSModel
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
+device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
 R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY")
 R2_SECRET_KEY = os.getenv("R2_SECRET_KEY")
@@ -26,22 +23,33 @@ s3_client = boto3.client(
     aws_secret_access_key=R2_SECRET_KEY
 )
 
-print("Loading XTTS v2 Multilingual Voice Model...")
-tts = TTS("tts_models/multilingual/multi-dataset/xtts_v2").to(device)
+print(f"Loading Qwen3-TTS (1.7B Base) Multilingual Voice Model on {device}...")
+try:
+    tts_model = Qwen3TTSModel.from_pretrained(
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        device_map=device,
+        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
+    )
+except Exception as e:
+    print(f"Loading model with bfloat16 failed ({e}), retrying with standard precision...")
+    tts_model = Qwen3TTSModel.from_pretrained(
+        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
+        device_map=device
+    )
+
+print("Qwen3-TTS Model loaded successfully!")
 
 def download_file(url, target_path):
     if not url:
         return ""
     print(f"Attempting to download {url} to {target_path}...")
     
-    # Check if this URL is inside our R2 S3 bucket endpoint
     downloaded = False
     if R2_ENDPOINT_URL and (R2_ENDPOINT_URL in url or BUCKET_NAME in url):
         try:
-            # Extract object key after bucket name
             parts = url.split(f"{BUCKET_NAME}/", 1)
             if len(parts) == 2:
-                object_key = parts[1].split("?")[0] # strip query params if any
+                object_key = parts[1].split("?")[0]
                 print(f"Detected R2 S3 Object Key: '{object_key}'. Downloading via S3 client...")
                 s3_client.download_file(BUCKET_NAME, object_key, target_path)
                 downloaded = True
@@ -49,7 +57,6 @@ def download_file(url, target_path):
             print(f"S3 direct download failed: {s3_err}. Falling back to standard HTTP get...")
             downloaded = False
 
-    # Fallback to direct HTTP request
     if not downloaded:
         response = requests.get(url, stream=True)
         if response.status_code == 200:
@@ -92,7 +99,7 @@ def create_presentation_slide_file(slide_notes, output_sub_path):
     
     formatted_bullets = ""
     for note in slide_notes:
-        formatted_bullets += f"• {note}\\N"
+        formatted_bullets += f"  {note}\\N"
         
     event_line = f"Dialogue: 0,0:00:00.00,0:00:30.00,SlideStyle,,0,0,0,,{formatted_bullets}\n"
     
@@ -149,17 +156,25 @@ def handler(job):
         "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 35))
     })
     
-    ref_voice_path = ""
+    voice_ref_text = job_input.get('voice_ref_text', '').strip()
+    voice_clone_prompt = None
     if voice_ref_url:
         raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig")
         ref_voice_path = f"{workspace}/ref_voice.wav"
-        # Always convert reference audio (whether MP3, M4A, OGG, WAV) into pure 22050Hz 16-bit PCM WAV for Coqui XTTS
-        print("Normalizing reference audio to 22.05kHz 16-bit PCM WAV...")
+        print("Normalizing reference audio to 24kHz 16-bit PCM WAV for Qwen3-TTS...")
         subprocess.run([
             'ffmpeg', '-y', '-i', raw_voice_path,
-            '-ac', '1', '-ar', '22050', '-sample_fmt', 's16',
+            '-ac', '1', '-ar', '24000', '-sample_fmt', 's16',
             ref_voice_path
         ], check=True)
+        
+        print("Extracting speaker embeddings & creating reusable Qwen3-TTS voice clone prompt...")
+        use_x_vector = not bool(voice_ref_text)
+        voice_clone_prompt = tts_model.create_voice_clone_prompt(
+            ref_audio=ref_voice_path,
+            ref_text=voice_ref_text if voice_ref_text else "",
+            x_vector_only_mode=use_x_vector
+        )
         
     avatar_img_path = ""
     if output_format == 'video' and avatar_url:
@@ -187,17 +202,33 @@ def handler(job):
         
         output_wav = f"{workspace}/audio_{idx}.wav"
         
-        if language_mode == 'english_cloned' and ref_voice_path and os.path.exists(ref_voice_path):
-            tts.tts_to_file(text=text, speaker_wav=ref_voice_path, language="en", file_path=output_wav)
+        if language_mode == 'english_cloned' and voice_clone_prompt is not None:
+            wavs, sr = tts_model.generate_voice_clone(
+                text=text,
+                language="English",
+                voice_clone_prompt=voice_clone_prompt
+            )
+            audio_data = wavs[0]
+            if hasattr(audio_data, 'cpu'):
+                audio_data = audio_data.cpu().numpy()
+            sf.write(output_wav, audio_data, sr)
         elif language_mode == 'swahili' and sunbird_key:
             generate_sunbird_audio(text, output_wav, sunbird_key, language="sw")
         elif language_mode == 'luganda' and sunbird_key:
             generate_sunbird_audio(text, output_wav, sunbird_key, language="lg")
         else:
-            if ref_voice_path and os.path.exists(ref_voice_path):
-                tts.tts_to_file(text=text, speaker_wav=ref_voice_path, language="en", file_path=output_wav)
+            if voice_clone_prompt is not None:
+                wavs, sr = tts_model.generate_voice_clone(
+                    text=text,
+                    language="English",
+                    voice_clone_prompt=voice_clone_prompt
+                )
+                audio_data = wavs[0]
+                if hasattr(audio_data, 'cpu'):
+                    audio_data = audio_data.cpu().numpy()
+                sf.write(output_wav, audio_data, sr)
             else:
-                raise Exception("Missing valid voice reference sample for English cloned TTS or Sunbird credentials.")
+                raise Exception("Missing valid voice reference sample for Qwen3-TTS cloning or Sunbird API credentials.")
         
         if output_format == 'audio':
             clip_files.append(output_wav)
