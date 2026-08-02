@@ -1,4 +1,4 @@
-﻿import os
+import os
 import json
 import runpod
 import torch
@@ -236,7 +236,7 @@ def handler(job):
             
         # Video Rendering Mode
         teacher_raw_mp4 = f"{workspace}/teacher_raw_{idx}.mp4"
-        subprocess.run(f"ffmpeg -y -loop 1 -i {avatar_img_path} -i {output_wav} -c:v libx264 -tune stillimage -c:a copy -shortest {teacher_raw_mp4}", shell=True, check=True)
+        subprocess.run(f"ffmpeg -y -loop 1 -i {avatar_img_path} -i {output_wav} -c:v libx264 -tune stillimage -c:a aac -b:a 320k -ac 2 -shortest {teacher_raw_mp4}", shell=True, check=True)
 
         if flag == 'b_roll':
             broll_raw_mp4 = f"{workspace}/broll_raw_{idx}.mp4"
@@ -267,7 +267,7 @@ def handler(job):
             
     if output_format == 'audio':
         master_file = f"{workspace}/master_lesson.mp3"
-        subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -q:a 2 {master_file}", shell=True, check=True)
+        subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", shell=True, check=True)
         r2_key = f"outputs/{job_id}_master.mp3"
     else:
         master_file = f"{workspace}/master_lesson.mp4"
