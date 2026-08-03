@@ -286,12 +286,7 @@ def handler(job):
     except Exception as e:
         download_url = f"{R2_ENDPOINT_URL}/{BUCKET_NAME}/{r2_key}"
     
-    runpod.serverless.progress_update(job, {
-        "step": "Generation complete!",
-        "percent": 100,
-        "time_left_sec": 0
-    })
-    
+    print(f"Job completed successfully! Returning output with download_url: {download_url}")
     return {
         "status": "success",
         "type": output_format,
