@@ -1,4 +1,7 @@
 import os
+import re
+import shutil
+import uuid
 import json
 import runpod
 import torch
@@ -87,6 +90,96 @@ def generate_sunbird_audio(text, output_path, sunbird_key, language="sw"):
     else:
         raise Exception(f"Sunbird API failed with status {response.status_code}: {response.text}")
 
+def _synthesize_single_segment(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key):
+    if not text or not text.strip():
+        subprocess.run(f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=stereo:d=0.2 -c:a pcm_s16le {output_wav}", shell=True, check=True)
+        return
+
+    if language_mode == 'english_cloned' and voice_clone_prompt is not None:
+        wavs, sr = tts_model.generate_voice_clone(
+            text=text,
+            language="English",
+            voice_clone_prompt=voice_clone_prompt
+        )
+        audio_data = wavs[0]
+        if hasattr(audio_data, 'cpu'):
+            audio_data = audio_data.cpu().numpy()
+        sf.write(output_wav, audio_data, sr)
+    elif language_mode in ['swahili', 'luganda', 'east_african_english', 'sunbird_english'] and sunbird_key:
+        lang_code = {"swahili": "sw", "luganda": "lg", "east_african_english": "en", "sunbird_english": "en"}[language_mode]
+        generate_sunbird_audio(text, output_wav, sunbird_key, language=lang_code)
+    else:
+        if voice_clone_prompt is not None:
+            wavs, sr = tts_model.generate_voice_clone(
+                text=text,
+                language="English",
+                voice_clone_prompt=voice_clone_prompt
+            )
+            audio_data = wavs[0]
+            if hasattr(audio_data, 'cpu'):
+                audio_data = audio_data.cpu().numpy()
+            sf.write(output_wav, audio_data, sr)
+        elif sunbird_key and language_mode in ['east_african_english', 'sunbird_english']:
+            generate_sunbird_audio(text, output_wav, sunbird_key, language="en")
+        else:
+            raise Exception("Missing valid voice reference sample for Qwen3-TTS cloning or Sunbird AI credentials.")
+
+def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace):
+    parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', text, flags=re.IGNORECASE)
+    if len(parts) <= 1:
+        _synthesize_single_segment(text.strip(), output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+        return
+
+    temp_clips = []
+    for idx, part in enumerate(parts):
+        if idx % 2 == 1:
+            try:
+                duration = float(part)
+            except ValueError:
+                duration = 1.0
+            silence_wav = f"{workspace}/silence_{idx}_{uuid.uuid4().hex[:6]}.wav"
+            subprocess.run(f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=stereo:d={duration} -c:a pcm_s16le {silence_wav}", shell=True, check=True)
+            temp_clips.append(silence_wav)
+        else:
+            clean_text = part.strip()
+            if clean_text:
+                seg_wav = f"{workspace}/seg_{idx}_{uuid.uuid4().hex[:6]}.wav"
+                _synthesize_single_segment(clean_text, seg_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+                temp_clips.append(seg_wav)
+
+    if not temp_clips:
+        _synthesize_single_segment(".", output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+        return
+    elif len(temp_clips) == 1:
+        shutil.copyfile(temp_clips[0], output_wav)
+        return
+
+    seg_list = f"{workspace}/seg_concat_{uuid.uuid4().hex[:6]}.txt"
+    with open(seg_list, "w") as f:
+        for c in temp_clips:
+            f.write(f"file '{c}'\n")
+    subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {seg_list} -c:a pcm_s16le {output_wav}", shell=True, check=True)
+
+def get_background_soundtrack(bg_preset, workspace):
+    if not bg_preset or bg_preset == 'none':
+        return None
+    asset_path = f"/app/assets/{bg_preset}.mp3"
+    if not os.path.exists(asset_path):
+        asset_path = f"assets/{bg_preset}.mp3"
+    if os.path.exists(asset_path):
+        return asset_path
+        
+    synth_bg = f"{workspace}/bg_synth_{bg_preset}.wav"
+    if bg_preset == 'lofi_study':
+        freqs = "0.05*sin(2*PI*174*t)+0.04*sin(2*PI*220*t)+0.03*sin(2*PI*261.63*t)"
+    elif bg_preset == 'african_acoustic':
+        freqs = "0.06*sin(2*PI*196*t)+0.05*sin(2*PI*246.94*t)+0.04*sin(2*PI*293.66*t)"
+    else:
+        freqs = "0.05*sin(2*PI*220*t)+0.04*sin(2*PI*277.18*t)+0.04*sin(2*PI*329.63*t)"
+    print(f"Generating ambient studio soundscape for mood '{bg_preset}'...")
+    subprocess.run(f"ffmpeg -y -f lavfi -i aevalsrc=\"{freqs}\":s=24000:d=600 -af \"lowpass=f=800,volume=0.25\" {synth_bg}", shell=True, check=True)
+    return synth_bg
+
 def create_presentation_slide_file(slide_notes, output_sub_path):
     ass_template = (
         "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
@@ -140,6 +233,7 @@ def handler(job):
     avatar_url = job_input.get('avatar_url')
     language_mode = job_input.get('language_mode')
     sunbird_key = job_input.get('sunbird_key')
+    bg_music = job_input.get('bg_music', 'none')
     output_format = job_input.get('output_format', 'video')
     
     job_id = job['id']
@@ -202,33 +296,7 @@ def handler(job):
         
         output_wav = f"{workspace}/audio_{idx}.wav"
         
-        if language_mode == 'english_cloned' and voice_clone_prompt is not None:
-            wavs, sr = tts_model.generate_voice_clone(
-                text=text,
-                language="English",
-                voice_clone_prompt=voice_clone_prompt
-            )
-            audio_data = wavs[0]
-            if hasattr(audio_data, 'cpu'):
-                audio_data = audio_data.cpu().numpy()
-            sf.write(output_wav, audio_data, sr)
-        elif language_mode == 'swahili' and sunbird_key:
-            generate_sunbird_audio(text, output_wav, sunbird_key, language="sw")
-        elif language_mode == 'luganda' and sunbird_key:
-            generate_sunbird_audio(text, output_wav, sunbird_key, language="lg")
-        else:
-            if voice_clone_prompt is not None:
-                wavs, sr = tts_model.generate_voice_clone(
-                    text=text,
-                    language="English",
-                    voice_clone_prompt=voice_clone_prompt
-                )
-                audio_data = wavs[0]
-                if hasattr(audio_data, 'cpu'):
-                    audio_data = audio_data.cpu().numpy()
-                sf.write(output_wav, audio_data, sr)
-            else:
-                raise Exception("Missing valid voice reference sample for Qwen3-TTS cloning or Sunbird API credentials.")
+        synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace)
         
         if output_format == 'audio':
             clip_files.append(output_wav)
@@ -265,13 +333,25 @@ def handler(job):
         for clip in clip_files:
             f.write(f"file '{clip}'\n")
             
+    bg_track = get_background_soundtrack(bg_music, workspace)
+
     if output_format == 'audio':
         master_file = f"{workspace}/master_lesson.mp3"
-        subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", shell=True, check=True)
+        if bg_track:
+            temp_voice = f"{workspace}/temp_voice.wav"
+            subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a pcm_s16le {temp_voice}", shell=True, check=True)
+            subprocess.run(f"ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex \"[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]\" -map \"[out]\" -c:a libmp3lame -b:a 320k -ac 2 {master_file}", shell=True, check=True)
+        else:
+            subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", shell=True, check=True)
         r2_key = f"outputs/{job_id}_master.mp3"
     else:
         master_file = f"{workspace}/master_lesson.mp4"
-        subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {master_file}", shell=True, check=True)
+        if bg_track:
+            temp_video = f"{workspace}/temp_video.mp4"
+            subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", shell=True, check=True)
+            subprocess.run(f"ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex \"[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]\" -map 0:v -map \"[out]\" -c:v copy -c:a aac -b:a 320k -ac 2 {master_file}", shell=True, check=True)
+        else:
+            subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {master_file}", shell=True, check=True)
         r2_key = f"outputs/{job_id}_master.mp4"
     
     print(f"Uploading {master_file} to R2 bucket {BUCKET_NAME} as {r2_key}...")
