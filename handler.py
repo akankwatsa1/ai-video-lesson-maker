@@ -124,10 +124,33 @@ def _synthesize_single_segment(text, output_wav, language_mode, tts_model, voice
         else:
             raise Exception("Missing valid voice reference sample for Qwen3-TTS cloning or Sunbird AI credentials.")
 
-def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace):
+def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace):
+    if not whisper_mode and abs(speed_val - 1.0) < 0.01 and abs(pitch_val - 1.0) < 0.01 and abs(volume_val - 1.0) < 0.01:
+        return
+    filters = []
+    if whisper_mode:
+        filters.append("highpass=f=300,treble=g=10:f=3000,compand=attacks=0:decays=0.1:points=-90/-90|-40/-30|-10/-20|0/-20:gain=5")
+    if abs(pitch_val - 1.0) >= 0.01:
+        new_rate = int(24000 * pitch_val)
+        tempo_comp = 1.0 / pitch_val
+        filters.append(f"asetrate={new_rate},atempo={tempo_comp:.4f},aresample=24000")
+    if abs(speed_val - 1.0) >= 0.01:
+        filters.append(f"atempo={speed_val:.4f}")
+    if abs(volume_val - 1.0) >= 0.01:
+        filters.append(f"volume={volume_val:.4f}")
+    if not filters:
+        return
+    filter_str = ",".join(filters)
+    mod_temp = f"{workspace}/mod_{uuid.uuid4().hex[:6]}.wav"
+    print(f"Applying vocal acoustic modulation ({filter_str}) to {audio_path}...")
+    subprocess.run(f"ffmpeg -y -i {audio_path} -af \"{filter_str}\" -c:a pcm_s16le {mod_temp}", shell=True, check=True)
+    shutil.copyfile(mod_temp, audio_path)
+
+def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace, whisper_mode=False, speed_val=1.0, pitch_val=1.0, volume_val=1.0):
     parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', text, flags=re.IGNORECASE)
     if len(parts) <= 1:
         _synthesize_single_segment(text.strip(), output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
         return
 
     temp_clips = []
@@ -159,6 +182,7 @@ def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_mode
         for c in temp_clips:
             f.write(f"file '{c}'\n")
     subprocess.run(f"ffmpeg -y -f concat -safe 0 -i {seg_list} -c:a pcm_s16le {output_wav}", shell=True, check=True)
+    apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
 
 def get_background_soundtrack(bg_preset, workspace):
     if not bg_preset or bg_preset == 'none':
@@ -234,6 +258,13 @@ def handler(job):
     language_mode = job_input.get('language_mode')
     sunbird_key = job_input.get('sunbird_key')
     bg_music = job_input.get('bg_music', 'none')
+    global_whisper = (job_input.get('whisper_mode', 'no') == 'yes')
+    try: global_speed = float(job_input.get('speaking_speed', 1.0))
+    except: global_speed = 1.0
+    try: global_pitch = float(job_input.get('voice_pitch', 1.0))
+    except: global_pitch = 1.0
+    try: global_volume = float(job_input.get('voice_volume', 1.0))
+    except: global_volume = 1.0
     output_format = job_input.get('output_format', 'video')
     
     job_id = job['id']
@@ -296,7 +327,13 @@ def handler(job):
         
         output_wav = f"{workspace}/audio_{idx}.wav"
         
-        synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace)
+        delivery = block.get('delivery_style', 'normal')
+        blk_whisper = True if delivery == 'whisper' else global_whisper
+        blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
+        synthesize_block_audio_with_pauses(
+            text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace,
+            whisper_mode=blk_whisper, speed_val=blk_speed, pitch_val=global_pitch, volume_val=global_volume
+        )
         
         if output_format == 'audio':
             clip_files.append(output_wav)
