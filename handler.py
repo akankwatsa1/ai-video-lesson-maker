@@ -8,6 +8,7 @@ import torch
 import requests
 import subprocess
 import boto3
+from botocore.config import Config
 import time
 import soundfile as sf
 from qwen_tts import Qwen3TTSModel
@@ -23,7 +24,9 @@ s3_client = boto3.client(
     's3',
     endpoint_url=R2_ENDPOINT_URL,
     aws_access_key_id=R2_ACCESS_KEY,
-    aws_secret_access_key=R2_SECRET_KEY
+    aws_secret_access_key=R2_SECRET_KEY,
+    region_name='auto',
+    config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
 )
 
 print(f"Loading Qwen3-TTS (1.7B Base) Multilingual Voice Model on {device}...")
@@ -77,16 +80,57 @@ def download_file(url, target_path):
 def generate_sunbird_audio(text, output_path, sunbird_key, language="sw"):
     headers = {
         "Authorization": f"Bearer {sunbird_key}",
-        "Content-Type": "application/json"
+        "Content-Type": "application/json",
+        "accept": "application/json"
     }
+    lang_map = {
+        "sw": ("swa", "salt_swa_0001"),
+        "lg": ("lug", "salt_lug_0001"),
+        "en": ("eng", "salt_eng_0001"),
+        "swahili": ("swa", "salt_swa_0001"),
+        "luganda": ("lug", "salt_lug_0001"),
+        "east_african_english": ("eng", "salt_eng_0001"),
+        "sunbird_english": ("eng", "salt_eng_0001")
+    }
+    iso_lang, voice_tag = lang_map.get(language, ("eng", "salt_eng_0001"))
     payload = {
         "text": text,
-        "language": language 
+        "model": "orpheus-3b-tts",
+        "voice": voice_tag,
+        "language": iso_lang
     }
-    response = requests.post("https://api.sunbird.ai/tasks/tts", json=payload, headers=headers)
+    response = requests.post("https://api.sunbird.ai/tasks/audio/speech", json=payload, headers=headers)
     if response.status_code == 200:
-        with open(output_path, 'wb') as f:
-            f.write(response.content)
+        content_type = response.headers.get("Content-Type", "")
+        if "application/json" in content_type:
+            data = response.json()
+            audio_url = None
+            if "output" in data and isinstance(data["output"], dict) and "audio_url" in data["output"]:
+                audio_url = data["output"]["audio_url"]
+            elif "audio_url" in data:
+                audio_url = data["audio_url"]
+            elif "url" in data:
+                audio_url = data["url"]
+            
+            if audio_url:
+                audio_resp = requests.get(audio_url)
+                if audio_resp.status_code == 200:
+                    with open(output_path, 'wb') as f:
+                        f.write(audio_resp.content)
+                    return
+                else:
+                    raise Exception(f"Failed to download Sunbird audio from signed URL: HTTP {audio_resp.status_code}")
+            elif "audio_content" in data or "base64" in data:
+                import base64
+                b64_str = data.get("audio_content") or data.get("base64")
+                with open(output_path, 'wb') as f:
+                    f.write(base64.b64decode(b64_str))
+                return
+            else:
+                raise Exception(f"Unexpected JSON format from Sunbird API: {data}")
+        else:
+            with open(output_path, 'wb') as f:
+                f.write(response.content)
     else:
         raise Exception(f"Sunbird API failed with status {response.status_code}: {response.text}")
 
