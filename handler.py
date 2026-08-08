@@ -385,7 +385,7 @@ def handler(job):
             
         # Video Rendering Mode
         teacher_raw_mp4 = f"{workspace}/teacher_raw_{idx}.mp4"
-        subprocess.run(f"ffmpeg -y -loop 1 -i {avatar_img_path} -i {output_wav} -c:v libx264 -tune stillimage -c:a aac -b:a 320k -ac 2 -shortest {teacher_raw_mp4}", shell=True, check=True)
+        subprocess.run(f"ffmpeg -y -loop 1 -i {avatar_img_path} -i {output_wav} -c:v libx264 -c:a aac -b:a 320k -ac 2 -shortest {teacher_raw_mp4}", shell=True, check=True)
 
         if flag == 'b_roll':
             broll_raw_mp4 = f"{workspace}/broll_raw_{idx}.mp4"
@@ -455,3 +455,5 @@ def handler(job):
     }
 
 runpod.serverless.start({"handler": handler})
+
+
