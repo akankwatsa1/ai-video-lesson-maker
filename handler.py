@@ -84,10 +84,10 @@ def generate_sunbird_audio(text, output_path, sunbird_key, language="sw"):
         "accept": "application/json"
     }
     lang_map = {
-        "sw": ("swa", "salt_swa_0001"),
+        "sw": ("swa", "waxal_swa_0006"),
         "lg": ("lug", "salt_lug_0001"),
         "en": ("eng", "salt_eng_0001"),
-        "swahili": ("swa", "salt_swa_0001"),
+        "swahili": ("swa", "waxal_swa_0006"),
         "luganda": ("lug", "salt_lug_0001"),
         "east_african_english": ("eng", "salt_eng_0001"),
         "sunbird_english": ("eng", "salt_eng_0001")
