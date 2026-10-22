@@ -1,13 +1,13 @@
-﻿FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies (ffmpeg for media processing, libsndfile1 for python soundfile)
+# Install system dependencies (ffmpeg + fonts for subtitle/slide rendering, libsndfile1 for python soundfile)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg libsndfile1 git wget build-essential && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fontconfig libsndfile1 git wget build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies from requirements.txt
