@@ -5,6 +5,7 @@ import shutil
 import uuid
 import json
 import asyncio
+import concurrent.futures
 import importlib.util
 import runpod
 import torch
@@ -239,14 +240,12 @@ async def _edge_tts_save_async(text, voice, out_mp3):
 
 def generate_edge_tts_audio(text, output_wav, edge_voice):
     raw_mp3 = f"{output_wav}.edge.mp3"
-    try:
+
+    def _run_edge_in_new_thread():
         asyncio.run(_edge_tts_save_async(text, edge_voice, raw_mp3))
-    except RuntimeError:
-        loop = asyncio.new_event_loop()
-        try:
-            loop.run_until_complete(_edge_tts_save_async(text, edge_voice, raw_mp3))
-        finally:
-            loop.close()
+
+    with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+        executor.submit(_run_edge_in_new_thread).result()
 
     normalize_audio_to_wav(raw_mp3, output_wav)
     if os.path.exists(raw_mp3):
@@ -513,11 +512,12 @@ def create_broll_cutaway_overlay(teacher_video, broll_video, output_path):
         '-i', teacher_video,
         '-i', broll_video,
         '-filter_complex',
-        "[1:v]setpts=PTS-STARTPTS[broll];[0:v][broll]overlay=enable='between(t,5,25)':x=0:y=0[outv]",
+        "[1:v]setpts=PTS-STARTPTS[broll];[0:v][broll]overlay=enable='between(t,5,25)':x=0:y=0:shortest=1[outv]",
         '-map', '[outv]',
         '-map', '0:a',
         '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
         '-c:a', 'copy',
+        '-shortest',
         output_path
     ]
     run_ffmpeg(cmd, desc="Create B-roll cutaway overlay")
