@@ -1,20 +1,31 @@
 import os
 import re
-import base64
+import gc
 import shutil
 import uuid
 import json
+import asyncio
+import importlib.util
 import runpod
 import torch
+import torchaudio
 import requests
 import subprocess
 import boto3
 from botocore.config import Config
 import time
 import soundfile as sf
-from qwen_tts import Qwen3TTSModel
+import edge_tts
+from transformers import AutoModel, AutoProcessor
+from omnivoice import OmniVoice
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
+
+if torch.cuda.is_available():
+    torch.backends.cuda.enable_cudnn_sdp(False)
+    torch.backends.cuda.enable_flash_sdp(True)
+    torch.backends.cuda.enable_mem_efficient_sdp(True)
+    torch.backends.cuda.enable_math_sdp(True)
 
 DEFAULT_R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 DEFAULT_R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
@@ -22,8 +33,111 @@ DEFAULT_R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "")
 DEFAULT_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "video-making")
 
 HTTP_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
 }
+
+# Global lazy-loaded model references (mutually exclusive in GPU VRAM)
+_OMNIVOICE_MODEL = None
+_MOSS_PROCESSOR = None
+_MOSS_MODEL = None
+
+MOSS_MODEL_ID = os.getenv("MOSS_MODEL_ID", "OpenMOSS-Team/MOSS-TTS-Local-Transformer-v1.5")
+
+# Complete list of supported Edge TTS English & Kiswahili neural voices (51 voices)
+VALID_EDGE_VOICES = {
+    # Kiswahili (Kenya & Tanzania)
+    "sw-KE-RafikiNeural", "sw-KE-ZuriNeural",
+    "sw-TZ-DaudiNeural", "sw-TZ-RehemaNeural",
+    # English - Africa (Kenya, Tanzania, Nigeria, South Africa)
+    "en-KE-AsiliaNeural", "en-KE-ChilembaNeural",
+    "en-TZ-ElimuNeural", "en-TZ-ImaniNeural",
+    "en-NG-AbeoNeural", "en-NG-EzinneNeural",
+    "en-ZA-LeahNeural", "en-ZA-LukeNeural",
+    # English - United States
+    "en-US-AriaNeural", "en-US-AndrewNeural", "en-US-AndrewMultilingualNeural",
+    "en-US-AvaNeural", "en-US-AvaMultilingualNeural", "en-US-BrianNeural",
+    "en-US-BrianMultilingualNeural", "en-US-ChristopherNeural", "en-US-EmmaNeural",
+    "en-US-EmmaMultilingualNeural", "en-US-EricNeural", "en-US-GuyNeural",
+    "en-US-JennyNeural", "en-US-MichelleNeural", "en-US-RogerNeural",
+    "en-US-SteffanNeural", "en-US-AnaNeural",
+    # English - United Kingdom
+    "en-GB-SoniaNeural", "en-GB-RyanNeural", "en-GB-LibbyNeural",
+    "en-GB-MaisieNeural", "en-GB-ThomasNeural",
+    # English - Australia, Canada, Ireland, India, NZ, Singapore, Philippines, HK
+    "en-AU-NatashaNeural", "en-AU-WilliamMultilingualNeural",
+    "en-CA-ClaraNeural", "en-CA-LiamNeural",
+    "en-IE-ConnorNeural", "en-IE-EmilyNeural",
+    "en-IN-NeerjaExpressiveNeural", "en-IN-NeerjaNeural", "en-IN-PrabhatNeural",
+    "en-NZ-MitchellNeural", "en-NZ-MollyNeural",
+    "en-SG-LunaNeural", "en-SG-WayneNeural",
+    "en-PH-JamesNeural", "en-PH-RosaNeural",
+    "en-HK-SamNeural", "en-HK-YanNeural",
+}
+
+def _free_gpu_memory():
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+def get_omnivoice_model():
+    global _OMNIVOICE_MODEL, _MOSS_PROCESSOR, _MOSS_MODEL
+    if _MOSS_MODEL is not None or _MOSS_PROCESSOR is not None:
+        print("Unloading MOSS-TTS from GPU memory before loading OmniVoice...")
+        _MOSS_MODEL = None
+        _MOSS_PROCESSOR = None
+        _free_gpu_memory()
+
+    if _OMNIVOICE_MODEL is None:
+        print(f"Loading OmniVoice (k2-fsa/OmniVoice) on {device}...")
+        dtype = torch.float16 if torch.cuda.is_available() else torch.float32
+        _OMNIVOICE_MODEL = OmniVoice.from_pretrained(
+            "k2-fsa/OmniVoice",
+            device_map=device,
+            dtype=dtype
+        )
+        print("OmniVoice loaded successfully!")
+    return _OMNIVOICE_MODEL
+
+def _resolve_attn_implementation(dtype):
+    if (
+        torch.cuda.is_available()
+        and importlib.util.find_spec("flash_attn") is not None
+        and dtype in {torch.float16, torch.bfloat16}
+    ):
+        major, _ = torch.cuda.get_device_capability()
+        if major >= 8:
+            return "flash_attention_2"
+    return "sdpa" if torch.cuda.is_available() else "eager"
+
+def get_moss_tts_engine():
+    global _OMNIVOICE_MODEL, _MOSS_PROCESSOR, _MOSS_MODEL
+    if _OMNIVOICE_MODEL is not None:
+        print("Unloading OmniVoice from GPU memory before loading MOSS-TTS...")
+        _OMNIVOICE_MODEL = None
+        _free_gpu_memory()
+
+    if _MOSS_MODEL is None or _MOSS_PROCESSOR is None:
+        print(f"Loading MOSS-TTS ({MOSS_MODEL_ID}) on {device}...")
+        moss_device = "cuda" if torch.cuda.is_available() else "cpu"
+        dtype = torch.bfloat16 if torch.cuda.is_available() else torch.float32
+        attn_impl = _resolve_attn_implementation(dtype)
+
+        _MOSS_PROCESSOR = AutoProcessor.from_pretrained(
+            MOSS_MODEL_ID,
+            trust_remote_code=True
+        )
+        if hasattr(_MOSS_PROCESSOR, "audio_tokenizer") and _MOSS_PROCESSOR.audio_tokenizer is not None:
+            _MOSS_PROCESSOR.audio_tokenizer = _MOSS_PROCESSOR.audio_tokenizer.to(moss_device)
+
+        _MOSS_MODEL = AutoModel.from_pretrained(
+            MOSS_MODEL_ID,
+            trust_remote_code=True,
+            attn_implementation=attn_impl,
+            dtype=dtype
+        ).to(moss_device)
+        _MOSS_MODEL.eval()
+        print("MOSS-TTS loaded successfully!")
+    return _MOSS_PROCESSOR, _MOSS_MODEL
 
 def build_s3_client(access_key, secret_key, endpoint_url):
     if not access_key or not secret_key or not endpoint_url:
@@ -44,22 +158,6 @@ def run_ffmpeg(cmd, desc="FFmpeg command"):
     except subprocess.CalledProcessError as e:
         err_tail = (e.stderr or e.stdout or str(e))[-1000:]
         raise Exception(f"{desc} failed (exit {e.returncode}): {err_tail}")
-
-print(f"Loading Qwen3-TTS (1.7B Base) Multilingual Voice Model on {device}...")
-try:
-    tts_model = Qwen3TTSModel.from_pretrained(
-        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        device_map=device,
-        dtype=torch.bfloat16 if torch.cuda.is_available() else torch.float32
-    )
-except Exception as e:
-    print(f"Loading model with bfloat16 failed ({e}), retrying with standard precision...")
-    tts_model = Qwen3TTSModel.from_pretrained(
-        "Qwen/Qwen3-TTS-12Hz-1.7B-Base",
-        device_map=device
-    )
-
-print("Qwen3-TTS Model loaded successfully!")
 
 def download_file(url, target_path, s3_client=None, r2_endpoint="", bucket_name="video-making"):
     if not url:
@@ -94,74 +192,146 @@ def download_file(url, target_path, s3_client=None, r2_endpoint="", bucket_name=
 
     return target_path
 
-def normalize_audio_to_wav(input_audio_path, output_wav_path):
-    run_ffmpeg([
-        'ffmpeg', '-y', '-i', input_audio_path,
-        '-ac', '1', '-ar', '24000', '-sample_fmt', 's16', '-c:a', 'pcm_s16le',
-        output_wav_path
-    ], desc="Audio normalization to 24kHz mono WAV")
+def normalize_audio_to_wav(input_audio_path, output_wav_path, max_duration_sec=None):
+    cmd = ['ffmpeg', '-y', '-i', input_audio_path]
+    if max_duration_sec:
+        cmd.extend(['-t', str(max_duration_sec)])
+    cmd.extend(['-ac', '1', '-ar', '24000', '-sample_fmt', 's16', '-c:a', 'pcm_s16le', output_wav_path])
+    run_ffmpeg(cmd, desc="Audio normalization to 24kHz mono WAV")
 
-def generate_sunbird_audio(text, output_path, sunbird_key, language="sw"):
-    headers = {
-        "Authorization": f"Bearer {sunbird_key}",
-        "Content-Type": "application/json",
-        "accept": "application/json",
-        "User-Agent": HTTP_HEADERS["User-Agent"]
-    }
-    lang_map = {
-        "sw": ("swa", "waxal_swa_0006"),
-        "lg": ("lug", "salt_lug_0001"),
-        "en": ("eng", "salt_eng_0001"),
-        "swahili": ("swa", "waxal_swa_0006"),
-        "luganda": ("lug", "salt_lug_0001"),
-        "east_african_english": ("eng", "salt_eng_0001"),
-        "sunbird_english": ("eng", "salt_eng_0001")
-    }
-    iso_lang, voice_tag = lang_map.get(language, ("eng", "salt_eng_0001"))
-    payload = {
-        "text": text,
-        "model": "orpheus-3b-tts",
-        "voice": voice_tag,
-        "language": iso_lang
-    }
-    raw_tmp = f"{output_path}.raw"
-    response = requests.post("https://api.sunbird.ai/tasks/audio/speech", json=payload, headers=headers, timeout=90)
-    if response.status_code == 200:
-        content_type = response.headers.get("Content-Type", "")
-        if "application/json" in content_type:
-            data = response.json()
-            audio_url = None
-            if "output" in data and isinstance(data["output"], dict) and "audio_url" in data["output"]:
-                audio_url = data["output"]["audio_url"]
-            elif "audio_url" in data:
-                audio_url = data["audio_url"]
-            elif "url" in data:
-                audio_url = data["url"]
+def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_edge_voice=None):
+    """
+    Maps language_mode into:
+      tts_engine: 'omnivoice' | 'moss_tts' | 'edge_tts'
+      target_lang: 'English' | 'Swahili'
+      edge_voice: Microsoft Edge TTS ShortName
+    """
+    mode = (language_mode or "omnivoice_en").strip().lower()
 
-            if audio_url:
-                audio_resp = requests.get(audio_url, headers=HTTP_HEADERS, timeout=60)
-                if audio_resp.status_code == 200:
-                    with open(raw_tmp, 'wb') as f:
-                        f.write(audio_resp.content)
-                else:
-                    raise Exception(f"Failed to download Sunbird audio from signed URL: HTTP {audio_resp.status_code}")
-            elif "audio_content" in data or "base64" in data:
-                b64_str = data.get("audio_content") or data.get("base64")
-                with open(raw_tmp, 'wb') as f:
-                    f.write(base64.b64decode(b64_str))
-            else:
-                raise Exception(f"Unexpected JSON format from Sunbird API: {data}")
-        else:
-            with open(raw_tmp, 'wb') as f:
-                f.write(response.content)
-
-        normalize_audio_to_wav(raw_tmp, output_path)
-        if os.path.exists(raw_tmp):
-            os.remove(raw_tmp)
+    if explicit_engine in ("omnivoice", "moss_tts", "edge_tts"):
+        engine = explicit_engine
+    elif mode.startswith("moss"):
+        engine = "moss_tts"
+    elif mode.startswith("edge") or mode in ("swahili", "east_african_english", "sunbird_english", "luganda"):
+        engine = "edge_tts"
     else:
-        raise Exception(f"Sunbird API failed with status {response.status_code}: {response.text}")
+        engine = "omnivoice"
 
-def _synthesize_single_segment(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key):
+    if "sw" in mode or "kiswahili" in mode:
+        target_lang = "Swahili"
+    else:
+        target_lang = "English"
+
+    edge_voice = (explicit_edge_voice or "").strip()
+    if edge_voice not in VALID_EDGE_VOICES:
+        if target_lang == "Swahili":
+            edge_voice = "sw-KE-RafikiNeural"
+        elif "east_african" in mode:
+            edge_voice = "en-KE-ChilembaNeural"
+        else:
+            edge_voice = "en-US-AriaNeural"
+
+    return engine, target_lang, edge_voice
+
+async def _edge_tts_save_async(text, voice, out_mp3):
+    communicate = edge_tts.Communicate(text, voice)
+    await communicate.save(out_mp3)
+
+def generate_edge_tts_audio(text, output_wav, edge_voice):
+    raw_mp3 = f"{output_wav}.edge.mp3"
+    try:
+        asyncio.run(_edge_tts_save_async(text, edge_voice, raw_mp3))
+    except RuntimeError:
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(_edge_tts_save_async(text, edge_voice, raw_mp3))
+        finally:
+            loop.close()
+
+    normalize_audio_to_wav(raw_mp3, output_wav)
+    if os.path.exists(raw_mp3):
+        os.remove(raw_mp3)
+
+def generate_omnivoice_audio(text, output_wav, voice_clone_prompt=None, ref_voice_path=None, voice_ref_text=""):
+    model = get_omnivoice_model()
+    raw_wav = f"{output_wav}.omni.wav"
+
+    kwargs = {"text": text}
+    if voice_clone_prompt is not None:
+        kwargs["voice_clone_prompt"] = voice_clone_prompt
+    elif ref_voice_path and os.path.exists(ref_voice_path):
+        kwargs["ref_audio"] = ref_voice_path
+        if voice_ref_text:
+            kwargs["ref_text"] = voice_ref_text
+
+    audio_list = model.generate(**kwargs)
+    audio_data = audio_list[0]
+    if hasattr(audio_data, "detach"):
+        audio_data = audio_data.detach().cpu().numpy()
+    sf.write(raw_wav, audio_data, 24000)
+    normalize_audio_to_wav(raw_wav, output_wav)
+    if os.path.exists(raw_wav):
+        os.remove(raw_wav)
+
+def generate_moss_tts_audio(text, output_wav, moss_ref_codes=None, ref_voice_path=None, target_lang="English"):
+    processor, model = get_moss_tts_engine()
+    moss_device = "cuda" if torch.cuda.is_available() else "cpu"
+    raw_wav = f"{output_wav}.moss.wav"
+
+    reference_arg = None
+    if moss_ref_codes is not None:
+        reference_arg = moss_ref_codes
+    elif ref_voice_path and os.path.exists(ref_voice_path):
+        reference_arg = [ref_voice_path]
+
+    user_msg = processor.build_user_message(
+        text=text,
+        reference=reference_arg,
+        language=target_lang
+    )
+    batch = processor([[user_msg]], mode="generation")
+    input_ids = batch["input_ids"].to(moss_device)
+    attention_mask = batch["attention_mask"].to(moss_device)
+
+    with torch.no_grad():
+        outputs = model.generate(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            max_new_tokens=4096
+        )
+
+    saved = False
+    for message in processor.decode(outputs):
+        if message is not None and getattr(message, "audio_codes_list", None):
+            audio = message.audio_codes_list[0]
+            if audio.ndim == 1:
+                audio = audio.unsqueeze(0)
+            torchaudio.save(
+                raw_wav,
+                audio.detach().cpu().to(torch.float32),
+                int(processor.model_config.sampling_rate)
+            )
+            saved = True
+            break
+
+    if not saved:
+        raise Exception("MOSS-TTS did not produce decoded audio tokens for segment.")
+
+    normalize_audio_to_wav(raw_wav, output_wav)
+    if os.path.exists(raw_wav):
+        os.remove(raw_wav)
+
+def _synthesize_single_segment(
+    text,
+    output_wav,
+    tts_engine,
+    target_lang,
+    edge_voice,
+    omnivoice_prompt=None,
+    moss_ref_codes=None,
+    ref_voice_path=None,
+    voice_ref_text=""
+):
     if not text or not text.strip():
         run_ffmpeg(
             f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono:d=0.2 -c:a pcm_s16le {output_wav}",
@@ -169,42 +339,24 @@ def _synthesize_single_segment(text, output_wav, language_mode, tts_model, voice
         )
         return
 
-    raw_wav = f"{output_wav}.qwen.wav"
-    if language_mode == 'english_cloned' and voice_clone_prompt is not None:
-        wavs, sr = tts_model.generate_voice_clone(
-            text=text,
-            language="English",
-            voice_clone_prompt=voice_clone_prompt
+    if tts_engine == "edge_tts":
+        generate_edge_tts_audio(text, output_wav, edge_voice)
+    elif tts_engine == "moss_tts":
+        generate_moss_tts_audio(
+            text,
+            output_wav,
+            moss_ref_codes=moss_ref_codes,
+            ref_voice_path=ref_voice_path,
+            target_lang=target_lang
         )
-        audio_data = wavs[0]
-        if hasattr(audio_data, 'cpu'):
-            audio_data = audio_data.cpu().numpy()
-        sf.write(raw_wav, audio_data, sr)
-        normalize_audio_to_wav(raw_wav, output_wav)
-        if os.path.exists(raw_wav):
-            os.remove(raw_wav)
-    elif language_mode in ['swahili', 'luganda', 'east_african_english', 'sunbird_english'] and sunbird_key:
-        lang_code = {"swahili": "sw", "luganda": "lg", "east_african_english": "en", "sunbird_english": "en"}[language_mode]
-        generate_sunbird_audio(text, output_wav, sunbird_key, language=lang_code)
     else:
-        if voice_clone_prompt is not None:
-            wavs, sr = tts_model.generate_voice_clone(
-                text=text,
-                language="English",
-                voice_clone_prompt=voice_clone_prompt
-            )
-            audio_data = wavs[0]
-            if hasattr(audio_data, 'cpu'):
-                audio_data = audio_data.cpu().numpy()
-            sf.write(raw_wav, audio_data, sr)
-            normalize_audio_to_wav(raw_wav, output_wav)
-            if os.path.exists(raw_wav):
-                os.remove(raw_wav)
-        elif sunbird_key and language_mode in ['east_african_english', 'sunbird_english', 'swahili', 'luganda']:
-            lang_code = {"swahili": "sw", "luganda": "lg", "east_african_english": "en", "sunbird_english": "en"}.get(language_mode, "en")
-            generate_sunbird_audio(text, output_wav, sunbird_key, language=lang_code)
-        else:
-            raise Exception("Missing valid voice reference sample for Qwen3-TTS cloning or Sunbird AI credentials.")
+        generate_omnivoice_audio(
+            text,
+            output_wav,
+            voice_clone_prompt=omnivoice_prompt,
+            ref_voice_path=ref_voice_path,
+            voice_ref_text=voice_ref_text
+        )
 
 def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace):
     if not whisper_mode and abs(speed_val - 1.0) < 0.01 and abs(pitch_val - 1.0) < 0.01 and abs(volume_val - 1.0) < 0.01:
@@ -226,15 +378,33 @@ def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volum
     mod_temp = f"{workspace}/mod_{uuid.uuid4().hex[:6]}.wav"
     print(f"Applying vocal acoustic modulation ({filter_str}) to {audio_path}...")
     run_ffmpeg(
-        f"ffmpeg -y -i {audio_path} -af \"{filter_str}\" -ac 1 -ar 24000 -c:a pcm_s16le {mod_temp}",
+        f'ffmpeg -y -i {audio_path} -af "{filter_str}" -ac 1 -ar 24000 -c:a pcm_s16le {mod_temp}',
         desc="Vocal modulation filter"
     )
     shutil.copyfile(mod_temp, audio_path)
 
-def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace, whisper_mode=False, speed_val=1.0, pitch_val=1.0, volume_val=1.0):
+def synthesize_block_audio_with_pauses(
+    text,
+    output_wav,
+    tts_engine,
+    target_lang,
+    edge_voice,
+    omnivoice_prompt,
+    moss_ref_codes,
+    ref_voice_path,
+    voice_ref_text,
+    workspace,
+    whisper_mode=False,
+    speed_val=1.0,
+    pitch_val=1.0,
+    volume_val=1.0
+):
     parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', text, flags=re.IGNORECASE)
     if len(parts) <= 1:
-        _synthesize_single_segment(text.strip(), output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+        _synthesize_single_segment(
+            text.strip(), output_wav, tts_engine, target_lang, edge_voice,
+            omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
+        )
         apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
         return
 
@@ -255,11 +425,17 @@ def synthesize_block_audio_with_pauses(text, output_wav, language_mode, tts_mode
             clean_text = part.strip()
             if clean_text:
                 seg_wav = f"{workspace}/seg_{idx}_{uuid.uuid4().hex[:6]}.wav"
-                _synthesize_single_segment(clean_text, seg_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+                _synthesize_single_segment(
+                    clean_text, seg_wav, tts_engine, target_lang, edge_voice,
+                    omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
+                )
                 temp_clips.append(seg_wav)
 
     if not temp_clips:
-        _synthesize_single_segment(".", output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key)
+        _synthesize_single_segment(
+            ".", output_wav, tts_engine, target_lang, edge_voice,
+            omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
+        )
         return
     elif len(temp_clips) == 1:
         shutil.copyfile(temp_clips[0], output_wav)
@@ -294,7 +470,7 @@ def get_background_soundtrack(bg_preset, workspace):
         freqs = "0.05*sin(2*PI*220*t)+0.04*sin(2*PI*277.18*t)+0.04*sin(2*PI*329.63*t)"
     print(f"Generating ambient studio soundscape for mood '{bg_preset}'...")
     run_ffmpeg(
-        f"ffmpeg -y -f lavfi -i aevalsrc=\"{freqs}\":s=24000:d=600 -af \"lowpass=f=800,volume=0.25\" {synth_bg}",
+        f'ffmpeg -y -f lavfi -i aevalsrc="{freqs}":s=24000:d=600 -af "lowpass=f=800,volume=0.25" {synth_bg}',
         desc="Background ambient soundtrack synthesis"
     )
     return synth_bg
@@ -370,8 +546,9 @@ def handler(job):
     timeline_data = job_input.get('timeline_data')
     voice_ref_url = job_input.get('voice_ref_url')
     avatar_url = job_input.get('avatar_url')
-    language_mode = job_input.get('language_mode', 'english_cloned')
-    sunbird_key = job_input.get('sunbird_key') or os.getenv("SUNBIRD_API_KEY", "")
+    language_mode = job_input.get('language_mode', 'omnivoice_en')
+    explicit_engine = job_input.get('tts_engine')
+    explicit_edge_voice = job_input.get('edge_voice')
     bg_music = job_input.get('bg_music', 'none')
     global_whisper = (job_input.get('whisper_mode', 'no') == 'yes')
     try: global_speed = float(job_input.get('speaking_speed', 1.0))
@@ -381,6 +558,13 @@ def handler(job):
     try: global_volume = float(job_input.get('voice_volume', 1.0))
     except: global_volume = 1.0
     output_format = job_input.get('output_format', 'video')
+
+    tts_engine, target_lang, edge_voice = resolve_engine_and_language(
+        language_mode,
+        explicit_engine=explicit_engine,
+        explicit_edge_voice=explicit_edge_voice
+    )
+    print(f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice}")
 
     # Resolve Cloudflare R2 credentials (prefer job_input from WordPress, fallback to container env vars)
     r2_access_key = (job_input.get('r2_access_key') or DEFAULT_R2_ACCESS_KEY or "").strip()
@@ -400,26 +584,44 @@ def handler(job):
         start_time = time.time()
 
         runpod.serverless.progress_update(job, {
-            "step": f"Downloading media assets & preparing {'audio' if output_format == 'audio' else 'video'} rendering...",
+            "step": f"Initializing {tts_engine.upper()} & preparing {'audio' if output_format == 'audio' else 'video'} assets...",
             "percent": 5,
-            "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 35))
+            "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 30))
         })
 
         voice_ref_text = job_input.get('voice_ref_text', '').strip()
-        voice_clone_prompt = None
-        if voice_ref_url:
-            raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig", s3_client, r2_endpoint, bucket_name)
-            ref_voice_path = f"{workspace}/ref_voice.wav"
-            print("Normalizing reference audio to 24kHz 16-bit PCM WAV for Qwen3-TTS...")
-            normalize_audio_to_wav(raw_voice_path, ref_voice_path)
+        ref_voice_path = None
+        omnivoice_prompt = None
+        moss_ref_codes = None
 
-            print("Extracting speaker embeddings & creating reusable Qwen3-TTS voice clone prompt...")
-            use_x_vector = not bool(voice_ref_text)
-            voice_clone_prompt = tts_model.create_voice_clone_prompt(
-                ref_audio=ref_voice_path,
-                ref_text=voice_ref_text if voice_ref_text else "",
-                x_vector_only_mode=use_x_vector
-            )
+        if tts_engine in ("omnivoice", "moss_tts"):
+            if voice_ref_url:
+                raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig", s3_client, r2_endpoint, bucket_name)
+                ref_voice_path = f"{workspace}/ref_voice.wav"
+                print("Normalizing reference audio to 24kHz 16-bit PCM WAV (trimmed to 12s max for optimal cloning)...")
+                normalize_audio_to_wav(raw_voice_path, ref_voice_path, max_duration_sec=12 if not voice_ref_text else None)
+
+                if tts_engine == "omnivoice":
+                    model = get_omnivoice_model()
+                    print("Creating reusable OmniVoice voice clone prompt...")
+                    try:
+                        if voice_ref_text:
+                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path, ref_text=voice_ref_text)
+                        else:
+                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path)
+                    except Exception as prompt_err:
+                        print(f"OmniVoice prompt pre-encoding note ({prompt_err}); will pass ref_audio directly during generation.")
+                        omnivoice_prompt = None
+                elif tts_engine == "moss_tts":
+                    processor, _ = get_moss_tts_engine()
+                    print("Encoding reference audio into reusable MOSS-TTS RVQ codes...")
+                    try:
+                        moss_ref_codes = processor.encode_audios_from_path([ref_voice_path])
+                    except Exception as moss_err:
+                        print(f"MOSS-TTS pre-encoding note ({moss_err}); will pass reference path directly.")
+                        moss_ref_codes = None
+            else:
+                print(f"No reference audio provided for {tts_engine}; using default/auto voice generation.")
 
         avatar_img_path = ""
         if output_format == 'video':
@@ -437,13 +639,13 @@ def handler(job):
             notes = block.get('slide_notes', [])
 
             elapsed = time.time() - start_time
-            sec_per_block = elapsed / idx_counter if idx_counter > 0 else (8.0 if output_format == 'audio' else 30.0)
+            sec_per_block = elapsed / idx_counter if idx_counter > 0 else (8.0 if output_format == 'audio' else 25.0)
             remaining_blocks = total_blocks - idx_counter
             time_left = max(5, int(remaining_blocks * sec_per_block))
             percent_done = int(10 + (idx_counter / max(1, total_blocks)) * 75)
 
             runpod.serverless.progress_update(job, {
-                "step": f"Rendering Block {idx_counter+1} of {total_blocks}: Generating {'voiceover audio' if output_format == 'audio' else 'voice & video animation'}...",
+                "step": f"Rendering Block {idx_counter+1} of {total_blocks} ({tts_engine.upper()}): Generating {'voiceover' if output_format == 'audio' else 'voice & video'}...",
                 "percent": percent_done,
                 "time_left_sec": time_left
             })
@@ -453,9 +655,22 @@ def handler(job):
             delivery = block.get('delivery_style', 'normal')
             blk_whisper = True if delivery == 'whisper' else global_whisper
             blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
+
             synthesize_block_audio_with_pauses(
-                text, output_wav, language_mode, tts_model, voice_clone_prompt, sunbird_key, workspace,
-                whisper_mode=blk_whisper, speed_val=blk_speed, pitch_val=global_pitch, volume_val=global_volume
+                text=text,
+                output_wav=output_wav,
+                tts_engine=tts_engine,
+                target_lang=target_lang,
+                edge_voice=edge_voice,
+                omnivoice_prompt=omnivoice_prompt,
+                moss_ref_codes=moss_ref_codes,
+                ref_voice_path=ref_voice_path,
+                voice_ref_text=voice_ref_text,
+                workspace=workspace,
+                whisper_mode=blk_whisper,
+                speed_val=blk_speed,
+                pitch_val=global_pitch,
+                volume_val=global_volume
             )
 
             if output_format == 'audio':
@@ -512,7 +727,7 @@ def handler(job):
             if bg_track:
                 temp_voice = f"{workspace}/temp_voice.wav"
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a pcm_s16le {temp_voice}", desc="Concat audio blocks")
-                run_ffmpeg(f"ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex \"[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]\" -map \"[out]\" -c:a libmp3lame -b:a 320k -ac 2 {master_file}", desc="Mix audio with background music")
+                run_ffmpeg(f'ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map "[out]" -c:a libmp3lame -b:a 320k -ac 2 {master_file}', desc="Mix audio with background music")
             else:
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", desc="Concat audio to MP3")
             r2_key = f"outputs/{job_id}_master.mp3"
@@ -522,7 +737,7 @@ def handler(job):
             if bg_track:
                 temp_video = f"{workspace}/temp_video.mp4"
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", desc="Concat video blocks")
-                run_ffmpeg(f"ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex \"[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]\" -map 0:v -map \"[out]\" -c:v copy -c:a aac -b:a 192k -ac 2 {master_file}", desc="Mix video with background music")
+                run_ffmpeg(f'ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map 0:v -map "[out]" -c:v copy -c:a aac -b:a 192k -ac 2 {master_file}', desc="Mix video with background music")
             else:
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {master_file}", desc="Concat video blocks to MP4")
             r2_key = f"outputs/{job_id}_master.mp4"

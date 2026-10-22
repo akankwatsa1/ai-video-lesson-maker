@@ -1,11 +1,11 @@
-FROM pytorch/pytorch:2.3.1-cuda12.1-cudnn8-runtime
+FROM pytorch/pytorch:2.6.0-cuda12.4-cudnn9-runtime
 
 ENV DEBIAN_FRONTEND=noninteractive
 ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies (ffmpeg + fonts for subtitle/slide rendering, libsndfile1 for python soundfile)
+# Install system dependencies (ffmpeg + fonts for subtitle/slide rendering, libsndfile1 for soundfile)
 RUN apt-get update && \
     apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fontconfig libsndfile1 git wget build-essential && \
     rm -rf /var/lib/apt/lists/*
@@ -15,8 +15,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download Qwen3-TTS 1.7B Base model weights during container build so jobs boot instantly
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('Qwen/Qwen3-TTS-12Hz-1.7B-Base')"
+# Pre-download OmniVoice (3.04 GB) during container build so jobs boot fast; MOSS-TTS loads on-demand when selected
+RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('k2-fsa/OmniVoice')"
 
 # Copy our serverless worker code
 COPY handler.py .
