@@ -1113,6 +1113,57 @@ def _render_bokeh_particles(canvas_bgr, f_idx, fps=24):
     return cv2.addWeighted(overlay, 0.12, canvas_bgr, 0.88, 0.0)
 
 
+class _PexelsVideoStream:
+    """
+    Streams frames from a downloaded Pexels HD .mp4 video clip, automatically
+    scaling/cropping to 1920x1080 (16:9) and looping seamlessly if the scene
+    exceeds the clip duration.
+    """
+    def __init__(self, video_path, target_w=1920, target_h=1080):
+        self.video_path = video_path
+        self.target_w = target_w
+        self.target_h = target_h
+        self.cap = None
+        if video_path and os.path.exists(video_path) and os.path.getsize(video_path) > 5000:
+            try:
+                cap = cv2.VideoCapture(video_path)
+                if cap.isOpened():
+                    self.cap = cap
+            except Exception as e:
+                print(f"Pexels VideoCapture warning for {video_path}: {e}")
+
+    def is_valid(self):
+        return self.cap is not None and self.cap.isOpened()
+
+    def read_frame(self):
+        if not self.is_valid():
+            return None
+        ret, frame = self.cap.read()
+        if not ret or frame is None:
+            self.cap.set(cv2.CAP_PROP_POS_FRAMES, 0)
+            ret, frame = self.cap.read()
+        if not ret or frame is None:
+            return None
+
+        ih, iw = frame.shape[:2]
+        if iw == self.target_w and ih == self.target_h:
+            return frame
+        scale = max(self.target_w / float(max(1, iw)), self.target_h / float(max(1, ih)))
+        nw, nh = int(iw * scale), int(ih * scale)
+        resized = cv2.resize(frame, (nw, nh), interpolation=cv2.INTER_LINEAR)
+        x0 = max(0, (nw - self.target_w) // 2)
+        y0 = max(0, (nh - self.target_h) // 2)
+        return resized[y0:y0 + self.target_h, x0:x0 + self.target_w].copy()
+
+    def close(self):
+        if self.cap is not None:
+            try:
+                self.cap.release()
+            except Exception:
+                pass
+            self.cap = None
+
+
 def render_dynamic_lesson_block(
     raw_avatar_path,
     audio_wav_path,
@@ -1121,6 +1172,7 @@ def render_dynamic_lesson_block(
     slide_title,
     slide_notes,
     cf_images,
+    pexels_video_clips=None,
     block_idx=0,
     total_blocks=1,
     block_start_sec=0.0,
@@ -1133,18 +1185,24 @@ def render_dynamic_lesson_block(
     """
     Rescales the 10-Minute Video Blueprint proportionally to ANY video duration (60s, 90s, 180s, 600s)
     and dynamically switches camera/visual modes every 6-8 seconds inside EVERY block:
-      - Scaled Intro Window [0 .. T_intro] & Scaled Outro Window [D - T_outro .. D]:
-        Full Lip-Synced Teacher Studio Shot (with right-side PowerPoint card & Cloudflare image)
+      - Scaled Intro Window & Scaled Outro Window:
+        Opens/closes with Full Lip-Synced Teacher Studio Shot + interchanges Pexels HD Video Clip & PowerPoint Slide
       - Middle Timeline (rescaled across every block):
         Interchanges:
           1. PowerPoint Slide Deck (Part 1) + Cloudflare Image #1 + Live Lip-Sync Teacher PiP
-          2. 30s-scaled B-Roll Video Motion Clip (Ken Burns 3D pan/zoom + cinema bokeh + Cloudflare Image #2 + PiP)
+          2. Pexels HD B-Roll Video Clip #1 (or 3D Motion Clip) + Key Note Overlay + Live Lip-Sync Teacher PiP
           3. PowerPoint Slide Deck (Part 2 - Full Summary) + Cloudflare Image #3 + Live Lip-Sync Teacher PiP
-          4. Lip-Synced Teacher Studio Check-in
+          4. Pexels HD B-Roll Video Clip #2 (or Lip-Synced Teacher Studio Check-in)
     """
-    img1 = cf_images[0] if len(cf_images) > 0 else None
-    img2 = cf_images[1] if len(cf_images) > 1 else img1
-    img3 = cf_images[2] if len(cf_images) > 2 else img2
+    img1 = cf_images[0] if cf_images and len(cf_images) > 0 else None
+    img2 = cf_images[1] if cf_images and len(cf_images) > 1 else img1
+    img3 = cf_images[2] if cf_images and len(cf_images) > 2 else img2
+
+    vid_clip_1 = pexels_video_clips[0] if pexels_video_clips and len(pexels_video_clips) > 0 else None
+    vid_clip_2 = pexels_video_clips[1] if pexels_video_clips and len(pexels_video_clips) > 1 else vid_clip_1
+
+    pexels_stream_1 = _PexelsVideoStream(vid_clip_1, 1920, 1080)
+    pexels_stream_2 = _PexelsVideoStream(vid_clip_2, 1920, 1080)
 
     # 1. Pre-compute talking presenter state (S3FD + Wav2Lip-GAN + Syllable Jaw + Eye Blink)
     talk_state = synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=fps, device=device)
@@ -1205,7 +1263,6 @@ def render_dynamic_lesson_block(
 
     # 3. Rescale the 10-minute (600s) blueprint to the actual total video duration D
     D = max(block_dur_sec, float(total_video_duration_sec))
-    # Intro & Outro Lip-Sync Teacher windows: 15% of total video each (min 8s, max 30s)
     t_intro_window = min(30.0, max(8.0, D * 0.15))
     t_outro_window = min(30.0, max(8.0, D * 0.15))
 
@@ -1214,15 +1271,26 @@ def render_dynamic_lesson_block(
         t_global = block_start_sec + t_local
         frac_local = t_local / max(1.0, block_dur_sec)
 
-        # Always show Full Studio Lip-Sync Teacher during the rescaled Intro and Outro windows
-        if t_global < t_intro_window or t_global > (D - t_outro_window):
-            # Even in a long 30s intro/outro, briefly flash the full-screen slide for 5s around 65% so it stays dynamic
-            if block_dur_sec >= 22.0 and 0.62 <= frac_local <= 0.80:
+        # First block (Intro): Open with Full Studio Lip-Sync Teacher, then showcase Pexels B-Roll & Slide cutaway
+        if block_idx == 0 or t_global < t_intro_window:
+            if frac_local < 0.56:
+                return "studio_lipsync"
+            elif frac_local < 0.78:
+                return "broll_1"
+            else:
                 return "slide_1"
-            return "studio_lipsync"
+
+        # Last block (Outro): Showcase Slide Summary + Pexels B-Roll, then close with Full Studio Lip-Sync Teacher
+        if block_idx == total_blocks - 1 or t_global > (D - t_outro_window):
+            if frac_local < 0.22:
+                return "slide_2"
+            elif frac_local < 0.44:
+                return "broll_1"
+            else:
+                return "studio_lipsync"
 
         if visual_blueprint == "90s_avatar":
-            # Extended Teacher Presence: 65% Studio Lip-Sync, 20% B-Roll Clip, 15% Full Slide
+            # Extended Teacher Presence: 65% Studio Lip-Sync, 20% Pexels B-Roll Clip, 15% Full Slide
             if frac_local < 0.45:
                 return "studio_lipsync"
             elif frac_local < 0.72:
@@ -1233,15 +1301,18 @@ def render_dynamic_lesson_block(
                 return "studio_lipsync"
 
         # Default Cost-Saving Dynamic Blueprint (rescaled for any duration):
-        # Every block dynamically cycles through Slide 1 -> B-Roll Motion Clip 1 -> Slide 2 -> B-Roll Motion Clip 2 / Studio Check-in
+        # Every middle block dynamically cycles through Slide 1 -> Pexels B-Roll Clip 1 -> Slide 2 -> Pexels B-Roll Clip 2 / Studio Check-in
         if frac_local < 0.28:
             return "slide_1"
         elif frac_local < 0.56:
             return "broll_1"
-        elif frac_local < 0.82:
+        elif frac_local < 0.80:
             return "slide_2"
         else:
-            return "broll_2" if (block_idx % 2 == 0) else "studio_lipsync"
+            return "broll_2" if (block_idx % 2 == 0 or pexels_stream_2.is_valid()) else "studio_lipsync"
+
+    # Cache last rendered broll frame in case crossfade queries the same frame index
+    last_broll_frame = {"broll_1": (-1, None), "broll_2": (-1, None)}
 
     def _render_single_mode_frame(mode_name, f_idx):
         pres_bgr = get_animated_presenter_frame(talk_state, f_idx)
@@ -1256,7 +1327,6 @@ def render_dynamic_lesson_block(
 
         elif mode_name in ("slide_1", "slide_2"):
             base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
-            # Dynamic zoom on the right-hand illustration card (x=1080..1840, y=192..904)
             ix1, iy1, ix2, iy2 = 1080, 192, 1840, 904
             iw, ih = ix2 - ix1, iy2 - iy1
             zoom = 1.0 + 0.06 * prog
@@ -1266,26 +1336,36 @@ def render_dynamic_lesson_block(
                 [0.0, zoom, (1.0 - zoom) * (ih * 0.5)]
             ])
             base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-            # Overlay live Lip-Synced Teacher PiP in top-right corner
             base = _overlay_pip_presenter(base, pres_bgr, pos="top_right")
             return base
 
         else:
-            # 'broll_1' or 'broll_2' - Full-Screen Dynamic B-Roll Motion Clip
+            # 'broll_1' or 'broll_2' - Real Pexels HD Video Clip (or 3D Ken-Burns Motion Clip fallback)
             is_second = (mode_name == "broll_2")
-            canvas = broll_canvas_2 if is_second else broll_canvas_1
             ov_bgr = broll_ov2_bgr if is_second else broll_ov1_bgr
             ov_a = broll_ov2_a if is_second else broll_ov1_a
+            p_stream = pexels_stream_2 if is_second else pexels_stream_1
 
-            zoom = (1.14 - 0.10 * prog) if is_second else (1.02 + 0.12 * prog)
-            tx = (22.0 * (1.0 - prog)) if is_second else (-24.0 * prog)
-            ty = (12.0 * (1.0 - prog)) if is_second else (-14.0 * prog)
-            M = np.float32([
-                [zoom, 0.0, (1.0 - zoom) * (W * 0.5) + tx],
-                [0.0, zoom, (1.0 - zoom) * (H * 0.5) + ty]
-            ])
-            moved = cv2.warpAffine(canvas, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-            moved = _render_bokeh_particles(moved, f_idx, fps=fps)
+            cached_idx, cached_img = last_broll_frame.get(mode_name, (-1, None))
+            if cached_idx == f_idx and cached_img is not None:
+                moved = cached_img
+            else:
+                pexels_bgr = p_stream.read_frame() if p_stream.is_valid() else None
+                if pexels_bgr is not None:
+                    moved = pexels_bgr
+                else:
+                    canvas = broll_canvas_2 if is_second else broll_canvas_1
+                    zoom = (1.14 - 0.10 * prog) if is_second else (1.02 + 0.12 * prog)
+                    tx = (22.0 * (1.0 - prog)) if is_second else (-24.0 * prog)
+                    ty = (12.0 * (1.0 - prog)) if is_second else (-14.0 * prog)
+                    M = np.float32([
+                        [zoom, 0.0, (1.0 - zoom) * (W * 0.5) + tx],
+                        [0.0, zoom, (1.0 - zoom) * (H * 0.5) + ty]
+                    ])
+                    moved = cv2.warpAffine(canvas, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+                    moved = _render_bokeh_particles(moved, f_idx, fps=fps)
+                last_broll_frame[mode_name] = (f_idx, moved)
+
             comp = (moved.astype(np.float32) * (1.0 - ov_a) + ov_bgr * ov_a).astype(np.uint8)
             comp = _overlay_pip_presenter(comp, pres_bgr, pos="bottom_right")
             return comp
@@ -1301,11 +1381,9 @@ def render_dynamic_lesson_block(
         curr_mode = modes[f_idx]
         frame_bgr = _render_single_mode_frame(curr_mode, f_idx)
 
-        # Smooth crossfade transition when switching scene modes
         if f_idx >= transition_len:
             prev_mode = modes[f_idx - transition_len]
             if prev_mode != curr_mode:
-                # Find how many frames since mode changed
                 steps_since = 0
                 for back in range(1, transition_len + 1):
                     if modes[f_idx - back] != curr_mode:
@@ -1319,6 +1397,8 @@ def render_dynamic_lesson_block(
         writer.write(frame_bgr)
 
     writer.release()
+    pexels_stream_1.close()
+    pexels_stream_2.close()
 
     mux_cmd = [
         "ffmpeg", "-y",
@@ -1358,3 +1438,36 @@ def render_lipsync_teacher_block(raw_avatar_path, audio_wav_path, output_mp4_pat
         device=device,
         run_ffmpeg_fn=run_ffmpeg_fn
     )
+
+
+def render_slides_block(lesson_title, slide_title, slide_notes, cf_image_1, cf_image_2, raw_avatar_path, audio_wav_path, output_mp4_path, block_idx=0, total_blocks=1, fps=24, run_ffmpeg_fn=None):
+    return render_dynamic_lesson_block(
+        raw_avatar_path=raw_avatar_path,
+        audio_wav_path=audio_wav_path,
+        output_mp4_path=output_mp4_path,
+        lesson_title=lesson_title,
+        slide_title=slide_title,
+        slide_notes=slide_notes,
+        cf_images=[cf_image_1, cf_image_2 or cf_image_1],
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+        fps=fps,
+        run_ffmpeg_fn=run_ffmpeg_fn
+    )
+
+
+def render_broll_motion_block(lesson_title, slide_title, slide_notes, cf_image_1, cf_image_2, raw_avatar_path, audio_wav_path, output_mp4_path, block_idx=0, total_blocks=1, fps=24, run_ffmpeg_fn=None):
+    return render_dynamic_lesson_block(
+        raw_avatar_path=raw_avatar_path,
+        audio_wav_path=audio_wav_path,
+        output_mp4_path=output_mp4_path,
+        lesson_title=lesson_title,
+        slide_title=slide_title,
+        slide_notes=slide_notes,
+        cf_images=[cf_image_1, cf_image_2 or cf_image_1],
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+        fps=fps,
+        run_ffmpeg_fn=run_ffmpeg_fn
+    )
+

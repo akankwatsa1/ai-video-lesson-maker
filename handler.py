@@ -44,6 +44,7 @@ DEFAULT_R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "")
 DEFAULT_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "video-making")
 DEFAULT_CF_AI_TOKEN = os.getenv("CF_AI_TOKEN", "")
 DEFAULT_CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+DEFAULT_PEXELS_API_KEY = os.getenv("PEXELS_API_KEY", "")
 
 
 HTTP_HEADERS = {
@@ -370,9 +371,51 @@ def _synthesize_single_segment(
             voice_ref_text=voice_ref_text
         )
 
+def boost_and_normalize_speech_wav(audio_path, volume_val=1.3):
+    """
+    Normalizes synthesized teacher speech to YouTube Broadcast Standard loudness
+    (-13.5 dBFS active speech RMS) and scales by the user's chosen Teacher Voice
+    Volume multiplier (volume_val) with a smooth soft-knee studio limiter so
+    speech is always loud, clear, warm, and free of digital clipping.
+    """
+    try:
+        audio_np, sr = sf.read(audio_path, dtype='float32')
+        if audio_np.ndim > 1:
+            audio_np = np.mean(audio_np, axis=1)
+        if len(audio_np) < 100:
+            return
+
+        # Remove DC offset
+        audio_np = audio_np - float(np.mean(audio_np))
+
+        # Measure RMS on active speech frames (ignoring silent pauses)
+        abs_a = np.abs(audio_np)
+        peak_orig = float(np.max(abs_a)) + 1e-7
+        active_mask = abs_a > max(0.006, peak_orig * 0.08)
+        if np.sum(active_mask) > 200:
+            active_rms = float(np.sqrt(np.mean(audio_np[active_mask] ** 2)))
+        else:
+            active_rms = float(np.sqrt(np.mean(audio_np ** 2)))
+
+        if active_rms < 1e-5:
+            return
+
+        # Base broadcast RMS at 100% (1.0x) is 0.22 (-13.1 dBFS), scaled by user's volume_val
+        vol_mult = float(max(0.25, min(3.0, volume_val)))
+        target_rms = 0.22 * vol_mult
+        gain = target_rms / active_rms
+        # Cap maximum raw gain boost to 18x (+25 dB) so silence noise floor isn't over-amplified
+        gain = min(18.0, gain)
+
+        boosted = audio_np * gain
+        # Smooth studio soft-knee saturation/limiter (prevents harsh clipping while preserving loud punch)
+        limited = 0.96 * np.tanh(boosted / 0.90)
+        sf.write(audio_path, limited.astype(np.float32), sr, subtype='PCM_16')
+    except Exception as norm_err:
+        print(f"Speech loudness normalization note ({norm_err})")
+
+
 def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace):
-    if not whisper_mode and abs(speed_val - 1.0) < 0.01 and abs(pitch_val - 1.0) < 0.01 and abs(volume_val - 1.0) < 0.01:
-        return
     filters = []
     if whisper_mode:
         filters.append("highpass=f=300,treble=g=10:f=3000,compand=attacks=0:decays=0.1:points=-90/-90|-40/-30|-10/-20|0/-20:gain=5")
@@ -382,18 +425,20 @@ def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volum
         filters.append(f"asetrate={new_rate},atempo={tempo_comp:.4f},aresample=24000")
     if abs(speed_val - 1.0) >= 0.01:
         filters.append(f"atempo={speed_val:.4f}")
-    if abs(volume_val - 1.0) >= 0.01:
-        filters.append(f"volume={volume_val:.4f}")
-    if not filters:
-        return
-    filter_str = ",".join(filters)
-    mod_temp = f"{workspace}/mod_{uuid.uuid4().hex[:6]}.wav"
-    print(f"Applying vocal acoustic modulation ({filter_str}) to {audio_path}...")
-    run_ffmpeg(
-        f'ffmpeg -y -i {audio_path} -af "{filter_str}" -ac 1 -ar 24000 -c:a pcm_s16le {mod_temp}',
-        desc="Vocal modulation filter"
-    )
-    shutil.copyfile(mod_temp, audio_path)
+
+    if filters:
+        filter_str = ",".join(filters)
+        mod_temp = f"{workspace}/mod_{uuid.uuid4().hex[:6]}.wav"
+        print(f"Applying vocal acoustic modulation ({filter_str}) to {audio_path}...")
+        run_ffmpeg(
+            f'ffmpeg -y -i {audio_path} -af "{filter_str}" -ac 1 -ar 24000 -c:a pcm_s16le {mod_temp}',
+            desc="Vocal modulation filter"
+        )
+        shutil.copyfile(mod_temp, audio_path)
+
+    # Always normalize teacher speech to broadcast loudness and apply user's Teacher Voice Volume
+    boost_and_normalize_speech_wav(audio_path, volume_val=volume_val)
+
 
 def synthesize_block_audio_with_pauses(
     text,
@@ -409,7 +454,7 @@ def synthesize_block_audio_with_pauses(
     whisper_mode=False,
     speed_val=1.0,
     pitch_val=1.0,
-    volume_val=1.0
+    volume_val=1.3
 ):
     parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', text, flags=re.IGNORECASE)
     if len(parts) <= 1:
@@ -469,7 +514,7 @@ def get_background_soundtrack(bg_preset, workspace):
     """
     Synthesizes a rich, musical polyphonic studio background track (chord progressions,
     plucked arpeggios, warm bassline, and gentle rhythm pulse) at a clearly audible
-    studio level (-15 dB RMS) so background music properly works across all lessons.
+    studio level (-13 dB RMS) so background music properly works across all lessons.
     """
     if not bg_preset or bg_preset == 'none':
         return None
@@ -483,37 +528,34 @@ def get_background_soundtrack(bg_preset, workspace):
     print(f"Synthesizing polyphonic musical soundtrack for mood '{bg_preset}'...")
 
     sr = 24000
-    duration_sec = 64.0  # Seamless 16-bar loop at 120 BPM (or 8-bar loop at 60 BPM)
+    duration_sec = 64.0
     n_samples = int(sr * duration_sec)
     t = np.linspace(0.0, duration_sec, n_samples, endpoint=False, dtype=np.float32)
 
     if bg_preset == 'lofi_study':
-        # Warm Rhodes Jazz progression: Fmaj7 -> Em7 -> Dm7 -> Cmaj7 (4s per chord)
         chords = [
             (174.61, [220.00, 261.63, 329.63, 392.00]),  # Fmaj7
             (164.81, [196.00, 246.94, 293.66, 392.00]),  # Em7
             (146.83, [174.61, 220.00, 261.63, 329.63]),  # Dm7
             (130.81, [196.00, 246.94, 261.63, 329.63]),  # Cmaj7
         ]
-        beat_hz = 1.5  # 90 BPM relaxed lo-fi pulse
+        beat_hz = 1.5
     elif bg_preset == 'african_acoustic':
-        # Uplifting African Acoustic / Kalimba & Guitar progression: G -> C -> D -> G
         chords = [
             (196.00, [246.94, 293.66, 392.00, 493.88]),  # G major
             (130.81, [196.00, 261.63, 329.63, 523.25]),  # C major add9
             (146.83, [220.00, 293.66, 369.99, 587.33]),  # D major
             (196.00, [246.94, 293.66, 392.00, 587.33]),  # G major
         ]
-        beat_hz = 2.0  # 120 BPM acoustic groove
+        beat_hz = 2.0
     else:
-        # 'corporate_tech' or default: Inspiring Ambient Pluck & Pad: Am -> F -> C -> G
         chords = [
             (110.00, [220.00, 261.63, 329.63, 440.00]),  # Am
             (87.31,  [174.61, 220.00, 261.63, 349.23]),  # F
             (130.81, [196.00, 261.63, 329.63, 523.25]),  # C
             (98.00,  [196.00, 246.94, 293.66, 392.00]),  # G
         ]
-        beat_hz = 1.75  # 105 BPM modern corporate pulse
+        beat_hz = 1.75
 
     mix = np.zeros(n_samples, dtype=np.float32)
     chord_len_sec = 4.0
@@ -529,11 +571,9 @@ def get_background_soundtrack(bg_preset, workspace):
         lt = np.linspace(0.0, chord_len_sec, seg_len, endpoint=False, dtype=np.float32)
         bass_f, notes = chords[c_idx % len(chords)]
 
-        # Smooth chord pad envelope
         pad_env = np.sin(np.pi * lt / chord_len_sec) ** 0.45
         chord_sig = 0.28 * np.sin(2.0 * np.pi * bass_f * lt) + 0.10 * np.sin(2.0 * np.pi * (bass_f * 2.0) * lt)
         for n_f in notes:
-            # Warm electric piano / acoustic harmonics (fundamental + 2nd + gentle 3rd harmonic)
             chord_sig += (
                 0.16 * np.sin(2.0 * np.pi * n_f * lt)
                 + 0.05 * np.sin(2.0 * np.pi * (n_f * 2.0) * lt)
@@ -541,7 +581,6 @@ def get_background_soundtrack(bg_preset, workspace):
             )
         chord_sig *= pad_env
 
-        # Melodic plucked arpeggio (8 notes per 4-second bar)
         arp_notes = notes + notes[::-1]
         note_dur = chord_len_sec / float(len(arp_notes))
         note_samps = int(note_dur * sr)
@@ -551,7 +590,6 @@ def get_background_soundtrack(bg_preset, workspace):
             if ae_i <= as_i:
                 continue
             nt = np.linspace(0.0, (ae_i - as_i) / float(sr), ae_i - as_i, endpoint=False, dtype=np.float32)
-            # Crisp pluck decay envelope
             pluck_env = np.exp(-nt * 6.5) * (1.0 - np.exp(-nt * 120.0))
             pluck_wave = (
                 0.24 * np.sin(2.0 * np.pi * a_freq * nt)
@@ -562,19 +600,74 @@ def get_background_soundtrack(bg_preset, workspace):
 
         mix[s_i:e_i] += chord_sig
 
-    # Add gentle soft kick/pulse beat so the track feels alive and rhythmic
     beat_phase = (t * beat_hz) % 1.0
     kick_env = np.exp(-beat_phase * 14.0)
     kick_freq = 55.0 + 65.0 * np.exp(-beat_phase * 28.0)
     kick_wave = 0.18 * np.sin(2.0 * np.pi * kick_freq * (beat_phase / beat_hz)) * kick_env
     mix += kick_wave
 
-    # Normalize to a clean, warm studio backing level (peak 0.55, ~ -13 dB RMS)
     peak = float(np.max(np.abs(mix))) + 1e-6
     mix = (mix / peak) * 0.55
 
     sf.write(synth_bg, mix, sr, subtype='PCM_16')
     return synth_bg
+
+
+def mix_voice_and_background_wav(voice_wav_path, bg_track_path, output_wav_path, bg_volume=0.25):
+    """
+    Mixes the Teacher's narration WAV and the Background Soundtrack WAV directly
+    in floating-point PCM without FFmpeg's amix 1/2 volume attenuation!
+    - Preserves 100% of the Teacher's boosted broadcast loudness.
+    - Scales the background music linearly by the user's bg_volume slider (0.0 .. 1.0).
+    - Applies gentle voice-activated ducking so the music never masks syllables.
+    """
+    voice_np, sr = sf.read(voice_wav_path, dtype='float32')
+    if voice_np.ndim > 1:
+        voice_np = np.mean(voice_np, axis=1)
+
+    if not bg_track_path or not os.path.exists(bg_track_path) or float(bg_volume) <= 0.001:
+        stereo = np.column_stack([voice_np, voice_np])
+        sf.write(output_wav_path, stereo, sr, subtype='PCM_16')
+        return output_wav_path
+
+    # Ensure bg_track is 24kHz mono WAV
+    bg_wav_norm = f"{output_wav_path}.bgnorm.wav"
+    normalize_audio_to_wav(bg_track_path, bg_wav_norm)
+    bg_np, _ = sf.read(bg_wav_norm, dtype='float32')
+    if os.path.exists(bg_wav_norm):
+        os.remove(bg_wav_norm)
+    if bg_np.ndim > 1:
+        bg_np = np.mean(bg_np, axis=1)
+
+    n_voice = len(voice_np)
+    if len(bg_np) < n_voice:
+        repeats = int(np.ceil(n_voice / float(max(1, len(bg_np)))))
+        bg_np = np.tile(bg_np, repeats)[:n_voice]
+    else:
+        bg_np = bg_np[:n_voice]
+
+    # Smooth 1.5s fade-in and 2.5s fade-out on the background music
+    fade_in = min(int(1.5 * sr), n_voice // 4)
+    fade_out = min(int(2.5 * sr), n_voice // 4)
+    if fade_in > 0:
+        bg_np[:fade_in] *= np.linspace(0.0, 1.0, fade_in, dtype=np.float32)
+    if fade_out > 0:
+        bg_np[-fade_out:] *= np.linspace(1.0, 0.0, fade_out, dtype=np.float32)
+
+    # Gentle sidechain ducking envelope: duck background music by 28% during active syllables
+    win = max(1, int(0.08 * sr))
+    voice_env = np.convolve(np.abs(voice_np), np.ones(win, dtype=np.float32) / float(win), mode='same')
+    duck_factor = 1.0 - 0.28 * np.clip(voice_env / 0.18, 0.0, 1.0)
+
+    # User's bg_volume slider (0.0 .. 1.0, default 0.25)
+    bg_gain = float(max(0.0, min(1.5, bg_volume))) * 0.52
+    mixed_mono = voice_np + (bg_np * bg_gain * duck_factor)
+
+    # Transparent studio ceiling limiter so combined peaks never clip
+    mixed_limited = 0.97 * np.tanh(mixed_mono / 0.94)
+    stereo = np.column_stack([mixed_limited, mixed_limited])
+    sf.write(output_wav_path, stereo.astype(np.float32), sr, subtype='PCM_16')
+    return output_wav_path
 
 
 def _extract_cf_account_id(explicit_account_id, r2_endpoint):
@@ -585,6 +678,132 @@ def _extract_cf_account_id(explicit_account_id, r2_endpoint):
         if m:
             return m.group(1)
     return ""
+
+
+def _extract_clean_search_keywords(raw_text, max_words=4):
+    stopwords = {
+        "the", "and", "for", "with", "from", "that", "this", "into", "your", "about",
+        "lesson", "key", "concept", "understanding", "introduction", "overview",
+        "clean", "educational", "illustration", "showing", "real", "world", "example",
+        "diagram", "visual", "part", "section", "module", "summary", "how", "what", "why",
+        "practical", "application", "case", "study"
+    }
+    words = re.findall(r'[A-Za-z]{3,}', str(raw_text or ""))
+    keywords = []
+    for w in words:
+        wl = w.lower()
+        if wl not in stopwords and wl not in [k.lower() for k in keywords]:
+            keywords.append(w)
+        if len(keywords) >= max_words:
+            break
+    return " ".join(keywords)
+
+
+def fetch_pexels_video_clips_for_block(
+    pexels_api_key,
+    pexels_query,
+    slide_title,
+    lesson_title,
+    notes,
+    workspace,
+    block_idx,
+    used_video_ids,
+    count=2
+):
+    """
+    Queries the Pexels Videos API (https://api.pexels.com/videos/search) for best-matching
+    HD 16:9 landscape video clips (.mp4) for the current lesson block.
+    Avoids reusing video IDs across blocks so every block has fresh, captivating footage.
+    """
+    if not pexels_api_key or not str(pexels_api_key).strip():
+        return []
+
+    headers = {
+        "Authorization": str(pexels_api_key).strip(),
+        "User-Agent": HTTP_HEADERS["User-Agent"]
+    }
+
+    note_kw = _extract_clean_search_keywords(notes[0] if notes else "", max_words=3)
+    candidate_queries = []
+    for raw_q in [
+        pexels_query,
+        f"{slide_title} {lesson_title}",
+        f"{slide_title} {note_kw}",
+        lesson_title,
+        slide_title,
+        "education science technology classroom"
+    ]:
+        cleaned = _extract_clean_search_keywords(raw_q, max_words=4)
+        if cleaned and cleaned.lower() not in [q.lower() for q in candidate_queries]:
+            candidate_queries.append(cleaned)
+
+    downloaded_paths = []
+    api_url = "https://api.pexels.com/videos/search"
+
+    for q in candidate_queries:
+        if len(downloaded_paths) >= count:
+            break
+        params = {
+            "query": q,
+            "orientation": "landscape",
+            "size": "medium",
+            "per_page": 12
+        }
+        try:
+            resp = requests.get(api_url, headers=headers, params=params, timeout=12)
+            if resp.status_code != 200:
+                print(f"Pexels Videos API HTTP {resp.status_code} for '{q}': {resp.text[:160]}")
+                continue
+            videos = (resp.json() or {}).get("videos") or []
+            for v in videos:
+                if len(downloaded_paths) >= count:
+                    break
+                vid_id = v.get("id")
+                if not vid_id or vid_id in used_video_ids:
+                    continue
+                dur = float(v.get("duration") or 0)
+                if dur < 3.0 or dur > 90.0:
+                    continue
+
+                video_files = v.get("video_files") or []
+                best_link = None
+                best_score = -1e9
+                for vf in video_files:
+                    link = vf.get("link") or ""
+                    ftype = (vf.get("file_type") or "").lower()
+                    vw = int(vf.get("width") or 0)
+                    vh = int(vf.get("height") or 0)
+                    if not link or ("mp4" not in ftype and ".mp4" not in link.lower()):
+                        continue
+                    if vw < vh or vw < 640:
+                        continue
+                    # Prefer 1280x720 or 1920x1080 HD for fast download and crisp 16:9 rendering
+                    score = -abs(vw - 1280)
+                    if 1280 <= vw <= 1920:
+                        score += 1000
+                    if score > best_score:
+                        best_score = score
+                        best_link = link
+
+                if not best_link:
+                    continue
+
+                out_mp4 = f"{workspace}/pexels_{block_idx}_{len(downloaded_paths) + 1}.mp4"
+                print(f"Downloading Pexels HD Video Clip (id={vid_id}, query='{q}') -> {out_mp4}...")
+                v_resp = requests.get(best_link, headers=HTTP_HEADERS, stream=True, timeout=25)
+                if v_resp.status_code == 200:
+                    with open(out_mp4, "wb") as f:
+                        for chunk in v_resp.iter_content(chunk_size=65536):
+                            if chunk:
+                                f.write(chunk)
+                    if os.path.exists(out_mp4) and os.path.getsize(out_mp4) > 15000:
+                        used_video_ids.add(vid_id)
+                        downloaded_paths.append(out_mp4)
+        except Exception as px_err:
+            print(f"Pexels video search note for '{q}': {px_err}")
+            continue
+
+    return downloaded_paths
 
 
 def _save_and_frame_image_bytes(img_bytes, output_png, title_text="", subtitle_text=""):
@@ -616,17 +835,53 @@ def _save_and_frame_image_bytes(img_bytes, output_png, title_text="", subtitle_t
         return False
 
 
+def _fetch_pexels_photo_illustration(prompt_text, title_text, lesson_title, pexels_api_key, output_png, variant=0):
+    """
+    Fetches a high-resolution 16:9 landscape photograph from the Pexels Photos API
+    when Pexels API Key is available.
+    """
+    if not pexels_api_key or not str(pexels_api_key).strip():
+        return None
+    headers = {
+        "Authorization": str(pexels_api_key).strip(),
+        "User-Agent": HTTP_HEADERS["User-Agent"]
+    }
+    for raw_q in [f"{title_text} {lesson_title}", prompt_text, lesson_title]:
+        q = _extract_clean_search_keywords(raw_q, max_words=4)
+        if not q:
+            continue
+        try:
+            r = requests.get(
+                "https://api.pexels.com/v1/search",
+                headers=headers,
+                params={"query": q, "orientation": "landscape", "per_page": 10},
+                timeout=10
+            )
+            if r.status_code != 200:
+                continue
+            photos = (r.json() or {}).get("photos") or []
+            if not photos:
+                continue
+            chosen = photos[variant % len(photos)]
+            src = (chosen.get("src") or {})
+            img_url = src.get("large2x") or src.get("large") or src.get("landscape") or src.get("original")
+            if not img_url:
+                continue
+            img_resp = requests.get(img_url, headers=HTTP_HEADERS, timeout=12)
+            if img_resp.status_code == 200 and len(img_resp.content) > 2000:
+                if _save_and_frame_image_bytes(img_resp.content, output_png, title_text=title_text):
+                    return output_png
+        except Exception as e:
+            print(f"Pexels photo search note: {e}")
+            continue
+    return None
+
+
 def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title, output_png, variant=0):
     """
     Fetches a real, high-resolution educational photograph or scientific diagram
     from Wikimedia Commons API (no API key required) matching the lesson topic.
     """
-    stopwords = {
-        "the", "and", "for", "with", "from", "that", "this", "into", "your", "about",
-        "lesson", "key", "concept", "understanding", "introduction", "overview",
-        "clean", "educational", "illustration", "showing", "real", "world", "example",
-        "diagram", "visual", "part", "section", "module", "summary", "how", "what", "why"
-    }
     combined_queries = [
         f"{title_text} {lesson_title}",
         f"{lesson_title}",
@@ -635,18 +890,10 @@ def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title,
 
     api_url = "https://commons.wikimedia.org/w/api.php"
     for raw_q in combined_queries:
-        words = re.findall(r'[A-Za-z]{3,}', str(raw_q))
-        keywords = []
-        for w in words:
-            wl = w.lower()
-            if wl not in stopwords and wl not in [k.lower() for k in keywords]:
-                keywords.append(w)
-            if len(keywords) >= 5:
-                break
-        if not keywords:
+        search_q = _extract_clean_search_keywords(raw_q, max_words=5)
+        if not search_q:
             continue
 
-        search_q = " ".join(keywords)
         params = {
             "action": "query",
             "generator": "search",
@@ -672,7 +919,6 @@ def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title,
             if not candidates:
                 continue
 
-            # Pick a distinct image based on variant index
             chosen_url = candidates[variant % len(candidates)]
             print(f"Downloading real educational visual from Wikimedia Commons for '{search_q}': {chosen_url}")
             img_resp = requests.get(chosen_url, headers=HTTP_HEADERS, timeout=12)
@@ -685,12 +931,13 @@ def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title,
     return None
 
 
-def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0, lesson_title=""):
+def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0, lesson_title="", pexels_api_key=""):
     """
-    3-Tier Contextual Image Generator:
+    4-Tier Contextual Image Generator:
       1. Cloudflare Workers AI Model Cascade (Flux-1-Schnell -> SDXL-Lightning -> SDXL-Base)
-      2. Real Wikimedia Commons High-Res Educational Photography/Diagrams (when CF token is not yet set or fails)
-      3. Procedural Multi-Node Studio Vector Infographic
+      2. Pexels High-Res Landscape Photography (when Pexels API Key is configured)
+      3. Real Wikimedia Commons High-Res Educational Photography/Diagrams (no API key needed)
+      4. Procedural Multi-Node Studio Vector Infographic
     """
     clean_prompt = str(prompt_text or title_text or "Educational lesson concept").strip()
     if cf_account_id and cf_api_token:
@@ -726,7 +973,20 @@ def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_
             except Exception as cf_err:
                 print(f"Cloudflare Workers AI ({model_slug}) note: {cf_err}")
 
-    # Tier 2: Real high-resolution educational photo/diagram from Wikimedia Commons
+    # Tier 2: Pexels High-Res Photography (if Pexels key is available)
+    if pexels_api_key:
+        px_path = _fetch_pexels_photo_illustration(
+            prompt_text=clean_prompt,
+            title_text=title_text,
+            lesson_title=lesson_title,
+            pexels_api_key=pexels_api_key,
+            output_png=output_png,
+            variant=variant
+        )
+        if px_path and os.path.exists(px_path):
+            return px_path
+
+    # Tier 3: Real high-resolution educational photo/diagram from Wikimedia Commons
     wm_path = _fetch_wikimedia_commons_illustration(
         prompt_text=clean_prompt,
         title_text=title_text,
@@ -737,7 +997,7 @@ def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_
     if wm_path and os.path.exists(wm_path):
         return wm_path
 
-    # Tier 3: Rich vector node diagram fallback
+    # Tier 4: Rich vector node diagram fallback
     return generate_fallback_illustration(clean_prompt, title_text, output_png, variant=variant)
 
 
@@ -777,7 +1037,6 @@ def _highlight_lyric_keywords_ass(safe_text, phrase_idx=0):
     if not words:
         return safe_text
 
-    # Pick up to 2 longest content words (>= 6 letters) to highlight in Gold or Cyan
     accent_color = "&H0038BDF8&" if (phrase_idx % 2 == 0) else "&H0000D4FF&"
     scored = []
     for idx, w in enumerate(words):
@@ -794,7 +1053,6 @@ def _highlight_lyric_keywords_ass(safe_text, phrase_idx=0):
         else:
             out_words.append(w)
 
-    # Wrap into 2 balanced lines if more than 6 words
     if len(out_words) > 6:
         mid = len(out_words) // 2
         return " ".join(out_words[:mid]) + "\\N" + " ".join(out_words[mid:])
@@ -834,7 +1092,6 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
             f.write(ass_header)
         return output_sub_path
 
-    # Cycle lyric position every 2 phrases: Bottom -> Right -> Top -> Left
     style_cycle = ["LyricBottom", "LyricRight", "LyricTop", "LyricLeft"]
 
     weights = [max(1, len(p)) for p in phrases]
@@ -891,13 +1148,15 @@ def handler(job):
     explicit_engine = job_input.get('tts_engine')
     explicit_edge_voice = job_input.get('edge_voice')
     bg_music = job_input.get('bg_music', 'none')
+    try: bg_volume = float(job_input.get('bg_volume', 0.25))
+    except: bg_volume = 0.25
     global_whisper = (job_input.get('whisper_mode', 'no') == 'yes')
     try: global_speed = float(job_input.get('speaking_speed', 1.0))
     except: global_speed = 1.0
     try: global_pitch = float(job_input.get('voice_pitch', 1.0))
     except: global_pitch = 1.0
-    try: global_volume = float(job_input.get('voice_volume', 1.0))
-    except: global_volume = 1.0
+    try: global_volume = float(job_input.get('voice_volume', 1.3))
+    except: global_volume = 1.3
     output_format = job_input.get('output_format', 'video')
 
     tts_engine, target_lang, edge_voice = resolve_engine_and_language(
@@ -905,9 +1164,12 @@ def handler(job):
         explicit_engine=explicit_engine,
         explicit_edge_voice=explicit_edge_voice
     )
-    print(f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | Blueprint: {visual_blueprint}")
+    print(
+        f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | "
+        f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | Blueprint: {visual_blueprint}"
+    )
 
-    # Resolve Cloudflare R2 & Workers AI credentials
+    # Resolve Cloudflare R2, Workers AI, and Pexels credentials
     r2_access_key = (job_input.get('r2_access_key') or DEFAULT_R2_ACCESS_KEY or "").strip()
     r2_secret_key = (job_input.get('r2_secret_key') or DEFAULT_R2_SECRET_KEY or "").strip()
     r2_endpoint = (job_input.get('r2_endpoint') or DEFAULT_R2_ENDPOINT_URL or "").strip().rstrip('/')
@@ -915,6 +1177,7 @@ def handler(job):
 
     cf_ai_token = (job_input.get('cf_ai_token') or DEFAULT_CF_AI_TOKEN or "").strip()
     cf_account_id = _extract_cf_account_id(job_input.get('cf_account_id') or DEFAULT_CF_ACCOUNT_ID, r2_endpoint)
+    pexels_api_key = (job_input.get('pexels_api_key') or DEFAULT_PEXELS_API_KEY or "").strip()
 
     s3_client = build_s3_client(r2_access_key, r2_secret_key, r2_endpoint)
     if not s3_client:
@@ -988,7 +1251,7 @@ def handler(job):
 
             percent_done = int(8 + (idx_counter / max(1, total_blocks)) * 32)
             runpod.serverless.progress_update(job, {
-                "step": f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} narration audio...",
+                "step": f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} narration audio ({int(global_volume*100)}% broadcast boost)...",
                 "percent": percent_done,
                 "time_left_sec": max(10, int((total_blocks - idx_counter) * (7 if output_format == 'audio' else 22)))
             })
@@ -1047,6 +1310,7 @@ def handler(job):
         # PASS 2: Render Dynamic Multi-Scene Video Blocks (or collect audio)
         # =====================================================================
         clip_files = []
+        used_pexels_video_ids = set()
         render_start_time = time.time()
 
         for item in synthesized_blocks:
@@ -1069,12 +1333,26 @@ def handler(job):
             percent_done = int(42 + (idx_counter / max(1, total_blocks)) * 46)
 
             runpod.serverless.progress_update(job, {
-                "step": f"Block {idx_counter+1}/{total_blocks}: Rendering Lip-Sync Teacher, Slides, B-Roll Clips & Visuals...",
+                "step": f"Block {idx_counter+1}/{total_blocks}: Fetching Pexels HD Video Clips, Cloudflare Visuals & Rendering Lip-Sync...",
                 "percent": percent_done,
                 "time_left_sec": time_left
             })
 
-            # Generate 3 distinct contextual visuals per block so Slides and B-Roll Clips never repeat the same image
+            # 1. Fetch best-matching HD landscape video clips from Pexels for this block
+            pexels_query = (block.get('pexels_query') or f"{slide_title} {lesson_title}").strip()
+            pexels_clips = fetch_pexels_video_clips_for_block(
+                pexels_api_key=pexels_api_key,
+                pexels_query=pexels_query,
+                slide_title=slide_title,
+                lesson_title=lesson_title,
+                notes=notes,
+                workspace=workspace,
+                block_idx=idx,
+                used_video_ids=used_pexels_video_ids,
+                count=2
+            )
+
+            # 2. Generate 3 distinct contextual visuals per block for PowerPoint Slides & Studio cards
             prompt_1 = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {notes[0] if notes else slide_title}").strip()
             prompt_2 = f"{lesson_title} - {slide_title} practical application: {notes[1] if len(notes) > 1 else slide_title}".strip()
             prompt_3 = f"{lesson_title} - {slide_title} real-world case study: {notes[2] if len(notes) > 2 else (notes[-1] if notes else slide_title)}".strip()
@@ -1086,7 +1364,8 @@ def handler(job):
                 cf_api_token=cf_ai_token,
                 output_png=f"{workspace}/cf_{idx}_1.png",
                 variant=idx_counter * 3,
-                lesson_title=lesson_title
+                lesson_title=lesson_title,
+                pexels_api_key=pexels_api_key
             )
             cf_img_2 = generate_cloudflare_ai_image(
                 prompt_text=prompt_2,
@@ -1095,7 +1374,8 @@ def handler(job):
                 cf_api_token=cf_ai_token,
                 output_png=f"{workspace}/cf_{idx}_2.png",
                 variant=idx_counter * 3 + 1,
-                lesson_title=lesson_title
+                lesson_title=lesson_title,
+                pexels_api_key=pexels_api_key
             )
             cf_img_3 = generate_cloudflare_ai_image(
                 prompt_text=prompt_3,
@@ -1104,7 +1384,8 @@ def handler(job):
                 cf_api_token=cf_ai_token,
                 output_png=f"{workspace}/cf_{idx}_3.png",
                 variant=idx_counter * 3 + 2,
-                lesson_title=lesson_title
+                lesson_title=lesson_title,
+                pexels_api_key=pexels_api_key
             )
 
             raw_block_mp4 = f"{workspace}/block_raw_{idx}.mp4"
@@ -1116,6 +1397,7 @@ def handler(job):
                 slide_title=slide_title,
                 slide_notes=notes,
                 cf_images=[cf_img_1, cf_img_2, cf_img_3],
+                pexels_video_clips=pexels_clips,
                 block_idx=idx_counter,
                 total_blocks=total_blocks,
                 block_start_sec=blk_start_sec,
@@ -1135,7 +1417,7 @@ def handler(job):
             clip_files.append(final_chunk)
 
         runpod.serverless.progress_update(job, {
-            "step": "Mixing studio soundtrack & uploading master media to Cloudflare R2...",
+            "step": "Mixing Teacher Voice & Background Soundtrack at custom volumes & uploading to Cloudflare R2...",
             "percent": 92,
             "time_left_sec": 12
         })
@@ -1147,30 +1429,38 @@ def handler(job):
 
         bg_track = get_background_soundtrack(bg_music, workspace)
 
+        # Build concatenated teacher voice WAV so we can mix without FFmpeg's amix volume halving
+        voice_concat_list = f"{workspace}/voice_concat.txt"
+        with open(voice_concat_list, "w") as f:
+            for item in synthesized_blocks:
+                f.write(f"file '{item['audio_wav']}'\n")
+        temp_voice_wav = f"{workspace}/temp_voice_master.wav"
+        run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {voice_concat_list} -c:a pcm_s16le {temp_voice_wav}", desc="Concat teacher voice WAV blocks")
+
+        mixed_master_wav = f"{workspace}/mixed_master.wav"
+        mix_voice_and_background_wav(
+            voice_wav_path=temp_voice_wav,
+            bg_track_path=bg_track,
+            output_wav_path=mixed_master_wav,
+            bg_volume=bg_volume
+        )
+
         if output_format == 'audio':
             master_file = f"{workspace}/master_lesson.mp3"
-            if bg_track:
-                temp_voice = f"{workspace}/temp_voice.wav"
-                run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a pcm_s16le {temp_voice}", desc="Concat audio blocks")
-                run_ffmpeg(
-                    f'ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex "[0:a]volume=1.15[v];[1:a]volume=0.35[bg];[v][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map "[out]" -c:a libmp3lame -b:a 320k -ac 2 {master_file}',
-                    desc="Mix audio with polyphonic background soundtrack"
-                )
-            else:
-                run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", desc="Concat audio to MP3")
+            run_ffmpeg(
+                f"ffmpeg -y -i {mixed_master_wav} -c:a libmp3lame -b:a 320k -ar 44100 -ac 2 {master_file}",
+                desc="Encode mixed master audio to 320kbps MP3"
+            )
             r2_key = f"outputs/{job_id}_master.mp3"
             content_type = "audio/mpeg"
         else:
             master_file = f"{workspace}/master_lesson.mp4"
-            if bg_track:
-                temp_video = f"{workspace}/temp_video.mp4"
-                run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", desc="Concat video blocks")
-                run_ffmpeg(
-                    f'ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex "[0:a]volume=1.15[v];[1:a]volume=0.35[bg];[v][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map 0:v -map "[out]" -c:v copy -c:a aac -b:a 192k -ac 2 {master_file}',
-                    desc="Mix video with polyphonic background soundtrack"
-                )
-            else:
-                run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {master_file}", desc="Concat video blocks to MP4")
+            temp_video = f"{workspace}/temp_video.mp4"
+            run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", desc="Concat video blocks")
+            run_ffmpeg(
+                f"ffmpeg -y -i {temp_video} -i {mixed_master_wav} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ar 44100 -ac 2 -shortest {master_file}",
+                desc="Mux video with non-attenuated broadcast master audio"
+            )
             r2_key = f"outputs/{job_id}_master.mp4"
             content_type = "video/mp4"
 
@@ -1202,3 +1492,4 @@ def handler(job):
         shutil.rmtree(workspace, ignore_errors=True)
 
 runpod.serverless.start({"handler": handler})
+
