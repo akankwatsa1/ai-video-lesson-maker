@@ -4,6 +4,7 @@ import gc
 import shutil
 import uuid
 import json
+import base64
 import asyncio
 import concurrent.futures
 import importlib.util
@@ -19,6 +20,12 @@ import soundfile as sf
 import edge_tts
 from transformers import AutoModel, AutoProcessor
 from omnivoice import OmniVoice
+from lipsync_engine import (
+    render_lipsync_teacher_block,
+    render_slides_block,
+    render_broll_motion_block,
+    generate_fallback_illustration,
+)
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -32,6 +39,9 @@ DEFAULT_R2_ACCESS_KEY = os.getenv("R2_ACCESS_KEY", "")
 DEFAULT_R2_SECRET_KEY = os.getenv("R2_SECRET_KEY", "")
 DEFAULT_R2_ENDPOINT_URL = os.getenv("R2_ENDPOINT_URL", "")
 DEFAULT_BUCKET_NAME = os.getenv("R2_BUCKET_NAME", "video-making")
+DEFAULT_CF_AI_TOKEN = os.getenv("CF_AI_TOKEN", "")
+DEFAULT_CF_ACCOUNT_ID = os.getenv("CF_ACCOUNT_ID", "")
+
 
 HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"
@@ -474,26 +484,141 @@ def get_background_soundtrack(bg_preset, workspace):
     )
     return synth_bg
 
-def create_presentation_slide_file(slide_notes, output_sub_path):
-    ass_template = (
-        "[Script Info]\nScriptType: v4.00+\nPlayResX: 1920\nPlayResY: 1080\n\n"
+def _extract_cf_account_id(explicit_account_id, r2_endpoint):
+    if explicit_account_id and str(explicit_account_id).strip():
+        return str(explicit_account_id).strip()
+    if r2_endpoint:
+        m = re.search(r'https?://([a-f0-9]{32})\.r2\.cloudflarestorage\.com', str(r2_endpoint), re.IGNORECASE)
+        if m:
+            return m.group(1)
+    return ""
+
+
+def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0):
+    """
+    Calls Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell) to generate
+    a contextual 16:9 illustration for the current lesson point.
+    Automatically falls back to a crisp procedural infographic card if the token is
+    not yet configured or if the API request fails.
+    """
+    clean_prompt = str(prompt_text or title_text or "Educational lesson concept").strip()
+    if cf_account_id and cf_api_token:
+        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+        headers = {
+            "Authorization": f"Bearer {cf_api_token}",
+            "Content-Type": "application/json"
+        }
+        full_prompt = (
+            f"Clean educational textbook illustration and professional visual diagram showing: {clean_prompt}. "
+            f"Lesson context: {title_text}. High resolution, vibrant studio colors, clear subject focus, no gibberish text, 16:9 widescreen."
+        )
+        try:
+            print(f"Generating Cloudflare Workers AI illustration for '{clean_prompt[:60]}...'")
+            resp = requests.post(url, headers=headers, json={"prompt": full_prompt, "steps": 4}, timeout=35)
+            if resp.status_code == 200:
+                ctype = resp.headers.get("Content-Type", "")
+                if "application/json" in ctype:
+                    payload = resp.json()
+                    b64_img = (payload.get("result") or {}).get("image")
+                    if b64_img:
+                        with open(output_png, "wb") as f:
+                            f.write(base64.b64decode(b64_img))
+                elif len(resp.content) > 1000:
+                    with open(output_png, "wb") as f:
+                        f.write(resp.content)
+
+                if os.path.exists(output_png) and os.path.getsize(output_png) > 500:
+                    return output_png
+            else:
+                print(f"Cloudflare Workers AI returned HTTP {resp.status_code}: {resp.text[:200]}")
+        except Exception as cf_err:
+            print(f"Cloudflare Workers AI request warning ({cf_err}); using studio infographic fallback.")
+
+    return generate_fallback_illustration(clean_prompt, title_text, output_png, variant=variant)
+
+
+def _format_ass_timestamp(seconds):
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = seconds % 60.0
+    return f"{h}:{m:02d}:{s:05.2f}"
+
+
+def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=9):
+    clean = re.sub(r'\[pause\s+[0-9\.]+\s*s?\]', ' ', str(spoken_text or ''), flags=re.IGNORECASE)
+    clean = re.sub(r'\s+', ' ', clean).strip()
+    if not clean:
+        return []
+
+    # First split on natural clause/sentence boundaries
+    raw_clauses = re.split(r'(?<=[\.\,\;\:\!\?])\s+', clean)
+    phrases = []
+    for clause in raw_clauses:
+        words = clause.split()
+        if not words:
+            continue
+        for i in range(0, len(words), max_words_per_phrase):
+            chunk = " ".join(words[i:i + max_words_per_phrase]).strip()
+            if chunk:
+                phrases.append(chunk)
+    return phrases
+
+
+def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path):
+    """
+    Generates phrase-by-phrase synchronized on-screen lyrics (.ass) positioned inside
+    the bottom lower-third lyric bar, timed proportionally to the exact audio duration.
+    """
+    try:
+        total_duration = max(1.0, float(sf.info(audio_wav_path).duration))
+    except Exception:
+        total_duration = 25.0
+
+    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=9)
+    ass_header = (
+        "[Script Info]\n"
+        "ScriptType: v4.00+\n"
+        "PlayResX: 1920\n"
+        "PlayResY: 1080\n\n"
         "[V4+ Styles]\n"
-        "Format: Name, Fontname, Fontsize, PrimaryColour, BackColour, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: SlideStyle,DejaVu Sans,42,&H00FFFFFF,&H80000000,1,3,6,100,100,50,1\n\n"
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
+        "Style: LyricStyle,DejaVu Sans,36,&H00FFFFFF,&H0038BDF8,&H000F172A,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,90,90,46,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    formatted_bullets = ""
-    for note in (slide_notes or []):
-        clean_note = str(note).replace("{", "(").replace("}", ")").replace("\n", " ").strip()
-        if clean_note:
-            formatted_bullets += f"• {clean_note}\\N"
+    if not phrases:
+        with open(output_sub_path, "w", encoding="utf-8") as f:
+            f.write(ass_header)
+        return output_sub_path
 
-    event_line = f"Dialogue: 0,0:00:00.00,0:05:00.00,SlideStyle,,0,0,0,,{formatted_bullets}\n"
+    weights = [max(1, len(p)) for p in phrases]
+    total_weight = float(sum(weights))
+
+    events = []
+    curr_t = 0.0
+    for idx, phrase in enumerate(phrases):
+        dur = total_duration * (weights[idx] / total_weight)
+        start_t = curr_t
+        end_t = total_duration if idx == len(phrases) - 1 else (curr_t + dur)
+        curr_t = end_t
+
+        safe_text = phrase.replace("{", "(").replace("}", ")").replace("\n", " ").strip()
+        # Wrap long phrase cleanly into 2 balanced lines if > 54 chars
+        if len(safe_text) > 54:
+            words = safe_text.split()
+            mid = len(words) // 2
+            safe_text = " ".join(words[:mid]) + "\\N" + " ".join(words[mid:])
+
+        events.append(
+            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},LyricStyle,,0,0,0,,{safe_text}\n"
+        )
 
     with open(output_sub_path, "w", encoding="utf-8") as f:
-        f.write(ass_template + event_line)
+        f.write(ass_header + "".join(events))
+    return output_sub_path
+
 
 def burn_presentation_slides(input_video, subtitle_file, final_output):
     cmd = [
@@ -504,46 +629,50 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
         '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
         final_output
     ]
-    run_ffmpeg(cmd, desc="Burn presentation slides")
+    run_ffmpeg(cmd, desc="Burn synchronized on-screen lyrics")
 
-def create_broll_cutaway_overlay(teacher_video, broll_video, output_path):
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', teacher_video,
-        '-i', broll_video,
-        '-filter_complex',
-        "[1:v]setpts=PTS-STARTPTS[broll];[0:v][broll]overlay=enable='between(t,5,25)':x=0:y=0:shortest=1[outv]",
-        '-map', '[outv]',
-        '-map', '0:a',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-        '-c:a', 'copy',
-        '-shortest',
-        output_path
-    ]
-    run_ffmpeg(cmd, desc="Create B-roll cutaway overlay")
 
-def prepare_avatar_frame(raw_avatar_path, target_avatar_path):
-    if raw_avatar_path and os.path.exists(raw_avatar_path) and os.path.getsize(raw_avatar_path) > 0:
-        run_ffmpeg([
-            'ffmpeg', '-y', '-i', raw_avatar_path,
-            '-vf', 'scale=1920:1080:force_original_aspect_ratio=decrease,pad=1920:1080:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,format=yuv420p',
-            '-frames:v', '1',
-            target_avatar_path
-        ], desc="Normalize avatar image to 1920x1080")
-    else:
-        print("No avatar image supplied or found; generating default 1920x1080 studio background frame...")
-        run_ffmpeg([
-            'ffmpeg', '-y', '-f', 'lavfi', '-i', 'color=c=#1e293b:s=1920x1080:d=1',
-            '-frames:v', '1',
-            target_avatar_path
-        ], desc="Generate default 1920x1080 background frame")
-    return target_avatar_path
+def resolve_block_scene_type(block, idx_counter, total_blocks, visual_blueprint="standard_30s"):
+    """
+    Determines the visual layout for a 30-second block:
+      - 'teacher_lipsync': AI Lip-Synced Teacher in Studio Frame + Right PowerPoint Card
+      - 'slides': Full-Screen PowerPoint Presentation Slide Deck + Interchanging AI Illustrations
+      - 'b_roll': Contextual 30s B-Roll Motion Clip (Ken Burns pan/zoom across 2 AI visuals)
+    """
+    raw_flag = (block.get("flag_type") or "teacher").strip().lower()
+    if raw_flag in ("teacher_lipsync", "slides", "b_roll"):
+        return raw_flag
+
+    # Automatic Cost-Saving Pacing Blueprint when legacy 'teacher' flag is present:
+    if idx_counter == 0 or idx_counter == total_blocks - 1:
+        return "teacher_lipsync"
+
+    if visual_blueprint == "90s_avatar":
+        # 90s Avatar per 120s (3 out of 4 blocks lip-synced teacher, 1 block B-roll/Slides)
+        if idx_counter % 4 == 2:
+            return "b_roll"
+        elif idx_counter % 4 == 1:
+            return "slides"
+        return "teacher_lipsync"
+
+    # Default 'standard_30s': First & Last 30s Lip-Sync Teacher; 30s B-Roll per 120s; rest PowerPoint Slides
+    if idx_counter % 4 == 2:
+        return "b_roll"
+    return "slides"
+
 
 def handler(job):
     job_input = job.get('input', {})
     job_id = job.get('id', str(uuid.uuid4()))
 
-    timeline_data = job_input.get('timeline_data')
+    timeline_data = job_input.get('timeline_data') or {}
+    lesson_title = (
+        job_input.get('lesson_title')
+        or timeline_data.get('lesson_title')
+        or "Interactive Video Lesson"
+    ).strip()
+    visual_blueprint = (job_input.get('visual_blueprint') or 'standard_30s').strip()
+
     voice_ref_url = job_input.get('voice_ref_url')
     avatar_url = job_input.get('avatar_url')
     language_mode = job_input.get('language_mode', 'omnivoice_en')
@@ -564,13 +693,16 @@ def handler(job):
         explicit_engine=explicit_engine,
         explicit_edge_voice=explicit_edge_voice
     )
-    print(f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice}")
+    print(f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | Blueprint: {visual_blueprint}")
 
-    # Resolve Cloudflare R2 credentials (prefer job_input from WordPress, fallback to container env vars)
+    # Resolve Cloudflare R2 & Workers AI credentials
     r2_access_key = (job_input.get('r2_access_key') or DEFAULT_R2_ACCESS_KEY or "").strip()
     r2_secret_key = (job_input.get('r2_secret_key') or DEFAULT_R2_SECRET_KEY or "").strip()
     r2_endpoint = (job_input.get('r2_endpoint') or DEFAULT_R2_ENDPOINT_URL or "").strip().rstrip('/')
     bucket_name = (job_input.get('r2_bucket') or DEFAULT_BUCKET_NAME or "video-making").strip()
+
+    cf_ai_token = (job_input.get('cf_ai_token') or DEFAULT_CF_AI_TOKEN or "").strip()
+    cf_account_id = _extract_cf_account_id(job_input.get('cf_account_id') or DEFAULT_CF_ACCOUNT_ID, r2_endpoint)
 
     s3_client = build_s3_client(r2_access_key, r2_secret_key, r2_endpoint)
     if not s3_client:
@@ -584,9 +716,9 @@ def handler(job):
         start_time = time.time()
 
         runpod.serverless.progress_update(job, {
-            "step": f"Initializing {tts_engine.upper()} & preparing {'audio' if output_format == 'audio' else 'video'} assets...",
+            "step": f"Initializing {tts_engine.upper()} & preparing {'audio' if output_format == 'audio' else 'Broadcast Studio'} assets...",
             "percent": 5,
-            "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 30))
+            "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 28))
         })
 
         voice_ref_text = job_input.get('voice_ref_text', '').strip()
@@ -623,20 +755,18 @@ def handler(job):
             else:
                 print(f"No reference audio provided for {tts_engine}; using default/auto voice generation.")
 
-        avatar_img_path = ""
-        if output_format == 'video':
-            raw_avatar = ""
-            if avatar_url:
-                raw_avatar = download_file(avatar_url, f"{workspace}/avatar_orig", s3_client, r2_endpoint, bucket_name)
-            avatar_img_path = prepare_avatar_frame(raw_avatar, f"{workspace}/avatar_1080p.jpg")
+        raw_avatar_path = ""
+        if output_format == 'video' and avatar_url:
+            raw_avatar_path = download_file(avatar_url, f"{workspace}/avatar_orig", s3_client, r2_endpoint, bucket_name)
 
         clip_files = []
 
         for idx_counter, block in enumerate(timeline_data['timeline']):
             idx = block.get('block_index', idx_counter)
             text = block.get('spoken_script', '')
-            flag = block.get('flag_type', 'teacher')
-            notes = block.get('slide_notes', [])
+            notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
+            slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
+            scene_type = resolve_block_scene_type(block, idx_counter, total_blocks, visual_blueprint=visual_blueprint)
 
             elapsed = time.time() - start_time
             sec_per_block = elapsed / idx_counter if idx_counter > 0 else (8.0 if output_format == 'audio' else 25.0)
@@ -645,7 +775,7 @@ def handler(job):
             percent_done = int(10 + (idx_counter / max(1, total_blocks)) * 75)
 
             runpod.serverless.progress_update(job, {
-                "step": f"Rendering Block {idx_counter+1} of {total_blocks} ({tts_engine.upper()}): Generating {'voiceover' if output_format == 'audio' else 'voice & video'}...",
+                "step": f"Block {idx_counter+1}/{total_blocks} ({scene_type.upper()}): Synthesizing {tts_engine.upper()} voice & studio visuals...",
                 "percent": percent_done,
                 "time_left_sec": time_left
             })
@@ -677,35 +807,104 @@ def handler(job):
                 clip_files.append(output_wav)
                 continue
 
-            # Video Rendering Mode (1920x1080 @ 24fps)
-            teacher_raw_mp4 = f"{workspace}/teacher_raw_{idx}.mp4"
-            run_ffmpeg([
-                'ffmpeg', '-y',
-                '-loop', '1', '-r', '24', '-i', avatar_img_path,
-                '-i', output_wav,
-                '-c:v', 'libx264', '-tune', 'stillimage', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
-                '-c:a', 'aac', '-b:a', '192k', '-ac', '2', '-ar', '44100',
-                '-shortest',
-                teacher_raw_mp4
-            ], desc=f"Compile teacher avatar video block {idx}")
+            # Generate contextual illustrations via Cloudflare Workers AI (or crisp infographic fallback)
+            base_prompt = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {'; '.join(notes[:2])}").strip()
+            second_prompt = f"{lesson_title} - {slide_title} real-world example: {'; '.join(notes[1:3] if len(notes) > 1 else notes)}".strip()
 
-            if flag == 'b_roll':
-                broll_raw_mp4 = f"{workspace}/broll_raw_{idx}.mp4"
-                run_ffmpeg(
-                    f"ffmpeg -y -f lavfi -i color=c=#1e3a8a:s=1920x1080:r=24:d=20 -c:v libx264 -preset veryfast -pix_fmt yuv420p {broll_raw_mp4}",
-                    desc=f"Generate B-roll background block {idx}"
+            cf_img_1 = generate_cloudflare_ai_image(
+                prompt_text=base_prompt,
+                title_text=slide_title,
+                cf_account_id=cf_account_id,
+                cf_api_token=cf_ai_token,
+                output_png=f"{workspace}/cf_{idx}_1.png",
+                variant=idx_counter * 2
+            )
+
+            raw_block_mp4 = f"{workspace}/block_raw_{idx}.mp4"
+
+            if scene_type == "teacher_lipsync":
+                # For short 1-2 block videos, include a mid-block full-screen PowerPoint slide cutaway on the last block
+                # so even a 1-minute test video showcases Lip-Sync Teacher + Full-Screen Slide + Synced Lyrics!
+                use_cutaway = (total_blocks <= 2 and idx_counter == total_blocks - 1)
+                cf_img_2 = None
+                if use_cutaway:
+                    cf_img_2 = generate_cloudflare_ai_image(
+                        prompt_text=second_prompt,
+                        title_text=slide_title,
+                        cf_account_id=cf_account_id,
+                        cf_api_token=cf_ai_token,
+                        output_png=f"{workspace}/cf_{idx}_2.png",
+                        variant=idx_counter * 2 + 1
+                    )
+                render_lipsync_teacher_block(
+                    raw_avatar_path=raw_avatar_path,
+                    audio_wav_path=output_wav,
+                    output_mp4_path=raw_block_mp4,
+                    lesson_title=lesson_title,
+                    slide_title=slide_title,
+                    slide_notes=notes,
+                    cf_image_path=cf_img_1,
+                    cf_image_2=cf_img_2,
+                    block_idx=idx_counter,
+                    total_blocks=total_blocks,
+                    fps=24,
+                    device=device,
+                    run_ffmpeg_fn=run_ffmpeg,
+                    include_mid_cutaway=use_cutaway
                 )
-                teacher_overlaid_mp4 = f"{workspace}/teacher_overlaid_{idx}.mp4"
-                create_broll_cutaway_overlay(teacher_raw_mp4, broll_raw_mp4, teacher_overlaid_mp4)
-                teacher_raw_mp4 = teacher_overlaid_mp4
-
-            if notes:
-                ass_path = f"{workspace}/slides_{idx}.ass"
-                create_presentation_slide_file(notes, ass_path)
-                final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
-                burn_presentation_slides(teacher_raw_mp4, ass_path, final_chunk)
+            elif scene_type == "b_roll":
+                cf_img_2 = generate_cloudflare_ai_image(
+                    prompt_text=second_prompt,
+                    title_text=slide_title,
+                    cf_account_id=cf_account_id,
+                    cf_api_token=cf_ai_token,
+                    output_png=f"{workspace}/cf_{idx}_2.png",
+                    variant=idx_counter * 2 + 1
+                )
+                render_broll_motion_block(
+                    lesson_title=lesson_title,
+                    slide_title=slide_title,
+                    slide_notes=notes,
+                    cf_image_1=cf_img_1,
+                    cf_image_2=cf_img_2,
+                    raw_avatar_path=raw_avatar_path,
+                    audio_wav_path=output_wav,
+                    output_mp4_path=raw_block_mp4,
+                    block_idx=idx_counter,
+                    total_blocks=total_blocks,
+                    fps=24,
+                    run_ffmpeg_fn=run_ffmpeg
+                )
             else:
-                final_chunk = teacher_raw_mp4
+                # 'slides' - Full-screen PowerPoint Slide Deck with 2 interchanging visuals & progressive bullets
+                cf_img_2 = generate_cloudflare_ai_image(
+                    prompt_text=second_prompt,
+                    title_text=slide_title,
+                    cf_account_id=cf_account_id,
+                    cf_api_token=cf_ai_token,
+                    output_png=f"{workspace}/cf_{idx}_2.png",
+                    variant=idx_counter * 2 + 1
+                )
+                render_slides_block(
+                    lesson_title=lesson_title,
+                    slide_title=slide_title,
+                    slide_notes=notes,
+                    cf_image_1=cf_img_1,
+                    cf_image_2=cf_img_2,
+                    raw_avatar_path=raw_avatar_path,
+                    audio_wav_path=output_wav,
+                    output_mp4_path=raw_block_mp4,
+                    block_idx=idx_counter,
+                    total_blocks=total_blocks,
+                    fps=24,
+                    run_ffmpeg_fn=run_ffmpeg
+                )
+
+            # Burn synchronized phrase-by-phrase on-screen lyrics at the bottom of the screen
+            lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
+            create_synced_lyrics_ass(text, output_wav, lyrics_ass)
+            final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
+            burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
 
             clip_files.append(final_chunk)
 

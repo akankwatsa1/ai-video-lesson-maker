@@ -14,3 +14,7 @@ safetensors
 tiktoken
 scipy
 pydub
+opencv-python-headless
+Pillow
+numpy
+

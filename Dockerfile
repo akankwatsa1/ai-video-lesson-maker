@@ -5,9 +5,9 @@ ENV PYTHONUNBUFFERED=1
 
 WORKDIR /app
 
-# Install system dependencies (ffmpeg + fonts for subtitle/slide rendering, libsndfile1 for soundfile)
+# Install system dependencies (ffmpeg + fonts for subtitle/slide rendering, libsndfile1 for soundfile, libgl1/libglib2.0-0 for OpenCV)
 RUN apt-get update && \
-    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fontconfig libsndfile1 git wget build-essential && \
+    apt-get install -y --no-install-recommends ffmpeg fonts-dejavu-core fontconfig libsndfile1 libgl1 libglib2.0-0 git wget build-essential && \
     rm -rf /var/lib/apt/lists/*
 
 # Install python dependencies from requirements.txt
@@ -15,11 +15,13 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir --upgrade pip setuptools wheel && \
     pip install --no-cache-dir -r requirements.txt
 
-# Pre-download OmniVoice (3.04 GB) during container build so jobs boot fast; MOSS-TTS loads on-demand when selected
-RUN python3 -c "from huggingface_hub import snapshot_download; snapshot_download('k2-fsa/OmniVoice')"
+# Pre-download OmniVoice (3.04 GB) & Wav2Lip-GAN (415 MB) during container build so jobs boot fast
+RUN python3 -c "from huggingface_hub import snapshot_download, hf_hub_download; snapshot_download('k2-fsa/OmniVoice'); hf_hub_download(repo_id='camenduru/Wav2Lip', filename='checkpoints/wav2lip_gan.pth', local_dir='/app')"
 
-# Copy our serverless worker code
+# Copy our serverless worker code and lip-sync / slide studio engine
+COPY lipsync_engine.py .
 COPY handler.py .
 
 # Explicitly use python3 to execute our RunPod worker handler
 ENTRYPOINT ["python3", "-u", "/app/handler.py"]
+
