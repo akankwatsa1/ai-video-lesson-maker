@@ -1130,6 +1130,50 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
     run_ffmpeg(cmd, desc="Burn synchronized on-screen lyrics")
 
 
+import threading
+
+
+def report_live_progress(job, s3_client, bucket_name, job_id, step, percent, time_left_sec=15, extra=None):
+    """
+    Dual-channel real-time progress reporter:
+      1. Calls runpod.serverless.progress_update(job, payload)
+      2. Asynchronously writes progress/{job_id}.json to Cloudflare R2 so WordPress
+         Frontend & Backend dashboards receive sub-second progress updates even if
+         RunPod's API gateway caches /status responses.
+    """
+    pct = max(5, min(100, int(percent)))
+    rem = max(0, int(time_left_sec))
+    payload = {
+        "step": str(step),
+        "percent": pct,
+        "time_left_sec": rem,
+        "updated_at": int(time.time())
+    }
+    if isinstance(extra, dict):
+        payload.update(extra)
+
+    print(f"[LIVE PROGRESS {pct}% | ~{rem}s left] {step}", flush=True)
+    try:
+        runpod.serverless.progress_update(job, payload)
+    except Exception as rp_err:
+        print(f"RunPod progress_update note: {rp_err}")
+
+    if s3_client and bucket_name and job_id:
+        def _push_r2():
+            try:
+                s3_client.put_object(
+                    Bucket=bucket_name,
+                    Key=f"progress/{job_id}.json",
+                    Body=json.dumps(payload).encode("utf-8"),
+                    ContentType="application/json"
+                )
+            except Exception as s3_err:
+                print(f"R2 progress push note: {s3_err}")
+
+        t = threading.Thread(target=_push_r2, daemon=True)
+        t.start()
+
+
 def handler(job):
     job_input = job.get('input', {})
     job_id = job.get('id', str(uuid.uuid4()))
@@ -1191,11 +1235,12 @@ def handler(job):
         total_blocks = max(1, len(blocks_list))
         start_time = time.time()
 
-        runpod.serverless.progress_update(job, {
-            "step": f"Initializing {tts_engine.upper()} & preparing {'audio' if output_format == 'audio' else 'Broadcast Studio'} assets...",
-            "percent": 5,
-            "time_left_sec": int(total_blocks * (8 if output_format == 'audio' else 28))
-        })
+        report_live_progress(
+            job, s3_client, bucket_name, job_id,
+            step=f"GPU Worker active: Initializing {tts_engine.upper()} & downloading reference media...",
+            percent=8,
+            time_left_sec=int(total_blocks * (8 if output_format == 'audio' else 26))
+        )
 
         voice_ref_text = job_input.get('voice_ref_text', '').strip()
         ref_voice_path = None
@@ -1208,6 +1253,13 @@ def handler(job):
                 ref_voice_path = f"{workspace}/ref_voice.wav"
                 print("Normalizing reference audio to 24kHz 16-bit PCM WAV (trimmed to 12s max for optimal cloning)...")
                 normalize_audio_to_wav(raw_voice_path, ref_voice_path, max_duration_sec=12 if not voice_ref_text else None)
+
+                report_live_progress(
+                    job, s3_client, bucket_name, job_id,
+                    step=f"Encoding Teacher Voice Clone Profile with {tts_engine.upper()}...",
+                    percent=11,
+                    time_left_sec=int(total_blocks * (7 if output_format == 'audio' else 24))
+                )
 
                 if tts_engine == "omnivoice":
                     model = get_omnivoice_model()
@@ -1242,6 +1294,7 @@ def handler(job):
         # =====================================================================
         synthesized_blocks = []
         total_video_duration_sec = 0.0
+        tts_phase_span = 76 if output_format == 'audio' else 28
 
         for idx_counter, block in enumerate(blocks_list):
             idx = block.get('block_index', idx_counter)
@@ -1249,12 +1302,13 @@ def handler(job):
             notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
             slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
 
-            percent_done = int(8 + (idx_counter / max(1, total_blocks)) * 32)
-            runpod.serverless.progress_update(job, {
-                "step": f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} narration audio ({int(global_volume*100)}% broadcast boost)...",
-                "percent": percent_done,
-                "time_left_sec": max(10, int((total_blocks - idx_counter) * (7 if output_format == 'audio' else 22)))
-            })
+            percent_start = int(12 + (idx_counter / max(1, total_blocks)) * tts_phase_span)
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step=f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} teacher narration ({int(global_volume*100)}% broadcast boost)...",
+                percent=percent_start,
+                time_left_sec=max(8, int((total_blocks - idx_counter) * (6 if output_format == 'audio' else 21)))
+            )
 
             output_wav = f"{workspace}/audio_{idx}.wav"
             delivery = block.get('delivery_style', 'normal')
@@ -1296,6 +1350,14 @@ def handler(job):
             })
             total_video_duration_sec += blk_dur
 
+            percent_after_tts = int(12 + ((idx_counter + 1) / max(1, total_blocks)) * tts_phase_span)
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step=f"Block {idx_counter+1}/{total_blocks}: Narration audio ready ({blk_dur:.1f}s)...",
+                percent=percent_after_tts,
+                time_left_sec=max(6, int((total_blocks - idx_counter) * (5 if output_format == 'audio' else 19)))
+            )
+
         print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
 
         # Free TTS models from GPU VRAM before video lip-sync rendering
@@ -1312,6 +1374,8 @@ def handler(job):
         clip_files = []
         used_pexels_video_ids = set()
         render_start_time = time.time()
+        vid_phase_start = 40
+        vid_phase_span = 50.0  # 40% -> 90%
 
         for item in synthesized_blocks:
             idx_counter = item["idx_counter"]
@@ -1328,15 +1392,18 @@ def handler(job):
                 continue
 
             elapsed_render = time.time() - render_start_time
-            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 16.0
-            time_left = max(8, int((total_blocks - idx_counter) * sec_per_vid_blk))
-            percent_done = int(42 + (idx_counter / max(1, total_blocks)) * 46)
+            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 18.0
+            time_left_blk = max(8, int((total_blocks - idx_counter) * sec_per_vid_blk))
 
-            runpod.serverless.progress_update(job, {
-                "step": f"Block {idx_counter+1}/{total_blocks}: Fetching Pexels HD Video Clips, Cloudflare Visuals & Rendering Lip-Sync...",
-                "percent": percent_done,
-                "time_left_sec": time_left
-            })
+            blk_base_pct = vid_phase_start + (idx_counter / float(max(1, total_blocks))) * vid_phase_span
+            blk_span_pct = vid_phase_span / float(max(1, total_blocks))
+
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step=f"Block {idx_counter+1}/{total_blocks}: Searching & downloading Pexels HD 16:9 video clips...",
+                percent=int(blk_base_pct + blk_span_pct * 0.05),
+                time_left_sec=time_left_blk
+            )
 
             # 1. Fetch best-matching HD landscape video clips from Pexels for this block
             pexels_query = (block.get('pexels_query') or f"{slide_title} {lesson_title}").strip()
@@ -1350,6 +1417,13 @@ def handler(job):
                 block_idx=idx,
                 used_video_ids=used_pexels_video_ids,
                 count=2
+            )
+
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step=f"Block {idx_counter+1}/{total_blocks}: Generating 3 Cloudflare Workers AI & Pexels Slide Visuals...",
+                percent=int(blk_base_pct + blk_span_pct * 0.16),
+                time_left_sec=max(6, int(time_left_blk * 0.85))
             )
 
             # 2. Generate 3 distinct contextual visuals per block for PowerPoint Slides & Studio cards
@@ -1388,6 +1462,25 @@ def handler(job):
                 pexels_api_key=pexels_api_key
             )
 
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step=f"Block {idx_counter+1}/{total_blocks}: Running S3FD face detector & Wav2Lip-GAN neural lip-sync...",
+                percent=int(blk_base_pct + blk_span_pct * 0.28),
+                time_left_sec=max(5, int(time_left_blk * 0.72))
+            )
+
+            def _make_block_progress_cb(b_idx_human, b_base, b_span, b_rem):
+                def _cb(sub_frac, sub_msg):
+                    sub_pct = int(b_base + b_span * (0.28 + float(sub_frac) * 0.68))
+                    sub_rem = max(4, int(b_rem * (1.0 - float(sub_frac) * 0.75)))
+                    report_live_progress(
+                        job, s3_client, bucket_name, job_id,
+                        step=f"Block {b_idx_human}/{total_blocks}: {sub_msg}",
+                        percent=sub_pct,
+                        time_left_sec=sub_rem
+                    )
+                return _cb
+
             raw_block_mp4 = f"{workspace}/block_raw_{idx}.mp4"
             render_dynamic_lesson_block(
                 raw_avatar_path=raw_avatar_path,
@@ -1405,7 +1498,8 @@ def handler(job):
                 visual_blueprint=visual_blueprint,
                 fps=24,
                 device=device,
-                run_ffmpeg_fn=run_ffmpeg
+                run_ffmpeg_fn=run_ffmpeg,
+                progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk)
             )
 
             # Burn dynamic alternating Top/Bottom/Left/Right synchronized lyrics
@@ -1416,11 +1510,12 @@ def handler(job):
 
             clip_files.append(final_chunk)
 
-        runpod.serverless.progress_update(job, {
-            "step": "Mixing Teacher Voice & Background Soundtrack at custom volumes & uploading to Cloudflare R2...",
-            "percent": 92,
-            "time_left_sec": 12
-        })
+        report_live_progress(
+            job, s3_client, bucket_name, job_id,
+            step="Mixing Teacher Voice & Background Soundtrack at custom volumes...",
+            percent=92,
+            time_left_sec=8
+        )
 
         concat_list = f"{workspace}/concat.txt"
         with open(concat_list, "w") as f:
@@ -1464,6 +1559,13 @@ def handler(job):
             r2_key = f"outputs/{job_id}_master.mp4"
             content_type = "video/mp4"
 
+        report_live_progress(
+            job, s3_client, bucket_name, job_id,
+            step="Uploading finished HD Master Lesson to Cloudflare R2 storage...",
+            percent=96,
+            time_left_sec=4
+        )
+
         print(f"Uploading {master_file} to R2 bucket {bucket_name} as {r2_key}...")
         s3_client.upload_file(
             master_file,
@@ -1481,6 +1583,14 @@ def handler(job):
         except Exception as e:
             print(f"Presigned URL generation failed ({e}), falling back to endpoint URL...")
             download_url = f"{r2_endpoint}/{bucket_name}/{r2_key}"
+
+        report_live_progress(
+            job, s3_client, bucket_name, job_id,
+            step="Completed! Media rendered and saved to Cloudflare R2.",
+            percent=100,
+            time_left_sec=0,
+            extra={"download_url": download_url, "status": "COMPLETED"}
+        )
 
         print(f"Job completed successfully! Returning output with download_url: {download_url}")
         return {

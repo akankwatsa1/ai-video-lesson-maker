@@ -1180,7 +1180,8 @@ def render_dynamic_lesson_block(
     visual_blueprint="standard_30s",
     fps=24,
     device="cuda",
-    run_ffmpeg_fn=None
+    run_ffmpeg_fn=None,
+    progress_cb=None
 ):
     """
     Rescales the 10-Minute Video Blueprint proportionally to ANY video duration (60s, 90s, 180s, 600s)
@@ -1208,6 +1209,12 @@ def render_dynamic_lesson_block(
     talk_state = synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=fps, device=device)
     num_frames = talk_state["num_frames"]
     block_dur_sec = num_frames / float(fps)
+
+    if callable(progress_cb):
+        try:
+            progress_cb(0.35, "Wav2Lip-GAN neural lip-sync complete; building PowerPoint slides & studio set...")
+        except Exception:
+            pass
 
     # 2. Build Studio Composite Background, PowerPoint Slide 1 & 2, and B-Roll Canvases
     presenter_w, presenter_h = 680, 820
@@ -1376,6 +1383,8 @@ def render_dynamic_lesson_block(
 
     modes = [_get_mode_for_frame(i) for i in range(num_frames)]
     transition_len = 8
+    tick_33 = max(1, num_frames // 3)
+    tick_66 = max(2, (num_frames * 2) // 3)
 
     for f_idx in range(num_frames):
         curr_mode = modes[f_idx]
@@ -1396,9 +1405,27 @@ def render_dynamic_lesson_block(
 
         writer.write(frame_bgr)
 
+        if callable(progress_cb):
+            if f_idx == tick_33:
+                try:
+                    progress_cb(0.58, "Compositing 1080p multi-scene video frames (35% of block)...")
+                except Exception:
+                    pass
+            elif f_idx == tick_66:
+                try:
+                    progress_cb(0.78, "Compositing 1080p multi-scene video frames (70% of block)...")
+                except Exception:
+                    pass
+
     writer.release()
     pexels_stream_1.close()
     pexels_stream_2.close()
+
+    if callable(progress_cb):
+        try:
+            progress_cb(0.92, "Encoding H.264 video stream & burning 4-zone synchronized lyrics...")
+        except Exception:
+            pass
 
     mux_cmd = [
         "ffmpeg", "-y",
