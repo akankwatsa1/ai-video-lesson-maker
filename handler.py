@@ -8,6 +8,8 @@ import base64
 import asyncio
 import concurrent.futures
 import importlib.util
+import numpy as np
+import cv2
 import runpod
 import torch
 import torchaudio
@@ -21,6 +23,7 @@ import edge_tts
 from transformers import AutoModel, AutoProcessor
 from omnivoice import OmniVoice
 from lipsync_engine import (
+    render_dynamic_lesson_block,
     render_lipsync_teacher_block,
     render_slides_block,
     render_broll_motion_block,
@@ -461,7 +464,13 @@ def synthesize_block_audio_with_pauses(
     )
     apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
 
+
 def get_background_soundtrack(bg_preset, workspace):
+    """
+    Synthesizes a rich, musical polyphonic studio background track (chord progressions,
+    plucked arpeggios, warm bassline, and gentle rhythm pulse) at a clearly audible
+    studio level (-15 dB RMS) so background music properly works across all lessons.
+    """
     if not bg_preset or bg_preset == 'none':
         return None
     asset_path = f"/app/assets/{bg_preset}.mp3"
@@ -471,18 +480,102 @@ def get_background_soundtrack(bg_preset, workspace):
         return asset_path
 
     synth_bg = f"{workspace}/bg_synth_{bg_preset}.wav"
+    print(f"Synthesizing polyphonic musical soundtrack for mood '{bg_preset}'...")
+
+    sr = 24000
+    duration_sec = 64.0  # Seamless 16-bar loop at 120 BPM (or 8-bar loop at 60 BPM)
+    n_samples = int(sr * duration_sec)
+    t = np.linspace(0.0, duration_sec, n_samples, endpoint=False, dtype=np.float32)
+
     if bg_preset == 'lofi_study':
-        freqs = "0.05*sin(2*PI*174*t)+0.04*sin(2*PI*220*t)+0.03*sin(2*PI*261.63*t)"
+        # Warm Rhodes Jazz progression: Fmaj7 -> Em7 -> Dm7 -> Cmaj7 (4s per chord)
+        chords = [
+            (174.61, [220.00, 261.63, 329.63, 392.00]),  # Fmaj7
+            (164.81, [196.00, 246.94, 293.66, 392.00]),  # Em7
+            (146.83, [174.61, 220.00, 261.63, 329.63]),  # Dm7
+            (130.81, [196.00, 246.94, 261.63, 329.63]),  # Cmaj7
+        ]
+        beat_hz = 1.5  # 90 BPM relaxed lo-fi pulse
     elif bg_preset == 'african_acoustic':
-        freqs = "0.06*sin(2*PI*196*t)+0.05*sin(2*PI*246.94*t)+0.04*sin(2*PI*293.66*t)"
+        # Uplifting African Acoustic / Kalimba & Guitar progression: G -> C -> D -> G
+        chords = [
+            (196.00, [246.94, 293.66, 392.00, 493.88]),  # G major
+            (130.81, [196.00, 261.63, 329.63, 523.25]),  # C major add9
+            (146.83, [220.00, 293.66, 369.99, 587.33]),  # D major
+            (196.00, [246.94, 293.66, 392.00, 587.33]),  # G major
+        ]
+        beat_hz = 2.0  # 120 BPM acoustic groove
     else:
-        freqs = "0.05*sin(2*PI*220*t)+0.04*sin(2*PI*277.18*t)+0.04*sin(2*PI*329.63*t)"
-    print(f"Generating ambient studio soundscape for mood '{bg_preset}'...")
-    run_ffmpeg(
-        f'ffmpeg -y -f lavfi -i aevalsrc="{freqs}":s=24000:d=600 -af "lowpass=f=800,volume=0.25" {synth_bg}',
-        desc="Background ambient soundtrack synthesis"
-    )
+        # 'corporate_tech' or default: Inspiring Ambient Pluck & Pad: Am -> F -> C -> G
+        chords = [
+            (110.00, [220.00, 261.63, 329.63, 440.00]),  # Am
+            (87.31,  [174.61, 220.00, 261.63, 349.23]),  # F
+            (130.81, [196.00, 261.63, 329.63, 523.25]),  # C
+            (98.00,  [196.00, 246.94, 293.66, 392.00]),  # G
+        ]
+        beat_hz = 1.75  # 105 BPM modern corporate pulse
+
+    mix = np.zeros(n_samples, dtype=np.float32)
+    chord_len_sec = 4.0
+    chord_samples = int(chord_len_sec * sr)
+    num_chords = int(duration_sec // chord_len_sec)
+
+    for c_idx in range(num_chords):
+        s_i = c_idx * chord_samples
+        e_i = min(n_samples, s_i + chord_samples)
+        seg_len = e_i - s_i
+        if seg_len <= 0:
+            break
+        lt = np.linspace(0.0, chord_len_sec, seg_len, endpoint=False, dtype=np.float32)
+        bass_f, notes = chords[c_idx % len(chords)]
+
+        # Smooth chord pad envelope
+        pad_env = np.sin(np.pi * lt / chord_len_sec) ** 0.45
+        chord_sig = 0.28 * np.sin(2.0 * np.pi * bass_f * lt) + 0.10 * np.sin(2.0 * np.pi * (bass_f * 2.0) * lt)
+        for n_f in notes:
+            # Warm electric piano / acoustic harmonics (fundamental + 2nd + gentle 3rd harmonic)
+            chord_sig += (
+                0.16 * np.sin(2.0 * np.pi * n_f * lt)
+                + 0.05 * np.sin(2.0 * np.pi * (n_f * 2.0) * lt)
+                + 0.02 * np.sin(2.0 * np.pi * (n_f * 3.0) * lt)
+            )
+        chord_sig *= pad_env
+
+        # Melodic plucked arpeggio (8 notes per 4-second bar)
+        arp_notes = notes + notes[::-1]
+        note_dur = chord_len_sec / float(len(arp_notes))
+        note_samps = int(note_dur * sr)
+        for a_idx, a_freq in enumerate(arp_notes):
+            as_i = a_idx * note_samps
+            ae_i = min(seg_len, as_i + note_samps)
+            if ae_i <= as_i:
+                continue
+            nt = np.linspace(0.0, (ae_i - as_i) / float(sr), ae_i - as_i, endpoint=False, dtype=np.float32)
+            # Crisp pluck decay envelope
+            pluck_env = np.exp(-nt * 6.5) * (1.0 - np.exp(-nt * 120.0))
+            pluck_wave = (
+                0.24 * np.sin(2.0 * np.pi * a_freq * nt)
+                + 0.10 * np.sin(2.0 * np.pi * (a_freq * 2.0) * nt)
+                + 0.04 * np.sin(2.0 * np.pi * (a_freq * 3.0) * nt)
+            ) * pluck_env
+            chord_sig[as_i:ae_i] += pluck_wave
+
+        mix[s_i:e_i] += chord_sig
+
+    # Add gentle soft kick/pulse beat so the track feels alive and rhythmic
+    beat_phase = (t * beat_hz) % 1.0
+    kick_env = np.exp(-beat_phase * 14.0)
+    kick_freq = 55.0 + 65.0 * np.exp(-beat_phase * 28.0)
+    kick_wave = 0.18 * np.sin(2.0 * np.pi * kick_freq * (beat_phase / beat_hz)) * kick_env
+    mix += kick_wave
+
+    # Normalize to a clean, warm studio backing level (peak 0.55, ~ -13 dB RMS)
+    peak = float(np.max(np.abs(mix))) + 1e-6
+    mix = (mix / peak) * 0.55
+
+    sf.write(synth_bg, mix, sr, subtype='PCM_16')
     return synth_bg
+
 
 def _extract_cf_account_id(explicit_account_id, r2_endpoint):
     if explicit_account_id and str(explicit_account_id).strip():
@@ -494,46 +587,157 @@ def _extract_cf_account_id(explicit_account_id, r2_endpoint):
     return ""
 
 
-def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0):
+def _save_and_frame_image_bytes(img_bytes, output_png, title_text="", subtitle_text=""):
     """
-    Calls Cloudflare Workers AI (@cf/black-forest-labs/flux-1-schnell) to generate
-    a contextual 16:9 illustration for the current lesson point.
-    Automatically falls back to a crisp procedural infographic card if the token is
-    not yet configured or if the API request fails.
+    Decodes raw image bytes (PNG/JPEG/WebP), crops/fits cleanly to 1280x720 (16:9),
+    and saves as PNG. Returns True if valid.
+    """
+    try:
+        arr = np.frombuffer(img_bytes, dtype=np.uint8)
+        img = cv2.imdecode(arr, cv2.IMREAD_COLOR)
+        if img is None or img.size == 0:
+            return False
+        ih, iw = img.shape[:2]
+        if ih < 64 or iw < 64:
+            return False
+
+        target_w, target_h = 1280, 720
+        scale = max(target_w / float(iw), target_h / float(ih))
+        nw, nh = int(iw * scale), int(ih * scale)
+        resized = cv2.resize(img, (nw, nh), interpolation=cv2.INTER_LANCZOS4)
+        x0 = max(0, (nw - target_w) // 2)
+        y0 = max(0, (nh - target_h) // 2)
+        cropped = resized[y0:y0 + target_h, x0:x0 + target_w].copy()
+
+        cv2.imwrite(output_png, cropped)
+        return os.path.exists(output_png) and os.path.getsize(output_png) > 1000
+    except Exception as e:
+        print(f"Image decode warning: {e}")
+        return False
+
+
+def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title, output_png, variant=0):
+    """
+    Fetches a real, high-resolution educational photograph or scientific diagram
+    from Wikimedia Commons API (no API key required) matching the lesson topic.
+    """
+    stopwords = {
+        "the", "and", "for", "with", "from", "that", "this", "into", "your", "about",
+        "lesson", "key", "concept", "understanding", "introduction", "overview",
+        "clean", "educational", "illustration", "showing", "real", "world", "example",
+        "diagram", "visual", "part", "section", "module", "summary", "how", "what", "why"
+    }
+    combined_queries = [
+        f"{title_text} {lesson_title}",
+        f"{lesson_title}",
+        f"{prompt_text}",
+    ]
+
+    api_url = "https://commons.wikimedia.org/w/api.php"
+    for raw_q in combined_queries:
+        words = re.findall(r'[A-Za-z]{3,}', str(raw_q))
+        keywords = []
+        for w in words:
+            wl = w.lower()
+            if wl not in stopwords and wl not in [k.lower() for k in keywords]:
+                keywords.append(w)
+            if len(keywords) >= 5:
+                break
+        if not keywords:
+            continue
+
+        search_q = " ".join(keywords)
+        params = {
+            "action": "query",
+            "generator": "search",
+            "gsrsearch": f"filetype:bitmap {search_q}",
+            "gsrnamespace": 6,
+            "gsrlimit": 10,
+            "prop": "imageinfo",
+            "iiprop": "url",
+            "iiurlwidth": 1280,
+            "format": "json"
+        }
+        try:
+            r = requests.get(api_url, params=params, headers=HTTP_HEADERS, timeout=10)
+            if r.status_code != 200:
+                continue
+            pages = (r.json().get("query") or {}).get("pages") or {}
+            candidates = []
+            for p in pages.values():
+                ii = (p.get("imageinfo") or [{}])[0]
+                thumb = ii.get("thumburl") or ii.get("url")
+                if thumb and any(thumb.lower().endswith(ext) for ext in (".jpg", ".jpeg", ".png", ".webp")):
+                    candidates.append(thumb)
+            if not candidates:
+                continue
+
+            # Pick a distinct image based on variant index
+            chosen_url = candidates[variant % len(candidates)]
+            print(f"Downloading real educational visual from Wikimedia Commons for '{search_q}': {chosen_url}")
+            img_resp = requests.get(chosen_url, headers=HTTP_HEADERS, timeout=12)
+            if img_resp.status_code == 200 and len(img_resp.content) > 2000:
+                if _save_and_frame_image_bytes(img_resp.content, output_png, title_text=title_text):
+                    return output_png
+        except Exception as wm_err:
+            print(f"Wikimedia search note ({wm_err})")
+            continue
+    return None
+
+
+def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0, lesson_title=""):
+    """
+    3-Tier Contextual Image Generator:
+      1. Cloudflare Workers AI Model Cascade (Flux-1-Schnell -> SDXL-Lightning -> SDXL-Base)
+      2. Real Wikimedia Commons High-Res Educational Photography/Diagrams (when CF token is not yet set or fails)
+      3. Procedural Multi-Node Studio Vector Infographic
     """
     clean_prompt = str(prompt_text or title_text or "Educational lesson concept").strip()
     if cf_account_id and cf_api_token:
-        url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/@cf/black-forest-labs/flux-1-schnell"
+        cf_models = [
+            ("@cf/black-forest-labs/flux-1-schnell", {"prompt": f"Clean educational textbook illustration and professional visual photograph showing: {clean_prompt}. Context: {lesson_title} - {title_text}. High resolution, vibrant studio lighting, clear subject focus, 16:9 widescreen.", "steps": 4}),
+            ("@cf/bytedance/stable-diffusion-xl-lightning", {"prompt": f"Educational photography and visual diagram of {clean_prompt}, {title_text}, high resolution, 16:9"}),
+            ("@cf/stabilityai/stable-diffusion-xl-base-1.0", {"prompt": f"Educational textbook illustration of {clean_prompt}, {title_text}, clear visual, 16:9"}),
+        ]
         headers = {
             "Authorization": f"Bearer {cf_api_token}",
             "Content-Type": "application/json"
         }
-        full_prompt = (
-            f"Clean educational textbook illustration and professional visual diagram showing: {clean_prompt}. "
-            f"Lesson context: {title_text}. High resolution, vibrant studio colors, clear subject focus, no gibberish text, 16:9 widescreen."
-        )
-        try:
-            print(f"Generating Cloudflare Workers AI illustration for '{clean_prompt[:60]}...'")
-            resp = requests.post(url, headers=headers, json={"prompt": full_prompt, "steps": 4}, timeout=35)
-            if resp.status_code == 200:
-                ctype = resp.headers.get("Content-Type", "")
-                if "application/json" in ctype:
-                    payload = resp.json()
-                    b64_img = (payload.get("result") or {}).get("image")
-                    if b64_img:
-                        with open(output_png, "wb") as f:
-                            f.write(base64.b64decode(b64_img))
-                elif len(resp.content) > 1000:
-                    with open(output_png, "wb") as f:
-                        f.write(resp.content)
+        for model_slug, payload_body in cf_models:
+            url = f"https://api.cloudflare.com/client/v4/accounts/{cf_account_id}/ai/run/{model_slug}"
+            try:
+                print(f"Generating Cloudflare Workers AI ({model_slug}) illustration for '{clean_prompt[:60]}...'")
+                resp = requests.post(url, headers=headers, json=payload_body, timeout=30)
+                if resp.status_code == 200:
+                    ctype = resp.headers.get("Content-Type", "")
+                    raw_bytes = None
+                    if "application/json" in ctype:
+                        payload = resp.json()
+                        b64_img = (payload.get("result") or {}).get("image")
+                        if b64_img:
+                            raw_bytes = base64.b64decode(b64_img)
+                    elif len(resp.content) > 1000:
+                        raw_bytes = resp.content
 
-                if os.path.exists(output_png) and os.path.getsize(output_png) > 500:
-                    return output_png
-            else:
-                print(f"Cloudflare Workers AI returned HTTP {resp.status_code}: {resp.text[:200]}")
-        except Exception as cf_err:
-            print(f"Cloudflare Workers AI request warning ({cf_err}); using studio infographic fallback.")
+                    if raw_bytes and _save_and_frame_image_bytes(raw_bytes, output_png, title_text=title_text):
+                        return output_png
+                else:
+                    print(f"Cloudflare Workers AI ({model_slug}) returned HTTP {resp.status_code}: {resp.text[:180]}")
+            except Exception as cf_err:
+                print(f"Cloudflare Workers AI ({model_slug}) note: {cf_err}")
 
+    # Tier 2: Real high-resolution educational photo/diagram from Wikimedia Commons
+    wm_path = _fetch_wikimedia_commons_illustration(
+        prompt_text=clean_prompt,
+        title_text=title_text,
+        lesson_title=lesson_title,
+        output_png=output_png,
+        variant=variant
+    )
+    if wm_path and os.path.exists(wm_path):
+        return wm_path
+
+    # Tier 3: Rich vector node diagram fallback
     return generate_fallback_illustration(clean_prompt, title_text, output_png, variant=variant)
 
 
@@ -545,13 +749,12 @@ def _format_ass_timestamp(seconds):
     return f"{h}:{m:02d}:{s:05.2f}"
 
 
-def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=9):
+def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=8):
     clean = re.sub(r'\[pause\s+[0-9\.]+\s*s?\]', ' ', str(spoken_text or ''), flags=re.IGNORECASE)
     clean = re.sub(r'\s+', ' ', clean).strip()
     if not clean:
         return []
 
-    # First split on natural clause/sentence boundaries
     raw_clauses = re.split(r'(?<=[\.\,\;\:\!\?])\s+', clean)
     phrases = []
     for clause in raw_clauses:
@@ -565,25 +768,63 @@ def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=9):
     return phrases
 
 
-def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path):
+def _highlight_lyric_keywords_ass(safe_text, phrase_idx=0):
     """
-    Generates phrase-by-phrase synchronized on-screen lyrics (.ass) positioned inside
-    the bottom lower-third lyric bar, timed proportionally to the exact audio duration.
+    Adds dynamic broadcast color highlights (Gold & Sky Cyan) to important content words
+    inside an .ass subtitle line so the typography looks captivating and modern.
+    """
+    words = safe_text.split()
+    if not words:
+        return safe_text
+
+    # Pick up to 2 longest content words (>= 6 letters) to highlight in Gold or Cyan
+    accent_color = "&H0038BDF8&" if (phrase_idx % 2 == 0) else "&H0000D4FF&"
+    scored = []
+    for idx, w in enumerate(words):
+        clean_w = re.sub(r'[^A-Za-z]', '', w)
+        if len(clean_w) >= 6:
+            scored.append((len(clean_w), idx))
+    scored.sort(reverse=True)
+    highlight_indices = {idx for _, idx in scored[:2]}
+
+    out_words = []
+    for idx, w in enumerate(words):
+        if idx in highlight_indices:
+            out_words.append(f"{{\\c{accent_color}}}{w}{{\\c&H00FFFFFF&}}")
+        else:
+            out_words.append(w)
+
+    # Wrap into 2 balanced lines if more than 6 words
+    if len(out_words) > 6:
+        mid = len(out_words) // 2
+        return " ".join(out_words[:mid]) + "\\N" + " ".join(out_words[mid:])
+    return " ".join(out_words)
+
+
+def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block_idx=0):
+    """
+    Generates captivating, dynamic phrase-by-phrase synchronized on-screen lyrics (.ass)
+    that alternate positions across Bottom, Right, Top, and Left screen zones after
+    every 2 phrases, with enhanced Liberation Sans Bold typography and keyword color accents.
     """
     try:
         total_duration = max(1.0, float(sf.info(audio_wav_path).duration))
     except Exception:
         total_duration = 25.0
 
-    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=9)
+    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=8)
     ass_header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
         "PlayResX: 1920\n"
-        "PlayResY: 1080\n\n"
+        "PlayResY: 1080\n"
+        "WrapStyle: 1\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: LyricStyle,DejaVu Sans,36,&H00FFFFFF,&H0038BDF8,&H000F172A,&H80000000,-1,0,0,0,100,100,0,0,1,3,1,2,90,90,46,1\n\n"
+        "Style: LyricBottom,Liberation Sans,42,&H00FFFFFF,&H0000D4FF,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,2,80,80,38,1\n"
+        "Style: LyricTop,Liberation Sans,40,&H00FFFFFF,&H0038BDF8,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,8,80,80,82,1\n"
+        "Style: LyricLeft,Liberation Sans,39,&H00FFFFFF,&H0000D4FF,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,1,68,580,128,1\n"
+        "Style: LyricRight,Liberation Sans,39,&H00FFFFFF,&H0038BDF8,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,3,580,68,128,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -592,6 +833,9 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path):
         with open(output_sub_path, "w", encoding="utf-8") as f:
             f.write(ass_header)
         return output_sub_path
+
+    # Cycle lyric position every 2 phrases: Bottom -> Right -> Top -> Left
+    style_cycle = ["LyricBottom", "LyricRight", "LyricTop", "LyricLeft"]
 
     weights = [max(1, len(p)) for p in phrases]
     total_weight = float(sum(weights))
@@ -604,15 +848,12 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path):
         end_t = total_duration if idx == len(phrases) - 1 else (curr_t + dur)
         curr_t = end_t
 
+        style_name = style_cycle[((idx // 2) + block_idx) % len(style_cycle)]
         safe_text = phrase.replace("{", "(").replace("}", ")").replace("\n", " ").strip()
-        # Wrap long phrase cleanly into 2 balanced lines if > 54 chars
-        if len(safe_text) > 54:
-            words = safe_text.split()
-            mid = len(words) // 2
-            safe_text = " ".join(words[:mid]) + "\\N" + " ".join(words[mid:])
+        styled_text = _highlight_lyric_keywords_ass(safe_text, phrase_idx=idx)
 
         events.append(
-            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},LyricStyle,,0,0,0,,{safe_text}\n"
+            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},{style_name},,0,0,0,,{{\\fad(150,130)}}{styled_text}\n"
         )
 
     with open(output_sub_path, "w", encoding="utf-8") as f:
@@ -630,35 +871,6 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
         final_output
     ]
     run_ffmpeg(cmd, desc="Burn synchronized on-screen lyrics")
-
-
-def resolve_block_scene_type(block, idx_counter, total_blocks, visual_blueprint="standard_30s"):
-    """
-    Determines the visual layout for a 30-second block:
-      - 'teacher_lipsync': AI Lip-Synced Teacher in Studio Frame + Right PowerPoint Card
-      - 'slides': Full-Screen PowerPoint Presentation Slide Deck + Interchanging AI Illustrations
-      - 'b_roll': Contextual 30s B-Roll Motion Clip (Ken Burns pan/zoom across 2 AI visuals)
-    """
-    raw_flag = (block.get("flag_type") or "teacher").strip().lower()
-    if raw_flag in ("teacher_lipsync", "slides", "b_roll"):
-        return raw_flag
-
-    # Automatic Cost-Saving Pacing Blueprint when legacy 'teacher' flag is present:
-    if idx_counter == 0 or idx_counter == total_blocks - 1:
-        return "teacher_lipsync"
-
-    if visual_blueprint == "90s_avatar":
-        # 90s Avatar per 120s (3 out of 4 blocks lip-synced teacher, 1 block B-roll/Slides)
-        if idx_counter % 4 == 2:
-            return "b_roll"
-        elif idx_counter % 4 == 1:
-            return "slides"
-        return "teacher_lipsync"
-
-    # Default 'standard_30s': First & Last 30s Lip-Sync Teacher; 30s B-Roll per 120s; rest PowerPoint Slides
-    if idx_counter % 4 == 2:
-        return "b_roll"
-    return "slides"
 
 
 def handler(job):
@@ -712,7 +924,8 @@ def handler(job):
     os.makedirs(workspace, exist_ok=True)
 
     try:
-        total_blocks = len(timeline_data['timeline']) if timeline_data and 'timeline' in timeline_data else 1
+        blocks_list = timeline_data.get('timeline') if timeline_data and 'timeline' in timeline_data else []
+        total_blocks = max(1, len(blocks_list))
         start_time = time.time()
 
         runpod.serverless.progress_update(job, {
@@ -759,29 +972,28 @@ def handler(job):
         if output_format == 'video' and avatar_url:
             raw_avatar_path = download_file(avatar_url, f"{workspace}/avatar_orig", s3_client, r2_endpoint, bucket_name)
 
-        clip_files = []
+        # =====================================================================
+        # PASS 1: Synthesize narration audio for all blocks first so we know
+        # the exact total video duration (for rescaling the 10-min rules to ANY
+        # duration) and can free TTS VRAM before running Wav2Lip-GAN + S3FD!
+        # =====================================================================
+        synthesized_blocks = []
+        total_video_duration_sec = 0.0
 
-        for idx_counter, block in enumerate(timeline_data['timeline']):
+        for idx_counter, block in enumerate(blocks_list):
             idx = block.get('block_index', idx_counter)
             text = block.get('spoken_script', '')
             notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
             slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
-            scene_type = resolve_block_scene_type(block, idx_counter, total_blocks, visual_blueprint=visual_blueprint)
 
-            elapsed = time.time() - start_time
-            sec_per_block = elapsed / idx_counter if idx_counter > 0 else (8.0 if output_format == 'audio' else 25.0)
-            remaining_blocks = total_blocks - idx_counter
-            time_left = max(5, int(remaining_blocks * sec_per_block))
-            percent_done = int(10 + (idx_counter / max(1, total_blocks)) * 75)
-
+            percent_done = int(8 + (idx_counter / max(1, total_blocks)) * 32)
             runpod.serverless.progress_update(job, {
-                "step": f"Block {idx_counter+1}/{total_blocks} ({scene_type.upper()}): Synthesizing {tts_engine.upper()} voice & studio visuals...",
+                "step": f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} narration audio...",
                 "percent": percent_done,
-                "time_left_sec": time_left
+                "time_left_sec": max(10, int((total_blocks - idx_counter) * (7 if output_format == 'audio' else 22)))
             })
 
             output_wav = f"{workspace}/audio_{idx}.wav"
-
             delivery = block.get('delivery_style', 'normal')
             blk_whisper = True if delivery == 'whisper' else global_whisper
             blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
@@ -803,115 +1015,129 @@ def handler(job):
                 volume_val=global_volume
             )
 
+            try:
+                blk_dur = max(1.0, float(sf.info(output_wav).duration))
+            except Exception:
+                blk_dur = 30.0
+
+            synthesized_blocks.append({
+                "idx_counter": idx_counter,
+                "idx": idx,
+                "block": block,
+                "text": text,
+                "notes": notes,
+                "slide_title": slide_title,
+                "audio_wav": output_wav,
+                "start_sec": total_video_duration_sec,
+                "duration_sec": blk_dur,
+            })
+            total_video_duration_sec += blk_dur
+
+        print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
+
+        # Free TTS models from GPU VRAM before video lip-sync rendering
+        if output_format == 'video':
+            global _OMNIVOICE_MODEL, _MOSS_PROCESSOR, _MOSS_MODEL
+            _OMNIVOICE_MODEL = None
+            _MOSS_PROCESSOR = None
+            _MOSS_MODEL = None
+            _free_gpu_memory()
+
+        # =====================================================================
+        # PASS 2: Render Dynamic Multi-Scene Video Blocks (or collect audio)
+        # =====================================================================
+        clip_files = []
+        render_start_time = time.time()
+
+        for item in synthesized_blocks:
+            idx_counter = item["idx_counter"]
+            idx = item["idx"]
+            block = item["block"]
+            text = item["text"]
+            notes = item["notes"]
+            slide_title = item["slide_title"]
+            output_wav = item["audio_wav"]
+            blk_start_sec = item["start_sec"]
+
             if output_format == 'audio':
                 clip_files.append(output_wav)
                 continue
 
-            # Generate contextual illustrations via Cloudflare Workers AI (or crisp infographic fallback)
-            base_prompt = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {'; '.join(notes[:2])}").strip()
-            second_prompt = f"{lesson_title} - {slide_title} real-world example: {'; '.join(notes[1:3] if len(notes) > 1 else notes)}".strip()
+            elapsed_render = time.time() - render_start_time
+            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 16.0
+            time_left = max(8, int((total_blocks - idx_counter) * sec_per_vid_blk))
+            percent_done = int(42 + (idx_counter / max(1, total_blocks)) * 46)
+
+            runpod.serverless.progress_update(job, {
+                "step": f"Block {idx_counter+1}/{total_blocks}: Rendering Lip-Sync Teacher, Slides, B-Roll Clips & Visuals...",
+                "percent": percent_done,
+                "time_left_sec": time_left
+            })
+
+            # Generate 3 distinct contextual visuals per block so Slides and B-Roll Clips never repeat the same image
+            prompt_1 = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {notes[0] if notes else slide_title}").strip()
+            prompt_2 = f"{lesson_title} - {slide_title} practical application: {notes[1] if len(notes) > 1 else slide_title}".strip()
+            prompt_3 = f"{lesson_title} - {slide_title} real-world case study: {notes[2] if len(notes) > 2 else (notes[-1] if notes else slide_title)}".strip()
 
             cf_img_1 = generate_cloudflare_ai_image(
-                prompt_text=base_prompt,
+                prompt_text=prompt_1,
                 title_text=slide_title,
                 cf_account_id=cf_account_id,
                 cf_api_token=cf_ai_token,
                 output_png=f"{workspace}/cf_{idx}_1.png",
-                variant=idx_counter * 2
+                variant=idx_counter * 3,
+                lesson_title=lesson_title
+            )
+            cf_img_2 = generate_cloudflare_ai_image(
+                prompt_text=prompt_2,
+                title_text=slide_title,
+                cf_account_id=cf_account_id,
+                cf_api_token=cf_ai_token,
+                output_png=f"{workspace}/cf_{idx}_2.png",
+                variant=idx_counter * 3 + 1,
+                lesson_title=lesson_title
+            )
+            cf_img_3 = generate_cloudflare_ai_image(
+                prompt_text=prompt_3,
+                title_text=slide_title,
+                cf_account_id=cf_account_id,
+                cf_api_token=cf_ai_token,
+                output_png=f"{workspace}/cf_{idx}_3.png",
+                variant=idx_counter * 3 + 2,
+                lesson_title=lesson_title
             )
 
             raw_block_mp4 = f"{workspace}/block_raw_{idx}.mp4"
+            render_dynamic_lesson_block(
+                raw_avatar_path=raw_avatar_path,
+                audio_wav_path=output_wav,
+                output_mp4_path=raw_block_mp4,
+                lesson_title=lesson_title,
+                slide_title=slide_title,
+                slide_notes=notes,
+                cf_images=[cf_img_1, cf_img_2, cf_img_3],
+                block_idx=idx_counter,
+                total_blocks=total_blocks,
+                block_start_sec=blk_start_sec,
+                total_video_duration_sec=total_video_duration_sec,
+                visual_blueprint=visual_blueprint,
+                fps=24,
+                device=device,
+                run_ffmpeg_fn=run_ffmpeg
+            )
 
-            if scene_type == "teacher_lipsync":
-                # For short 1-2 block videos, include a mid-block full-screen PowerPoint slide cutaway on the last block
-                # so even a 1-minute test video showcases Lip-Sync Teacher + Full-Screen Slide + Synced Lyrics!
-                use_cutaway = (total_blocks <= 2 and idx_counter == total_blocks - 1)
-                cf_img_2 = None
-                if use_cutaway:
-                    cf_img_2 = generate_cloudflare_ai_image(
-                        prompt_text=second_prompt,
-                        title_text=slide_title,
-                        cf_account_id=cf_account_id,
-                        cf_api_token=cf_ai_token,
-                        output_png=f"{workspace}/cf_{idx}_2.png",
-                        variant=idx_counter * 2 + 1
-                    )
-                render_lipsync_teacher_block(
-                    raw_avatar_path=raw_avatar_path,
-                    audio_wav_path=output_wav,
-                    output_mp4_path=raw_block_mp4,
-                    lesson_title=lesson_title,
-                    slide_title=slide_title,
-                    slide_notes=notes,
-                    cf_image_path=cf_img_1,
-                    cf_image_2=cf_img_2,
-                    block_idx=idx_counter,
-                    total_blocks=total_blocks,
-                    fps=24,
-                    device=device,
-                    run_ffmpeg_fn=run_ffmpeg,
-                    include_mid_cutaway=use_cutaway
-                )
-            elif scene_type == "b_roll":
-                cf_img_2 = generate_cloudflare_ai_image(
-                    prompt_text=second_prompt,
-                    title_text=slide_title,
-                    cf_account_id=cf_account_id,
-                    cf_api_token=cf_ai_token,
-                    output_png=f"{workspace}/cf_{idx}_2.png",
-                    variant=idx_counter * 2 + 1
-                )
-                render_broll_motion_block(
-                    lesson_title=lesson_title,
-                    slide_title=slide_title,
-                    slide_notes=notes,
-                    cf_image_1=cf_img_1,
-                    cf_image_2=cf_img_2,
-                    raw_avatar_path=raw_avatar_path,
-                    audio_wav_path=output_wav,
-                    output_mp4_path=raw_block_mp4,
-                    block_idx=idx_counter,
-                    total_blocks=total_blocks,
-                    fps=24,
-                    run_ffmpeg_fn=run_ffmpeg
-                )
-            else:
-                # 'slides' - Full-screen PowerPoint Slide Deck with 2 interchanging visuals & progressive bullets
-                cf_img_2 = generate_cloudflare_ai_image(
-                    prompt_text=second_prompt,
-                    title_text=slide_title,
-                    cf_account_id=cf_account_id,
-                    cf_api_token=cf_ai_token,
-                    output_png=f"{workspace}/cf_{idx}_2.png",
-                    variant=idx_counter * 2 + 1
-                )
-                render_slides_block(
-                    lesson_title=lesson_title,
-                    slide_title=slide_title,
-                    slide_notes=notes,
-                    cf_image_1=cf_img_1,
-                    cf_image_2=cf_img_2,
-                    raw_avatar_path=raw_avatar_path,
-                    audio_wav_path=output_wav,
-                    output_mp4_path=raw_block_mp4,
-                    block_idx=idx_counter,
-                    total_blocks=total_blocks,
-                    fps=24,
-                    run_ffmpeg_fn=run_ffmpeg
-                )
-
-            # Burn synchronized phrase-by-phrase on-screen lyrics at the bottom of the screen
+            # Burn dynamic alternating Top/Bottom/Left/Right synchronized lyrics
             lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
-            create_synced_lyrics_ass(text, output_wav, lyrics_ass)
+            create_synced_lyrics_ass(text, output_wav, lyrics_ass, block_idx=idx_counter)
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
             burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
 
             clip_files.append(final_chunk)
 
         runpod.serverless.progress_update(job, {
-            "step": "Stitching master media and uploading to Cloudflare R2...",
-            "percent": 90,
-            "time_left_sec": 15
+            "step": "Mixing studio soundtrack & uploading master media to Cloudflare R2...",
+            "percent": 92,
+            "time_left_sec": 12
         })
 
         concat_list = f"{workspace}/concat.txt"
@@ -926,7 +1152,10 @@ def handler(job):
             if bg_track:
                 temp_voice = f"{workspace}/temp_voice.wav"
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a pcm_s16le {temp_voice}", desc="Concat audio blocks")
-                run_ffmpeg(f'ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map "[out]" -c:a libmp3lame -b:a 320k -ac 2 {master_file}', desc="Mix audio with background music")
+                run_ffmpeg(
+                    f'ffmpeg -y -i {temp_voice} -stream_loop -1 -i {bg_track} -filter_complex "[0:a]volume=1.15[v];[1:a]volume=0.35[bg];[v][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map "[out]" -c:a libmp3lame -b:a 320k -ac 2 {master_file}',
+                    desc="Mix audio with polyphonic background soundtrack"
+                )
             else:
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c:a libmp3lame -b:a 320k -ac 2 {master_file}", desc="Concat audio to MP3")
             r2_key = f"outputs/{job_id}_master.mp3"
@@ -936,7 +1165,10 @@ def handler(job):
             if bg_track:
                 temp_video = f"{workspace}/temp_video.mp4"
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", desc="Concat video blocks")
-                run_ffmpeg(f'ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex "[1:a]volume=0.12[bg];[0:a][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map 0:v -map "[out]" -c:v copy -c:a aac -b:a 192k -ac 2 {master_file}', desc="Mix video with background music")
+                run_ffmpeg(
+                    f'ffmpeg -y -i {temp_video} -stream_loop -1 -i {bg_track} -filter_complex "[0:a]volume=1.15[v];[1:a]volume=0.35[bg];[v][bg]amix=inputs=2:duration=first:dropout_transition=2[out]" -map 0:v -map "[out]" -c:v copy -c:a aac -b:a 192k -ac 2 {master_file}',
+                    desc="Mix video with polyphonic background soundtrack"
+                )
             else:
                 run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {master_file}", desc="Concat video blocks to MP4")
             r2_key = f"outputs/{job_id}_master.mp4"
