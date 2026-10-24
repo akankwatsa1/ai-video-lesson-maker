@@ -593,13 +593,30 @@ def _create_full_opacity_mouth_mask(w, h):
 
 def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
     """
-    Reinforces visible mouth/jaw articulation on spoken syllables and adds
-    natural periodic eye blinks so even tight-lipped portrait photos visibly talk and blink.
+    Reinforces visible mouth/jaw articulation on spoken syllables, adds
+    speech-synced eyebrow micro-lift, and performs natural single & occasional
+    double eye blinks so even tight-lipped portrait photos look genuinely alive.
     """
     fh, fw = face_bgr.shape[:2]
     out = face_bgr.copy()
+    t_sec = f_idx / float(max(1, fps))
 
-    # 1. Syllable-driven lower-jaw & lip opening reinforcement
+    # 1. Eyebrow Micro-Lift on Emphasized Syllables (y: 16% -> 27%, x: 16% -> 84%)
+    if energy > 0.14 and fh > 48 and fw > 48:
+        brow_lift_px = min(4.2, float(energy) * 3.6 + 0.8 * max(0.0, math.sin(t_sec * 6.2)))
+        by1, by2 = max(2, int(fh * 0.16)), min(fh - 2, int(fh * 0.27))
+        bx1, bx2 = max(2, int(fw * 0.16)), min(fw - 2, int(fw * 0.84))
+        if by2 > by1 + 6 and bx2 > bx1 + 12:
+            brow_roi = out[by1:by2, bx1:bx2].copy()
+            bh_r, bw_r = brow_roi.shape[:2]
+            grid_x, grid_y = np.meshgrid(np.arange(bw_r, dtype=np.float32), np.arange(bh_r, dtype=np.float32))
+            ny = grid_y / float(max(1, bh_r))
+            nx = (grid_x - bw_r * 0.5) / float(max(1, bw_r * 0.5))
+            weight = np.sin(ny * math.pi) * np.clip(1.0 - (nx ** 2), 0.0, 1.0)
+            map_y = np.clip(grid_y + weight * brow_lift_px, 0, bh_r - 1).astype(np.float32)
+            out[by1:by2, bx1:bx2] = cv2.remap(brow_roi, grid_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+
+    # 2. Syllable-driven lower-jaw & lip opening reinforcement
     if energy > 0.06 and fh > 40 and fw > 40:
         mouth_cx = fw // 2
         mouth_cy = int(fh * 0.74)
@@ -614,7 +631,6 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
             shift_px = max(1, int(fh * 0.045 * energy))
             jaw_patch = out[jaw_top:jaw_bot, :].copy()
             stretched = cv2.resize(jaw_patch, (fw, jaw_h + shift_px), interpolation=cv2.INTER_LINEAR)
-            # Feather horizontally so only central chin moves
             x_grid = np.linspace(-1.0, 1.0, fw, dtype=np.float32)
             horiz_w = np.clip(1.0 - (x_grid ** 2) * 1.4, 0.0, 1.0)[None, :, None]
             out[jaw_top:jaw_bot, :] = (
@@ -628,7 +644,6 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
             cv2.ellipse(lip_mask, (mouth_cx, mouth_cy + 1), (rx, ry), 0, 0, 360, 1.0, -1)
             bk = max(3, (min(fw, fh) // 15) | 1)
             lip_mask = cv2.GaussianBlur(lip_mask, (bk, bk), 0)[..., None]
-            # Warm dark inner oral cavity tint + subtle upper teeth highlight
             cavity = np.full_like(out, (28, 22, 48), dtype=np.uint8)
             teeth_y1 = max(0, mouth_cy - max(1, ry // 2))
             teeth_y2 = min(fh, mouth_cy)
@@ -636,18 +651,29 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
             alpha_lip = lip_mask * min(0.58, energy * 0.52)
             out = (out.astype(np.float32) * (1.0 - alpha_lip) + cavity.astype(np.float32) * alpha_lip).astype(np.uint8)
 
-    # 2. Periodic natural eye blink every ~3.6 seconds (duration 4 frames)
-    cycle_frames = int(3.6 * fps)
-    phase = (f_idx + 19) % max(1, cycle_frames)
-    if phase < 4 and fh > 48:
-        blink_strength = 1.0 - abs(phase - 1.5) / 2.0
-        ey1, ey2 = int(fh * 0.27), int(fh * 0.41)
+    # 3. Natural Single & Occasional Double Eye-Blinking (every ~3.8 seconds)
+    blink_cycle = (t_sec + 0.75) % 3.8
+    blink_strength = 0.0
+    if blink_cycle < 0.15:
+        blink_strength = math.sin((blink_cycle / 0.15) * math.pi)
+    elif (int((t_sec + 0.75) // 3.8) % 2 == 1) and (0.24 <= blink_cycle < 0.38):
+        # Occasional realistic double-blink
+        blink_strength = 0.88 * math.sin(((blink_cycle - 0.24) / 0.14) * math.pi)
+
+    if blink_strength > 0.05 and fh > 48:
+        ey1, ey2 = int(fh * 0.26), int(fh * 0.41)
         eh = ey2 - ey1
         if eh > 4:
             upper_lid = out[ey1:ey1 + max(2, eh // 2), :]
             lid_stretched = cv2.resize(upper_lid, (fw, eh), interpolation=cv2.INTER_LINEAR)
-            b_alpha = min(0.85, blink_strength * 0.85)
-            out[ey1:ey2, :] = cv2.addWeighted(lid_stretched, b_alpha, out[ey1:ey2, :], 1.0 - b_alpha, 0.0)
+            b_alpha = min(0.88, blink_strength * 0.88)
+            blended_eyes = cv2.addWeighted(lid_stretched, b_alpha, out[ey1:ey2, :], 1.0 - b_alpha, 0.0)
+            # Subtle upper eyelash fold line when eyelid descends
+            lash_y = min(eh - 1, max(1, int(eh * 0.68 * blink_strength)))
+            blended_eyes[lash_y, int(fw * 0.18):int(fw * 0.82)] = (
+                blended_eyes[lash_y, int(fw * 0.18):int(fw * 0.82)].astype(np.float32) * 0.55
+            ).astype(np.uint8)
+            out[ey1:ey2, :] = blended_eyes
 
     return out
 
@@ -1070,6 +1096,299 @@ def generate_fallback_illustration(prompt_text, title_text, output_png, variant=
     return output_png
 
 
+def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_title=""):
+    """
+    Renders a crisp, broadcast-grade Data Chart, Comparison Table, Process Flowchart,
+    or Scientific Formula Board onto a PIL RGB Image of size (width, height).
+    Supported chart_data['type'] values:
+      - 'bar'        : Horizontal/Vertical comparative metric bars with value badges
+      - 'comparison' : Two-column or multi-row structured comparison matrix
+      - 'formula'    : Highlighted mathematical / scientific equation board with variable legend
+      - 'process'    : Step-by-step connected flowchart nodes
+    """
+    accent = theme["accent"]
+    accent_alt = theme["accent_alt"]
+    card = Image.new("RGB", (width, height), (13, 20, 38))
+    draw = ImageDraw.Draw(card, "RGBA")
+
+    # Subtle grid lines for technical broadcast look
+    for gx in range(40, width, 60):
+        draw.line([(gx, 0), (gx, height)], fill=(255, 255, 255, 13), width=1)
+    for gy in range(40, height, 60):
+        draw.line([(0, gy), (width, gy)], fill=(255, 255, 255, 13), width=1)
+
+    ctype = str(chart_data.get("type") or "bar").strip().lower()
+    ctitle = str(chart_data.get("title") or slide_title or "Key Data & Metrics").strip()
+    unit = str(chart_data.get("unit") or "").strip()
+
+    # Header bar inside chart card
+    draw.rounded_rectangle([18, 18, width - 18, 92], radius=16, fill=(22, 33, 62, 240), outline=accent + (180,), width=2)
+    font_ctitle = _load_font(27, bold=True)
+    draw.text((38, 38), ctitle[:38], font=font_ctitle, fill=accent_alt + (255,))
+
+    labels = [str(x).strip() for x in (chart_data.get("labels") or []) if str(x).strip()]
+    raw_vals = chart_data.get("values") or []
+    vals = []
+    for v in raw_vals:
+        try:
+            vals.append(float(str(v).replace("%", "").replace("$", "").replace(",", "").strip()))
+        except Exception:
+            vals.append(50.0)
+
+    if ctype == "formula" or chart_data.get("formula"):
+        formula_str = str(chart_data.get("formula") or "E = m · c²").strip()
+        draw.rounded_rectangle([32, 118, width - 32, 310], radius=22, fill=(17, 28, 52, 255), outline=accent_alt + (235,), width=3)
+        font_eq_tag = _load_font(20, bold=True)
+        draw.text((54, 134), "CORE EQUATION / PRINCIPLE", font=font_eq_tag, fill=accent + (255,))
+        font_eq = _load_font(44, bold=True)
+        eq_lines = _wrap_text(draw, formula_str, font_eq, width - 110)
+        ey = 176
+        for el in eq_lines[:2]:
+            draw.text((54, ey), el, font=font_eq, fill=(255, 255, 255, 255))
+            ey += 54
+
+        font_leg = _load_font(25, bold=True)
+        ly = 338
+        for idx, lbl in enumerate(labels[:5]):
+            b_col = accent if idx % 2 == 0 else accent_alt
+            draw.ellipse([40, ly + 6, 58, ly + 24], fill=b_col + (255,))
+            w_lines = _wrap_text(draw, lbl, font_leg, width - 110)
+            for wl in w_lines[:2]:
+                draw.text((74, ly), wl, font=font_leg, fill=(235, 242, 255, 255))
+                ly += 33
+            ly += 12
+            if ly > height - 45:
+                break
+        return card
+
+    if ctype == "process" and labels:
+        steps = labels[:5]
+        n_steps = len(steps)
+        box_h = min(102, max(68, (height - 150) // max(1, n_steps) - 16))
+        curr_y = 116
+        font_step = _load_font(26, bold=True)
+        font_num = _load_font(24, bold=True)
+        palette = [accent, (16, 185, 129), accent_alt, (139, 92, 246), (244, 63, 94)]
+        for i, st in enumerate(steps):
+            col = palette[i % len(palette)]
+            draw.rounded_rectangle([36, curr_y, width - 36, curr_y + box_h], radius=16, fill=(24, 36, 68, 245), outline=col + (235,), width=3)
+            draw.ellipse([54, curr_y + (box_h - 44) // 2, 98, curr_y + (box_h + 44) // 2], fill=col + (255,))
+            draw.text((69, curr_y + (box_h - 30) // 2), str(i + 1), font=font_num, fill=(15, 23, 42, 255))
+            s_lines = _wrap_text(draw, st, font_step, width - 170)
+            ty = curr_y + (box_h - len(s_lines[:2]) * 30) // 2
+            for sl in s_lines[:2]:
+                draw.text((116, ty), sl, font=font_step, fill=(255, 255, 255, 255))
+                ty += 30
+            if i < n_steps - 1:
+                cx = width // 2
+                draw.line([(cx, curr_y + box_h), (cx, curr_y + box_h + 16)], fill=accent_alt + (255,), width=4)
+            curr_y += box_h + 18
+        return card
+
+    # Default: Horizontal Animated-Style Data Bar Chart
+    if not labels:
+        labels = ["Core Efficiency", "Retention Rate", "Accuracy Benchmark", "Practical Impact"]
+        vals = [92.0, 84.0, 96.0, 78.0]
+    while len(vals) < len(labels):
+        vals.append(float(70 + (len(vals) * 8) % 25))
+
+    max_v = max([abs(x) for x in vals] + [1.0])
+    curr_y = 122
+    bar_colors = [accent, accent_alt, (16, 185, 129), (139, 92, 246), (244, 63, 94)]
+    font_lbl = _load_font(26, bold=True)
+    font_val = _load_font(25, bold=True)
+    max_bar_w = width - 96
+
+    for idx, lbl in enumerate(labels[:5]):
+        v = vals[idx]
+        ratio = max(0.12, min(1.0, abs(v) / max_v))
+        b_col = bar_colors[idx % len(bar_colors)]
+        val_str = f"{v:g}{unit}" if unit else f"{v:g}"
+
+        draw.text((40, curr_y), lbl[:34], font=font_lbl, fill=(241, 245, 249, 255))
+        draw.text((width - 145, curr_y), val_str[:10], font=font_val, fill=accent_alt + (255,))
+        curr_y += 36
+
+        # Track background + filled metric bar
+        draw.rounded_rectangle([40, curr_y, 40 + max_bar_w, curr_y + 34], radius=12, fill=(30, 41, 59, 255))
+        fill_w = max(28, int(max_bar_w * ratio))
+        draw.rounded_rectangle([40, curr_y, 40 + fill_w, curr_y + 34], radius=12, fill=b_col + (255,))
+        curr_y += 58
+        if curr_y > height - 55:
+            break
+
+    return card
+
+
+def generate_youtube_thumbnail(
+    raw_avatar_path,
+    cf_image_path,
+    lesson_title,
+    presenter_name="",
+    channel_name="",
+    visual_template="broadcast_studio",
+    output_jpg_path="thumbnail.jpg"
+):
+    """
+    Generates a high-CTR 1280x720 YouTube Thumbnail (.jpg) combining:
+      - Full-bleed darkened & color-graded AI visual backdrop
+      - Dramatic studio glow + cut-out framed Teacher Portrait on the right
+      - Giant, high-contrast 3-6 word Hook Headline Banner on the left
+      - Branded Channel / Presenter verification badge
+    """
+    W, H = 1280, 720
+    theme = resolve_studio_template(visual_template, block_idx=0)
+    accent = theme["accent"]
+    accent_alt = theme["accent_alt"]
+
+    if cf_image_path and os.path.exists(cf_image_path):
+        try:
+            bg = Image.open(cf_image_path).convert("RGB")
+            iw, ih = bg.size
+            sc = max(W / float(max(1, iw)), H / float(max(1, ih)))
+            bg = bg.resize((int(iw * sc), int(ih * sc)), Image.Resampling.LANCZOS)
+            lx, ly = (bg.size[0] - W) // 2, (bg.size[1] - H) // 2
+            bg = bg.crop((lx, ly, lx + W, ly + H))
+            dark = Image.new("RGB", (W, H), theme["bg_tint"])
+            bg = Image.blend(bg, dark, alpha=0.68)
+        except Exception:
+            bg = Image.new("RGB", (W, H), theme["bg_tint"])
+    else:
+        bg = Image.new("RGB", (W, H), theme["bg_tint"])
+
+    draw = ImageDraw.Draw(bg, "RGBA")
+
+    # Radiant spotlight glow behind presenter & headline
+    draw.ellipse([660, 40, 1340, 740], fill=accent + (88,))
+    draw.ellipse([-140, -100, 680, 620], fill=(10, 15, 30, 210))
+
+    # Left-side high-contrast Hook Typography
+    badge_txt = (channel_name or "MASTERCLASS LESSON").strip().upper()[:28]
+    draw.rounded_rectangle([54, 48, 490, 106], radius=14, fill=accent + (245,))
+    font_badge = _load_font(25, bold=True)
+    draw.text((76, 62), badge_txt, font=font_badge, fill=(10, 15, 30, 255))
+
+    font_hook = _load_font(68, bold=True)
+    clean_title = (lesson_title or "COMPLETE VIDEO MASTERCLASS").strip().upper()
+    hook_lines = _wrap_text(draw, clean_title, font_hook, 690)
+    hy = 136
+    for idx, line in enumerate(hook_lines[:4]):
+        # Drop shadow
+        draw.text((60, hy + 5), line, font=font_hook, fill=(0, 0, 0, 230))
+        fill_col = accent_alt + (255,) if idx == len(hook_lines[:4]) - 1 else (255, 255, 255, 255)
+        draw.text((54, hy), line, font=font_hook, fill=fill_col)
+        hy += 82
+
+    if presenter_name:
+        draw.rounded_rectangle([54, H - 112, 640, H - 46], radius=16, fill=(15, 23, 42, 235), outline=accent_alt + (220,), width=3)
+        font_pres = _load_font(28, bold=True)
+        draw.text((80, H - 94), f"WITH {presenter_name.upper()[:32]}", font=font_pres, fill=(255, 255, 255, 255))
+
+    # Right-side Framed Presenter Portrait (x=780..1228, y=54..666)
+    if raw_avatar_path and os.path.exists(raw_avatar_path):
+        try:
+            pres_bgr, _, _ = prepare_presenter_portrait(raw_avatar_path, 440, 590, device="cpu")
+            pres_rgb = cv2.cvtColor(pres_bgr, cv2.COLOR_BGR2RGB)
+            pres_pil = Image.fromarray(pres_rgb)
+            draw.rounded_rectangle([778, 56, 1230, 658], radius=30, fill=(15, 23, 42, 255), outline=accent_alt + (255,), width=6)
+            mask = Image.new("L", (440, 590), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, 440, 590], radius=24, fill=255)
+            bg.paste(pres_pil, (784, 62), mask)
+        except Exception as e:
+            print(f"Thumbnail portrait note: {e}")
+
+    # Outer broadcast border frame
+    draw.rectangle([6, 6, W - 7, H - 7], outline=accent + (220,), width=6)
+    bg.save(output_jpg_path, "JPEG", quality=93)
+    return output_jpg_path
+
+
+def _draw_broadcast_branding_overlays(
+    frame_bgr,
+    t_local,
+    t_global,
+    total_video_dur,
+    block_idx,
+    total_blocks,
+    lesson_title,
+    slide_title,
+    presenter_name="",
+    channel_name="",
+    theme=None
+):
+    """
+    Renders three high-retention broadcast television graphics onto `frame_bgr`:
+      1. Sleek Intro Title Badge during the first 2.6 seconds of Block 1
+      2. Animated Slide-Out Lower-Third Teacher Nameplate (t = 1.2s .. 7.8s in Block 1)
+      3. Branded YouTube Outro End-Screen Call-To-Action Banner during the final 3.6s of the last block
+    """
+    H, W = frame_bgr.shape[:2]
+    accent = (theme or {}).get("accent", (56, 189, 248))
+    accent_alt = (theme or {}).get("accent_alt", (250, 204, 21))
+
+    show_intro = (block_idx == 0 and t_local < 2.4)
+    show_lower_third = (block_idx == 0 and 1.2 <= t_local <= 7.8 and (presenter_name or channel_name))
+    time_remaining = max(0.0, total_video_dur - t_global)
+    show_outro = (block_idx == total_blocks - 1 and time_remaining <= 3.6)
+
+    if not (show_intro or show_lower_third or show_outro):
+        return frame_bgr
+
+    pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_img, "RGBA")
+
+    # 1. Animated Lower-Third Presenter Nameplate (t = 1.2s .. 7.8s)
+    if show_lower_third:
+        if t_local < 1.8:
+            prog = (t_local - 1.2) / 0.6
+        elif t_local > 7.2:
+            prog = max(0.0, (7.8 - t_local) / 0.6)
+        else:
+            prog = 1.0
+        ease = math.sin(prog * math.pi * 0.5)
+        box_w = min(W - 80, 620)
+        x_left = int(-box_w + (box_w + 68) * ease)
+        y_bot = H - 148 if W >= H else H - 280
+        y_top = y_bot - 108
+
+        draw.rounded_rectangle([x_left, y_top, x_left + box_w, y_bot], radius=18, fill=(10, 16, 34, 238), outline=accent + (240,), width=3)
+        draw.rounded_rectangle([x_left, y_top, x_left + 18, y_bot], radius=8, fill=accent_alt + (255,))
+        font_name = _load_font(31, bold=True)
+        font_role = _load_font(22, bold=True)
+        main_lbl = (presenter_name or channel_name or "Course Instructor").strip()
+        sub_lbl = (channel_name if presenter_name and channel_name else (lesson_title or "Featured Masterclass")).strip()
+        draw.text((x_left + 34, y_top + 18), main_lbl[:34], font=font_name, fill=(255, 255, 255, 255))
+        draw.text((x_left + 34, y_top + 60), sub_lbl.upper()[:42], font=font_role, fill=accent_alt + (255,))
+
+    # 2. Branded Intro Module Pill (first 2.4s of Block 1)
+    if show_intro:
+        alpha_i = int(235 * min(1.0, (2.4 - t_local) / 0.6))
+        bw = min(W - 80, 740)
+        bx1 = (W - bw) // 2
+        by1 = 92 if W >= H else 160
+        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + 64], radius=32, fill=(15, 23, 42, alpha_i), outline=accent_alt + (alpha_i,), width=3)
+        font_ib = _load_font(25, bold=True)
+        ch_prefix = f"{channel_name.upper()}  •  " if channel_name else "OFFICIAL LESSON  •  "
+        draw.text((bx1 + 32, by1 + 17), f"{ch_prefix}{lesson_title[:36].upper()}", font=font_ib, fill=(255, 255, 255, alpha_i))
+
+    # 3. YouTube Outro End-Screen Call-To-Action Banner (final 3.6s of last block)
+    if show_outro:
+        prog_o = min(1.0, (3.6 - time_remaining) / 0.5)
+        alpha_o = int(242 * prog_o)
+        bw = min(W - 80, 920)
+        bx1 = (W - bw) // 2
+        by1 = H - 134 if W >= H else H - 240
+        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + 88], radius=22, fill=(12, 18, 38, alpha_o), outline=accent_alt + (alpha_o,), width=3)
+        draw.rounded_rectangle([bx1 + 20, by1 + 18, bx1 + 230, by1 + 70], radius=14, fill=(239, 68, 68, alpha_o))
+        font_sub = _load_font(25, bold=True)
+        font_cta = _load_font(27, bold=True)
+        draw.text((bx1 + 44, by1 + 30), "SUBSCRIBE", font=font_sub, fill=(255, 255, 255, alpha_o))
+        cta_msg = f"Thanks for watching {channel_name or 'this lesson'}! Like & Share for more."
+        draw.text((bx1 + 254, by1 + 28), cta_msg[:46], font=font_cta, fill=(255, 255, 255, alpha_o))
+
+    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
 def render_powerpoint_slide_frame(
     lesson_title,
     slide_title,
@@ -1081,11 +1400,13 @@ def render_powerpoint_slide_frame(
     total_blocks=1,
     reveal_all=True,
     theme_variant=0,
-    visual_template="broadcast_studio"
+    visual_template="broadcast_studio",
+    chart_data=None
 ):
     """
     Renders a dynamic, high-contrast 1920x1080 PowerPoint Presentation Slide with:
       - Enlarged accessibility typography (40px bold bullets, 50px bold headers) for visually impaired learners
+      - Real Data Chart / Formula / Process Diagram rendering when `chart_data` is provided on Slide 2
       - Template-specific color palette & left/right column swapping
       - Returns (output_png, img_box_coords) so Ken-Burns zoom targets the exact illustration box
     """
@@ -1153,12 +1474,21 @@ def render_powerpoint_slide_frame(
         if curr_y > 872:
             break
 
-    # High-Res Visual Illustration Card (760x712)
+    # High-Res Visual Illustration OR Data Chart / Formula Card (760x716)
     draw.rounded_rectangle([img_card_x1, 176, img_card_x2, 924], radius=26, fill=(15, 23, 42, 255), outline=accent + (225,), width=3)
-    if cf_image_path and os.path.exists(cf_image_path):
+    target_w, target_h = 760, 716
+
+    if isinstance(chart_data, dict) and (chart_data.get("labels") or chart_data.get("formula")):
+        try:
+            chart_pil = render_data_chart_or_formula_card(chart_data, target_w, target_h, theme, slide_title=slide_title)
+            mask = Image.new("L", (target_w, target_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, target_w, target_h], radius=20, fill=255)
+            slide.paste(chart_pil, (img_paste_x, 192), mask)
+        except Exception as e:
+            print(f"Chart card render note: {e}")
+    elif cf_image_path and os.path.exists(cf_image_path):
         try:
             ill = Image.open(cf_image_path).convert("RGB")
-            target_w, target_h = 760, 716
             iw, ih = ill.size
             scale = max(target_w / float(iw), target_h / float(ih))
             nw, nh = int(iw * scale), int(ih * scale)
@@ -1265,7 +1595,7 @@ def _apply_organic_camera_breathing(frame_bgr, f_idx, fps=24):
     zoom = 1.004 + 0.003 * math.sin(2.0 * math.pi * 0.17 * t)
     tx = 2.2 * math.sin(2.0 * math.pi * 0.13 * t)
     ty = 1.4 * math.cos(2.0 * math.pi * 0.19 * t)
-    W, H = 1920, 1080
+    H, W = frame_bgr.shape[:2]
     M = np.float32([
         [zoom, 0.0, (1.0 - zoom) * (W * 0.5) + tx],
         [0.0, zoom, (1.0 - zoom) * (H * 0.5) + ty]
@@ -1280,6 +1610,7 @@ def _render_bokeh_particles(canvas_bgr, f_idx, fps=24):
     """
     t = f_idx / float(fps)
     overlay = canvas_bgr.copy()
+    H, W = canvas_bgr.shape[:2]
     particles = [
         (320, 280, 42, 0.35, 0.25, (248, 210, 120)),
         (860, 480, 58, -0.28, 0.30, (255, 230, 160)),
@@ -1288,10 +1619,58 @@ def _render_bokeh_particles(canvas_bgr, f_idx, fps=24):
         (580, 680, 46, 0.25, -0.35, (255, 220, 140)),
     ]
     for idx, (bx, by, rad, vx, vy, col) in enumerate(particles):
-        px = int((bx + math.sin(t * vx * 2.0 + idx) * 140) % 1920)
-        py = int((by + math.cos(t * vy * 2.0 + idx) * 90) % 1080)
+        px = int((bx + math.sin(t * vx * 2.0 + idx) * 140) % max(1, W))
+        py = int((by + math.cos(t * vy * 2.0 + idx) * 90) % max(1, H))
         cv2.circle(overlay, (px, py), rad, col, -1, cv2.LINE_AA)
     return cv2.addWeighted(overlay, 0.12, canvas_bgr, 0.88, 0.0)
+
+
+def _compose_vertical_916_frame(widescreen_bgr, pres_bgr, lesson_title, slide_title, slide_notes, theme, block_idx, total_blocks):
+    """
+    Composes a 1080x1920 (9:16 Vertical Shorts / TikTok / Reels) broadcast layout:
+      - Top header banner (y=0..116)
+      - Upper stage (y=124..1016): Live Lip-Synced Teacher Portrait + Concept Card
+      - Lower stage (y=1028..1640): Widescreen visual slide / B-Roll / Chart card
+      - Bottom caption safe zone (y=1640..1920)
+    """
+    VW, VH = 1080, 1920
+    canvas = np.full((VH, VW, 3), (theme["bg_tint"][2], theme["bg_tint"][1], theme["bg_tint"][0]), dtype=np.uint8)
+    accent_bgr = (int(theme["accent"][2]), int(theme["accent"][1]), int(theme["accent"][0]))
+
+    # Upper Presenter Stage (centered 520x628 portrait at top)
+    pw, ph = 520, 628
+    pres_resized = cv2.resize(pres_bgr, (pw, ph), interpolation=cv2.INTER_LINEAR)
+    px = (VW - pw) // 2
+    py = 136
+    cv2.rectangle(canvas, (px - 4, py - 4), (px + pw + 4, py + ph + 4), accent_bgr, 4, cv2.LINE_AA)
+    canvas[py:py + ph, px:px + pw] = pres_resized
+
+    # Lower Visual / Slide Stage (1000x562 at y=800..1362)
+    vw, vh = 1000, 562
+    vis_resized = cv2.resize(widescreen_bgr, (vw, vh), interpolation=cv2.INTER_AREA)
+    vx = (VW - vw) // 2
+    vy = 804
+    cv2.rectangle(canvas, (vx - 4, vy - 4), (vx + vw + 4, vy + vh + 4), accent_bgr, 3, cv2.LINE_AA)
+    canvas[vy:vy + vh, vx:vx + vw] = vis_resized
+
+    # Top Title Banner
+    pil_c = Image.fromarray(cv2.cvtColor(canvas, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_c, "RGBA")
+    draw.rounded_rectangle([36, 28, VW - 36, 112], radius=18, fill=theme["header_bg"], outline=theme["accent"] + (220,), width=3)
+    f_top = _load_font(28, bold=True)
+    draw.text((64, 52), (slide_title or lesson_title)[:34].upper(), font=f_top, fill=(255, 255, 255, 255))
+
+    # Key Takeaway Card (y=1392..1630)
+    if slide_notes:
+        draw.rounded_rectangle([40, 1392, VW - 40, 1630], radius=22, fill=theme["card_bg"], outline=theme["accent"] + (220,), width=3)
+        f_note = _load_font(33, bold=True)
+        n_lines = _wrap_text(draw, str(slide_notes[0]), f_note, VW - 140)
+        ny = 1424
+        for nl in n_lines[:3]:
+            draw.text((72, ny), nl, font=f_note, fill=theme["card_text"])
+            ny += 46
+
+    return cv2.cvtColor(np.array(pil_c), cv2.COLOR_RGB2BGR)
 
 
 class _PexelsVideoStream:
@@ -1360,6 +1739,10 @@ def render_dynamic_lesson_block(
     total_video_duration_sec=60.0,
     visual_blueprint="standard_30s",
     visual_template="broadcast_studio",
+    chart_data=None,
+    presenter_name="",
+    channel_name="",
+    aspect_ratio="16:9",
     fps=24,
     device="cuda",
     run_ffmpeg_fn=None,
@@ -1368,12 +1751,15 @@ def render_dynamic_lesson_block(
     """
     Rescales the 10-Minute Video Blueprint proportionally to ANY video duration (60s, 90s, 180s, 600s),
     applies the user's selected Studio Visual Template (out of 6 distinct broadcast templates),
-    and dynamically switches camera/visual modes every 6-8 seconds inside EVERY block.
+    renders optional Data Charts / Scientific Formulas onto slides, overlays branded Intro /
+    Lower-Third / Outro graphics, and supports both 16:9 Widescreen and 9:16 Vertical Shorts/Reels.
     """
     theme = resolve_studio_template(visual_template, block_idx=block_idx)
     accent_rgb = theme["accent"]
     pip_slide_pos = theme.get("pip_slide_pos", "top_right")
     pip_broll_pos = theme.get("pip_broll_pos", "bottom_right")
+    is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
+    out_w, out_h = (1080, 1920) if is_vertical else (1920, 1080)
 
     img1 = cf_images[0] if cf_images and len(cf_images) > 0 else None
     img2 = cf_images[1] if cf_images and len(cf_images) > 1 else img1
@@ -1385,7 +1771,7 @@ def render_dynamic_lesson_block(
     pexels_stream_1 = _PexelsVideoStream(vid_clip_1, 1920, 1080)
     pexels_stream_2 = _PexelsVideoStream(vid_clip_2, 1920, 1080)
 
-    # 1. Pre-compute talking presenter state (S3FD + Wav2Lip-GAN + Syllable Jaw + Eye Blink)
+    # 1. Pre-compute talking presenter state (S3FD + Wav2Lip-GAN + Syllable Jaw + Eye Blink + Eyebrow Lift)
     talk_state = synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=fps, device=device)
     num_frames = talk_state["num_frames"]
     block_dur_sec = num_frames / float(fps)
@@ -1396,7 +1782,7 @@ def render_dynamic_lesson_block(
         except Exception:
             pass
 
-    # 2. Build Studio Composite Background, PowerPoint Slide 1 & 2, and B-Roll Canvases
+    # 2. Build Studio Composite Background, PowerPoint Slide 1 & 2 (with optional Chart/Formula), and B-Roll Canvases
     presenter_w, presenter_h = 680, 820
     studio_bg_bgr, pres_slot_x, pres_slot_y = build_studio_Composite_background(
         raw_avatar_path=raw_avatar_path,
@@ -1425,7 +1811,8 @@ def render_dynamic_lesson_block(
         total_blocks=total_blocks,
         reveal_all=False,
         theme_variant=block_idx,
-        visual_template=visual_template
+        visual_template=visual_template,
+        chart_data=None
     )
     render_powerpoint_slide_frame(
         lesson_title=lesson_title,
@@ -1438,7 +1825,8 @@ def render_dynamic_lesson_block(
         total_blocks=total_blocks,
         reveal_all=True,
         theme_variant=block_idx + 1,
-        visual_template=visual_template
+        visual_template=visual_template,
+        chart_data=chart_data
     )
     slide1_bgr = cv2.imread(p1_png)
     slide2_bgr = cv2.imread(p2_png)
@@ -1507,7 +1895,7 @@ def render_dynamic_lesson_block(
             full_frame = studio_bg_bgr.copy()
             comp_slot = (pres_bgr.astype(np.float32) * card_alpha + base_slot * (1.0 - card_alpha)).astype(np.uint8)
             full_frame[pres_slot_y:pres_slot_y + presenter_h, pres_slot_x:pres_slot_x + presenter_w] = comp_slot
-            return _apply_organic_camera_breathing(full_frame, f_idx, fps=fps)
+            wide_out = _apply_organic_camera_breathing(full_frame, f_idx, fps=fps)
 
         elif mode_name in ("slide_1", "slide_2"):
             base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
@@ -1521,7 +1909,7 @@ def render_dynamic_lesson_block(
             ])
             base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
             base = _overlay_pip_presenter(base, pres_bgr, pos=pip_slide_pos, border_rgb=accent_rgb)
-            return _apply_organic_camera_breathing(base, f_idx, fps=fps)
+            wide_out = _apply_organic_camera_breathing(base, f_idx, fps=fps)
 
         else:
             is_second = (mode_name == "broll_2")
@@ -1551,14 +1939,18 @@ def render_dynamic_lesson_block(
 
             comp = (moved.astype(np.float32) * (1.0 - ov_a) + ov_bgr * ov_a).astype(np.uint8)
             comp = _overlay_pip_presenter(comp, pres_bgr, pos=pip_broll_pos, border_rgb=accent_rgb)
-            return comp
+            wide_out = comp
+
+        if is_vertical:
+            return _compose_vertical_916_frame(wide_out, pres_bgr, lesson_title, slide_title, slide_notes, theme, block_idx, total_blocks)
+        return wide_out
 
     silent_mp4 = f"{output_mp4_path}.silent.mp4"
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
-    writer = cv2.VideoWriter(silent_mp4, fourcc, float(fps), (1920, 1080))
+    writer = cv2.VideoWriter(silent_mp4, fourcc, float(fps), (out_w, out_h))
 
     modes = [_get_mode_for_frame(i) for i in range(num_frames)]
-    transition_len = 8
+    transition_len = 9
     tick_33 = max(1, num_frames // 3)
     tick_66 = max(2, (num_frames * 2) // 3)
 
@@ -1578,6 +1970,29 @@ def render_dynamic_lesson_block(
                     alpha = steps_since / float(transition_len)
                     prev_bgr = _render_single_mode_frame(prev_mode, f_idx)
                     frame_bgr = cv2.addWeighted(frame_bgr, alpha, prev_bgr, 1.0 - alpha, 0.0)
+
+        # Smooth 0.30s soft entrance fade at the start of every block (>0) for broadcast polish
+        if block_idx > 0 and f_idx < 7:
+            fade_a = (f_idx + 1) / 7.0
+            dark_bg = np.full_like(frame_bgr, (15, 20, 34), dtype=np.uint8)
+            frame_bgr = cv2.addWeighted(frame_bgr, fade_a, dark_bg, 1.0 - fade_a, 0.0)
+
+        # Apply Intro Title Badge, Animated Lower-Third Teacher Nameplate & YouTube Outro End-Screen
+        t_local = f_idx / float(fps)
+        t_global = block_start_sec + t_local
+        frame_bgr = _draw_broadcast_branding_overlays(
+            frame_bgr=frame_bgr,
+            t_local=t_local,
+            t_global=t_global,
+            total_video_dur=D,
+            block_idx=block_idx,
+            total_blocks=total_blocks,
+            lesson_title=lesson_title,
+            slide_title=slide_title,
+            presenter_name=presenter_name,
+            channel_name=channel_name,
+            theme=theme
+        )
 
         writer.write(frame_bgr)
 
@@ -1599,7 +2014,7 @@ def render_dynamic_lesson_block(
 
     if callable(progress_cb):
         try:
-            progress_cb(0.92, "Encoding H.264 video stream & burning 4-zone synchronized lyrics...")
+            progress_cb(0.92, "Encoding H.264 video stream & burning active karaoke captions...")
         except Exception:
             pass
 

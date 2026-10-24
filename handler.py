@@ -28,6 +28,7 @@ from lipsync_engine import (
     render_slides_block,
     render_broll_motion_block,
     generate_fallback_illustration,
+    generate_youtube_thumbnail,
 )
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
@@ -812,10 +813,77 @@ def get_background_soundtrack(bg_preset, workspace):
     return synth_bg
 
 
-def mix_voice_and_background_wav(voice_wav_path, bg_track_path, output_wav_path, bg_volume=0.25):
+def generate_studio_sfx_track(synthesized_blocks, n_samples, sr=24000):
     """
-    Mixes the Teacher's narration WAV and the Background Soundtrack WAV directly
-    in floating-point PCM without FFmpeg's amix 1/2 volume attenuation!
+    Synthesizes a subtle, broadcast-grade Studio Sound Effects (SFX) track at `sr` Hz:
+      - Soft, airy transition 'whoosh' at block boundaries
+      - Gentle harmonic marimba/bell 'pop/chime' cues when slide cards / bullet points reveal
+    Kept deliberately subtle (-19 dB peak) so it enhances production value without ever
+    competing with the Teacher's voice.
+    """
+    sfx = np.zeros(n_samples, dtype=np.float32)
+    rng = np.random.default_rng(2026)
+
+    for b_idx, item in enumerate(synthesized_blocks):
+        start_s = float(item.get("start_sec", 0.0))
+        dur_s = float(item.get("duration_sec", 20.0))
+
+        # 1. Soft airy transition whoosh at the start of each block (except 0.0s where we play a gentle intro chime)
+        if b_idx == 0:
+            chime_len = int(0.45 * sr)
+            if chime_len < n_samples:
+                t_c = np.linspace(0.0, 0.45, chime_len, endpoint=False, dtype=np.float32)
+                env_c = np.exp(-t_c * 7.5) * (1.0 - np.exp(-t_c * 90.0))
+                wave_c = (
+                    0.065 * np.sin(2.0 * np.pi * 523.25 * t_c)
+                    + 0.050 * np.sin(2.0 * np.pi * 659.25 * t_c)
+                    + 0.040 * np.sin(2.0 * np.pi * 783.99 * t_c)
+                ) * env_c
+                sfx[:chime_len] += wave_c
+        else:
+            w_start = max(0, int((start_s - 0.14) * sr))
+            w_len = int(0.32 * sr)
+            w_end = min(n_samples, w_start + w_len)
+            if w_end > w_start + 32:
+                seg_l = w_end - w_start
+                t_w = np.linspace(0.0, seg_l / float(sr), seg_l, endpoint=False, dtype=np.float32)
+                env_w = np.sin(np.pi * (t_w / (seg_l / float(sr)))) ** 1.6
+                # Filtered soft noise + low-mid sweep
+                noise = rng.standard_normal(seg_l).astype(np.float32)
+                win_k = 24
+                smooth_noise = np.convolve(noise, np.ones(win_k, dtype=np.float32) / float(win_k), mode="same")
+                sweep = np.sin(2.0 * np.pi * (140.0 + 220.0 * (t_w / 0.32)) * t_w)
+                sfx[w_start:w_end] += (0.055 * smooth_noise + 0.035 * sweep) * env_w
+
+        # 2. Subtle harmonic 'pop/chime' cues at internal visual scene switches (28% and 56% of block)
+        for frac, freq in ((0.28, 587.33), (0.56, 659.25)):
+            if dur_s < 8.0:
+                continue
+            p_start = int((start_s + dur_s * frac) * sr)
+            p_len = int(0.18 * sr)
+            p_end = min(n_samples, p_start + p_len)
+            if p_end > p_start + 16:
+                seg_l = p_end - p_start
+                t_p = np.linspace(0.0, seg_l / float(sr), seg_l, endpoint=False, dtype=np.float32)
+                env_p = np.exp(-t_p * 18.0) * (1.0 - np.exp(-t_p * 140.0))
+                pop_wave = (0.045 * np.sin(2.0 * np.pi * freq * t_p) + 0.022 * np.sin(2.0 * np.pi * (freq * 1.5) * t_p)) * env_p
+                sfx[p_start:p_end] += pop_wave
+
+    return sfx
+
+
+def mix_voice_and_background_wav(
+    voice_wav_path,
+    bg_track_path,
+    output_wav_path,
+    bg_volume=0.25,
+    synthesized_blocks=None,
+    enable_sfx=True
+):
+    """
+    Mixes the Teacher's narration WAV, Background Soundtrack WAV, and optional
+    Studio Transition & Bullet SFX directly in floating-point PCM without FFmpeg's
+    amix 1/2 volume attenuation!
     - Preserves 100% of the Teacher's boosted broadcast loudness.
     - Scales the background music linearly by the user's bg_volume slider (0.0 .. 1.0).
     - Applies gentle voice-activated ducking so the music never masks syllables.
@@ -824,9 +892,13 @@ def mix_voice_and_background_wav(voice_wav_path, bg_track_path, output_wav_path,
     if voice_np.ndim > 1:
         voice_np = np.mean(voice_np, axis=1)
 
+    n_voice = len(voice_np)
+    sfx_np = generate_studio_sfx_track(synthesized_blocks or [], n_voice, sr=sr) if enable_sfx else np.zeros(n_voice, dtype=np.float32)
+
     if not bg_track_path or not os.path.exists(bg_track_path) or float(bg_volume) <= 0.001:
-        stereo = np.column_stack([voice_np, voice_np])
-        sf.write(output_wav_path, stereo, sr, subtype='PCM_16')
+        combined = 0.97 * np.tanh((voice_np + sfx_np) / 0.94)
+        stereo = np.column_stack([combined, combined])
+        sf.write(output_wav_path, stereo.astype(np.float32), sr, subtype='PCM_16')
         return output_wav_path
 
     # Ensure bg_track is 24kHz mono WAV
@@ -838,7 +910,6 @@ def mix_voice_and_background_wav(voice_wav_path, bg_track_path, output_wav_path,
     if bg_np.ndim > 1:
         bg_np = np.mean(bg_np, axis=1)
 
-    n_voice = len(voice_np)
     if len(bg_np) < n_voice:
         repeats = int(np.ceil(n_voice / float(max(1, len(bg_np)))))
         bg_np = np.tile(bg_np, repeats)[:n_voice]
@@ -860,7 +931,7 @@ def mix_voice_and_background_wav(voice_wav_path, bg_track_path, output_wav_path,
 
     # User's bg_volume slider (0.0 .. 1.0, default 0.25)
     bg_gain = float(max(0.0, min(1.5, bg_volume))) * 0.52
-    mixed_mono = voice_np + (bg_np * bg_gain * duck_factor)
+    mixed_mono = voice_np + (bg_np * bg_gain * duck_factor) + sfx_np
 
     # Transparent studio ceiling limiter so combined peaks never clip
     mixed_limited = 0.97 * np.tanh(mixed_mono / 0.94)
@@ -1227,62 +1298,142 @@ def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=8):
     return phrases
 
 
-def _highlight_lyric_keywords_ass(safe_text, phrase_idx=0):
+def _format_youtube_chapter_ts(seconds):
+    seconds = max(0, int(round(float(seconds))))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    if h > 0:
+        return f"{h}:{m:02d}:{s:02d}"
+    return f"{m:02d}:{s:02d}"
+
+
+def build_youtube_seo_package(lesson_title, synthesized_blocks, presenter_name="", channel_name=""):
     """
-    Adds dynamic broadcast color highlights (Gold & Sky Cyan) to important content words
-    inside an .ass subtitle line so the typography looks captivating and modern.
+    Computes exact MM:SS YouTube Chapter Timestamps from the actual rendered block
+    audio durations, plus a ready-to-paste YouTube SEO Description & Comma-Separated Tags.
+    Always begins with 00:00 as required by YouTube automatic chapters.
     """
-    words = safe_text.split()
+    chapters = []
+    keywords_bag = []
+
+    for idx, item in enumerate(synthesized_blocks):
+        ts_str = "00:00" if idx == 0 else _format_youtube_chapter_ts(item.get("start_sec", 0.0))
+        stitle = str(item.get("slide_title") or f"Section {idx + 1}").strip()
+        chapters.append(f"{ts_str} - {stitle}")
+        for w in re.findall(r'[A-Za-z]{4,}', stitle):
+            wl = w.lower()
+            if wl not in keywords_bag and wl not in ("section", "module", "slide", "lesson", "introduction", "conclusion"):
+                keywords_bag.append(wl)
+
+    chapters_text = "\n".join(chapters)
+    ch_line = f"Presented by {presenter_name}" if presenter_name else (f"Published by {channel_name}" if channel_name else "Complete Interactive Video Masterclass")
+    summary_bullets = []
+    for item in synthesized_blocks[:6]:
+        notes = item.get("notes") or []
+        if notes:
+            summary_bullets.append(f"• {notes[0]}")
+
+    tags_list = [lesson_title, "Video Lesson", "Online Course", "Educational Masterclass"]
+    if channel_name:
+        tags_list.append(channel_name)
+    for kw in keywords_bag[:12]:
+        tags_list.append(kw.title())
+    tags_csv = ", ".join(tags_list[:16])
+
+    full_description = (
+        f"🎓 {lesson_title.upper()}\n"
+        f"{ch_line}\n\n"
+        f"📌 KEY TAKEAWAYS IN THIS LESSON:\n"
+        + ("\n".join(summary_bullets) if summary_bullets else f"• Comprehensive walkthrough of {lesson_title}")
+        + "\n\n⏱️ YOUTUBE CHAPTER TIMESTAMPS:\n"
+        + chapters_text
+        + f"\n\n🔖 TAGS:\n{tags_csv}\n"
+    )
+
+    return {
+        "title": lesson_title,
+        "chapters_text": chapters_text,
+        "full_description": full_description,
+        "tags": tags_csv,
+    }
+
+
+def _build_active_karaoke_line_ass(safe_text, phrase_duration_sec):
+    """
+    Builds a word-by-word active-highlight ASS Karaoke line using `{\\kf<centiseconds>}` tags.
+    In ASS karaoke:
+      - `PrimaryColour` is the ACTIVE / SPOKEN highlight color (Vibrant Gold/Cyan)
+      - `SecondaryColour` is the UNSPOKEN upcoming word color (Crisp White)
+    Each word smoothly sweeps from Crisp White to Vibrant Gold/Cyan at the exact
+    centisecond the teacher speaks it!
+    """
+    words = [w for w in safe_text.split() if w.strip()]
     if not words:
         return safe_text
 
-    accent_color = "&H0038BDF8&" if (phrase_idx % 2 == 0) else "&H0000D4FF&"
-    scored = []
-    for idx, w in enumerate(words):
-        clean_w = re.sub(r'[^A-Za-z]', '', w)
-        if len(clean_w) >= 6:
-            scored.append((len(clean_w), idx))
-    scored.sort(reverse=True)
-    highlight_indices = {idx for _, idx in scored[:2]}
+    total_cs = max(20, int(round(phrase_duration_sec * 100.0)))
+    char_weights = [max(2, len(re.sub(r'[^A-Za-z0-9]', '', w)) + (2 if w.endswith((',', '.', ';', '!', '?')) else 0)) for w in words]
+    sum_w = float(max(1, sum(char_weights)))
 
-    out_words = []
+    k_tokens = []
+    allocated = 0
     for idx, w in enumerate(words):
-        if idx in highlight_indices:
-            out_words.append(f"{{\\c{accent_color}}}{w}{{\\c&H00FFFFFF&}}")
+        if idx == len(words) - 1:
+            cs = max(8, total_cs - allocated)
         else:
-            out_words.append(w)
+            cs = max(8, int(round(total_cs * (char_weights[idx] / sum_w))))
+            allocated += cs
+        k_tokens.append(f"{{\\kf{cs}}}{w}")
 
-    if len(out_words) > 6:
-        mid = len(out_words) // 2
-        return " ".join(out_words[:mid]) + "\\N" + " ".join(out_words[mid:])
-    return " ".join(out_words)
+    if len(k_tokens) > 6:
+        mid = len(k_tokens) // 2
+        return " ".join(k_tokens[:mid]) + "\\N" + " ".join(k_tokens[mid:])
+    return " ".join(k_tokens)
 
 
-def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block_idx=0):
+def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block_idx=0, aspect_ratio="16:9"):
     """
-    Generates captivating, dynamic phrase-by-phrase synchronized on-screen lyrics (.ass)
-    that alternate positions across Bottom, Right, Top, and Left screen zones after
-    every 2 phrases, with enlarged high-visibility accessibility fonts (52-56px bold)
-    for visually impaired learners.
+    Generates captivating, word-by-word Active Karaoke Highlighted on-screen captions (.ass)
+    that alternate positions across Bottom, Right, Top, and Left screen zones (for 16:9)
+    or Bottom/Center zones (for 9:16 Vertical Shorts/Reels), with enlarged high-visibility
+    accessibility fonts (52-56px bold) for visually impaired learners.
+    Also detects speech onset in `audio_wav_path` so captions never lead before speech starts.
     """
+    speech_onset_sec = 0.0
     try:
-        total_duration = max(1.0, float(sf.info(audio_wav_path).duration))
+        wav_data, sr = sf.read(audio_wav_path, dtype='float32')
+        if wav_data.ndim > 1:
+            wav_data = np.mean(wav_data, axis=1)
+        total_duration = max(1.0, len(wav_data) / float(max(1, sr)))
+        # Detect first active speech sample above noise floor
+        abs_w = np.abs(wav_data)
+        peak_w = float(np.max(abs_w)) if len(abs_w) > 0 else 0.0
+        if peak_w > 0.02:
+            active_idx = np.where(abs_w > (peak_w * 0.08))[0]
+            if len(active_idx) > 0:
+                speech_onset_sec = min(0.65, float(active_idx[0]) / float(sr))
     except Exception:
         total_duration = 25.0
 
-    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=7)
+    is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
+    res_x, res_y = (1080, 1920) if is_vertical else (1920, 1080)
+    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=6 if is_vertical else 7)
+
+    # Note: In ASS Karaoke {\kf}, PrimaryColour is the ACTIVE highlighted word color (Gold &H0015CCFA / Cyan &H00F8BD38)
+    # and SecondaryColour is the UNSPOKEN word color (Crisp White &H00FFFFFF).
     ass_header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
-        "PlayResX: 1920\n"
-        "PlayResY: 1080\n"
+        f"PlayResX: {res_x}\n"
+        f"PlayResY: {res_y}\n"
         "WrapStyle: 1\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: LyricBottom,Liberation Sans,54,&H00FFFFFF,&H0000D4FF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,2,70,70,34,1\n"
-        "Style: LyricTop,Liberation Sans,52,&H00FFFFFF,&H0038BDF8,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,8,70,70,82,1\n"
-        "Style: LyricLeft,Liberation Sans,50,&H00FFFFFF,&H0000D4FF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,1,68,540,126,1\n"
-        "Style: LyricRight,Liberation Sans,50,&H00FFFFFF,&H0038BDF8,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,3,540,68,126,1\n\n"
+        "Style: LyricBottom,Liberation Sans,55,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,65,65,42,1\n"
+        "Style: LyricTop,Liberation Sans,53,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,8,65,65,86,1\n"
+        "Style: LyricLeft,Liberation Sans,51,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,1,68,540,128,1\n"
+        "Style: LyricRight,Liberation Sans,51,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,3,540,68,128,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -1292,25 +1443,26 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
             f.write(ass_header)
         return output_sub_path
 
-    style_cycle = ["LyricBottom", "LyricRight", "LyricTop", "LyricLeft"]
+    style_cycle = ["LyricBottom", "LyricTop"] if is_vertical else ["LyricBottom", "LyricRight", "LyricTop", "LyricLeft"]
 
     weights = [max(1, len(p)) for p in phrases]
     total_weight = float(sum(weights))
+    usable_duration = max(0.5, total_duration - speech_onset_sec)
 
     events = []
-    curr_t = 0.0
+    curr_t = speech_onset_sec
     for idx, phrase in enumerate(phrases):
-        dur = total_duration * (weights[idx] / total_weight)
+        dur = usable_duration * (weights[idx] / total_weight)
         start_t = curr_t
         end_t = total_duration if idx == len(phrases) - 1 else (curr_t + dur)
         curr_t = end_t
 
         style_name = style_cycle[((idx // 2) + block_idx) % len(style_cycle)]
         safe_text = phrase.replace("{", "(").replace("}", ")").replace("\n", " ").strip()
-        styled_text = _highlight_lyric_keywords_ass(safe_text, phrase_idx=idx)
+        karaoke_text = _build_active_karaoke_line_ass(safe_text, max(0.3, end_t - start_t))
 
         events.append(
-            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},{style_name},,0,0,0,,{{\\fad(150,130)}}{styled_text}\n"
+            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},{style_name},,0,0,0,,{{\\fad(120,110)}}{karaoke_text}\n"
         )
 
     with open(output_sub_path, "w", encoding="utf-8") as f:
@@ -1327,7 +1479,7 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
         '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
         final_output
     ]
-    run_ffmpeg(cmd, desc="Burn synchronized on-screen lyrics")
+    run_ffmpeg(cmd, desc="Burn synchronized active-karaoke captions")
 
 
 import threading
@@ -1386,6 +1538,10 @@ def handler(job):
     ).strip()
     visual_blueprint = (job_input.get('visual_blueprint') or 'standard_30s').strip()
     visual_template = (job_input.get('visual_template') or 'broadcast_studio').strip()
+    presenter_name = (job_input.get('presenter_name') or timeline_data.get('presenter_name') or '').strip()
+    channel_name = (job_input.get('channel_name') or timeline_data.get('channel_name') or '').strip()
+    aspect_ratio = (job_input.get('aspect_ratio') or '16:9').strip()
+    enable_sfx = (str(job_input.get('enable_sfx', 'yes')).strip().lower() != 'no')
 
     voice_ref_url = job_input.get('voice_ref_url')
     avatar_url = job_input.get('avatar_url')
@@ -1412,7 +1568,7 @@ def handler(job):
     print(
         f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | "
         f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | "
-        f"Blueprint: {visual_blueprint} | Studio Template: {visual_template}"
+        f"Blueprint: {visual_blueprint} | Studio Template: {visual_template} | Aspect: {aspect_ratio} | SFX: {enable_sfx}"
     )
 
     # Resolve Cloudflare R2, Workers AI, and Pexels credentials
@@ -1566,6 +1722,14 @@ def handler(job):
 
         print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
 
+        # Build YouTube Chapters, SEO Description & Tags package from exact block timestamps
+        youtube_seo = build_youtube_seo_package(
+            lesson_title=lesson_title,
+            synthesized_blocks=synthesized_blocks,
+            presenter_name=presenter_name,
+            channel_name=channel_name
+        )
+
         # Free TTS models from GPU VRAM before video lip-sync rendering
         if output_format == 'video':
             global _OMNIVOICE_MODEL, _MOSS_PROCESSOR, _MOSS_MODEL
@@ -1579,6 +1743,7 @@ def handler(job):
         # =====================================================================
         clip_files = []
         used_pexels_video_ids = set()
+        hero_thumbnail_bg_img = None
         render_start_time = time.time()
         vid_phase_start = 40
         vid_phase_span = 50.0  # 40% -> 90%
@@ -1592,6 +1757,7 @@ def handler(job):
             slide_title = item["slide_title"]
             output_wav = item["audio_wav"]
             blk_start_sec = item["start_sec"]
+            chart_data = block.get("chart_data") if isinstance(block.get("chart_data"), dict) else None
 
             if output_format == 'audio':
                 clip_files.append(output_wav)
@@ -1667,6 +1833,8 @@ def handler(job):
                 lesson_title=lesson_title,
                 pexels_api_key=pexels_api_key
             )
+            if hero_thumbnail_bg_img is None and cf_img_1:
+                hero_thumbnail_bg_img = cf_img_1
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
@@ -1703,15 +1871,19 @@ def handler(job):
                 total_video_duration_sec=total_video_duration_sec,
                 visual_blueprint=visual_blueprint,
                 visual_template=visual_template,
+                chart_data=chart_data,
+                presenter_name=presenter_name,
+                channel_name=channel_name,
+                aspect_ratio=aspect_ratio,
                 fps=24,
                 device=device,
                 run_ffmpeg_fn=run_ffmpeg,
                 progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk)
             )
 
-            # Burn dynamic alternating Top/Bottom/Left/Right synchronized lyrics
+            # Burn dynamic alternating word-by-word active-karaoke captions
             lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
-            create_synced_lyrics_ass(text, output_wav, lyrics_ass, block_idx=idx_counter)
+            create_synced_lyrics_ass(text, output_wav, lyrics_ass, block_idx=idx_counter, aspect_ratio=aspect_ratio)
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
             burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
 
@@ -1719,7 +1891,7 @@ def handler(job):
 
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step="Mixing Teacher Voice & Background Soundtrack at custom volumes...",
+            step="Mixing Teacher Voice, Studio Transition SFX & Background Soundtrack...",
             percent=92,
             time_left_sec=8
         )
@@ -1744,7 +1916,9 @@ def handler(job):
             voice_wav_path=temp_voice_wav,
             bg_track_path=bg_track,
             output_wav_path=mixed_master_wav,
-            bg_volume=bg_volume
+            bg_volume=bg_volume,
+            synthesized_blocks=synthesized_blocks,
+            enable_sfx=enable_sfx
         )
 
         # Build clean, human-readable filename from Lesson Title
@@ -1771,9 +1945,48 @@ def handler(job):
             r2_key = f"outputs/{job_id}/{download_filename}"
             content_type = "video/mp4"
 
+        # Generate & Upload 1280x720 High-CTR YouTube Thumbnail (.jpg)
+        thumbnail_url = ""
+        thumbnail_filename = f"{clean_slug}-Thumbnail.jpg"
+        try:
+            thumb_local = f"{workspace}/youtube_thumbnail.jpg"
+            generate_youtube_thumbnail(
+                raw_avatar_path=raw_avatar_path,
+                cf_image_path=hero_thumbnail_bg_img,
+                lesson_title=lesson_title,
+                presenter_name=presenter_name,
+                channel_name=channel_name,
+                visual_template=visual_template,
+                output_jpg_path=thumb_local
+            )
+            if os.path.exists(thumb_local):
+                thumb_r2_key = f"outputs/{job_id}/{thumbnail_filename}"
+                thumb_disp = f'attachment; filename="{thumbnail_filename}"'
+                s3_client.upload_file(
+                    thumb_local,
+                    bucket_name,
+                    thumb_r2_key,
+                    ExtraArgs={
+                        'ContentType': 'image/jpeg',
+                        'ContentDisposition': thumb_disp
+                    }
+                )
+                thumbnail_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': bucket_name,
+                        'Key': thumb_r2_key,
+                        'ResponseContentDisposition': thumb_disp,
+                        'ResponseContentType': 'image/jpeg'
+                    },
+                    ExpiresIn=604800
+                )
+        except Exception as th_err:
+            print(f"YouTube thumbnail generation/upload note: {th_err}")
+
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step=f"Uploading {download_filename} to Cloudflare R2 storage...",
+            step=f"Uploading {download_filename} & YouTube SEO Package to Cloudflare R2...",
             percent=96,
             time_left_sec=4
         )
@@ -1807,10 +2020,17 @@ def handler(job):
 
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step="Completed! Media rendered and saved to Cloudflare R2.",
+            step="Completed! Media, YouTube Thumbnail & Chapters ready.",
             percent=100,
             time_left_sec=0,
-            extra={"download_url": download_url, "filename": download_filename, "status": "COMPLETED"}
+            extra={
+                "download_url": download_url,
+                "filename": download_filename,
+                "thumbnail_url": thumbnail_url,
+                "thumbnail_filename": thumbnail_filename,
+                "youtube_seo": youtube_seo,
+                "status": "COMPLETED"
+            }
         )
 
         print(f"Job completed successfully! Returning output with download_url: {download_url} ({download_filename})")
@@ -1818,7 +2038,10 @@ def handler(job):
             "status": "success",
             "type": output_format,
             "filename": download_filename,
-            "download_url": download_url
+            "download_url": download_url,
+            "thumbnail_url": thumbnail_url,
+            "thumbnail_filename": thumbnail_filename,
+            "youtube_seo": youtube_seo
         }
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
