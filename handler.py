@@ -214,6 +214,195 @@ def normalize_audio_to_wav(input_audio_path, output_wav_path, max_duration_sec=N
     cmd.extend(['-ac', '1', '-ar', '24000', '-sample_fmt', 's16', '-c:a', 'pcm_s16le', output_wav_path])
     run_ffmpeg(cmd, desc="Audio normalization to 24kHz mono WAV")
 
+
+def prepare_clean_reference_voice_wav(input_audio_path, output_wav_path):
+    """
+    Prepares a clean 24kHz mono reference voice WAV for zero-shot voice cloning (OmniVoice / MOSS-TTS):
+      1. Applies an 80Hz high-pass filter to remove mic rumble/handling noise.
+      2. Trims leading silence so the prompt begins cleanly.
+      3. Instead of hard-cutting at 12.0s (which slices mid-word and causes OmniVoice/Whisper
+         to hallucinate or repeat a cut-off word like 'water' at every paragraph), scans between
+         4.5s and 9.5s for the quietest natural pause/silence valley and cuts cleanly there.
+      4. Applies a 60ms cosine fade-out on the last spoken samples and appends 400ms of pure
+         digital silence (0.0) so the acoustic prompt ends in a complete, silent pause.
+    """
+    temp_wav = f"{output_wav_path}.raw24k.wav"
+    cmd = [
+        'ffmpeg', '-y', '-i', input_audio_path,
+        '-af', 'highpass=f=80,lowpass=f=11500',
+        '-t', '15',
+        '-ac', '1', '-ar', '24000', '-sample_fmt', 's16', '-c:a', 'pcm_s16le',
+        temp_wav
+    ]
+    run_ffmpeg(cmd, desc="Reference voice pre-filtering to 24kHz mono WAV")
+
+    try:
+        audio_np, sr = sf.read(temp_wav, dtype='float32')
+        if os.path.exists(temp_wav):
+            os.remove(temp_wav)
+        if audio_np.ndim > 1:
+            audio_np = np.mean(audio_np, axis=1)
+
+        # Remove DC offset
+        audio_np = audio_np - float(np.mean(audio_np))
+        peak = float(np.max(np.abs(audio_np))) + 1e-7
+
+        # 1. Trim leading silence (keep 80ms pad before first speech)
+        win = int(0.025 * sr)
+        if len(audio_np) > win * 4:
+            abs_env = np.convolve(np.abs(audio_np), np.ones(win, dtype=np.float32) / float(win), mode='same')
+            voice_thresh = max(0.008, peak * 0.045)
+            active_idx = np.where(abs_env > voice_thresh)[0]
+            if len(active_idx) > 0:
+                start_sample = max(0, int(active_idx[0]) - int(0.08 * sr))
+                end_active = min(len(audio_np), int(active_idx[-1]) + int(0.08 * sr))
+                audio_np = audio_np[start_sample:end_active]
+
+        # 2. If longer than 5.5s, cut at the quietest natural pause valley between 4.5s and 9.5s
+        min_samples = int(4.5 * sr)
+        max_samples = int(9.5 * sr)
+        if len(audio_np) > int(5.5 * sr):
+            search_end = min(len(audio_np), max_samples)
+            if search_end > min_samples + int(0.3 * sr):
+                valley_win = int(0.14 * sr)  # 140ms pause window
+                segment = audio_np[min_samples:search_end]
+                energy = np.convolve(segment ** 2, np.ones(valley_win, dtype=np.float32) / float(valley_win), mode='valid')
+                if len(energy) > 0:
+                    best_offset = int(np.argmin(energy)) + valley_win // 2
+                    cut_sample = min_samples + best_offset
+                    audio_np = audio_np[:cut_sample]
+            else:
+                audio_np = audio_np[:search_end]
+
+        # 3. Apply 65ms smooth fade-out at the end of the spoken reference
+        fade_len = min(int(0.065 * sr), len(audio_np) // 4)
+        if fade_len > 0:
+            fade_curve = 0.5 * (1.0 + np.cos(np.linspace(0.0, np.pi, fade_len, dtype=np.float32)))
+            audio_np[-fade_len:] *= fade_curve
+
+        # 4. Append 400ms of pure digital silence (0.0) so Whisper & OmniVoice see a definitive sentence stop
+        silence_tail = np.zeros(int(0.40 * sr), dtype=np.float32)
+        clean_ref = np.concatenate([audio_np, silence_tail])
+
+        sf.write(output_wav_path, clean_ref, sr, subtype='PCM_16')
+        return output_wav_path
+    except Exception as e:
+        print(f"Reference voice smart-trim note ({e}); using standard normalization.")
+        if os.path.exists(temp_wav):
+            shutil.copyfile(temp_wav, output_wav_path)
+            os.remove(temp_wav)
+        else:
+            normalize_audio_to_wav(input_audio_path, output_wav_path, max_duration_sec=8)
+        return output_wav_path
+
+
+def sanitize_tts_spoken_text(raw_text):
+    """
+    Cleans input script text before passing to OmniVoice / MOSS-TTS / Edge-TTS:
+      - Removes any stage directions in brackets/parentheses like [pause 1s], [slide], [visual]
+      - Removes markdown formatting (*, #, _, `, ~) and raw URLs
+      - Normalizes whitespace and ensures clean sentence punctuation so zero-shot models
+        never hallucinate filler words at paragraph boundaries.
+    """
+    if not raw_text:
+        return ""
+    txt = str(raw_text)
+    txt = re.sub(r'\[[^\]]*\]', ' ', txt)
+    txt = re.sub(r'https?://\S+', ' ', txt)
+    txt = re.sub(r'[*#_`~>|]+', ' ', txt)
+    txt = re.sub(r'\s+', ' ', txt).strip()
+    if txt and txt[-1] not in '.!?':
+        txt += '.'
+    return txt
+
+
+def sanitize_omnivoice_prompt_object(prompt_obj):
+    """
+    Ensures the Whisper-transcribed `ref_text` inside an OmniVoice voice_clone_prompt
+    is free of trailing Whisper noise hallucinations (such as 'water', 'thank you', 'subtitles')
+    and ends with a clean full stop + space ('. ') so the reference transcript never bleeds
+    into the beginning of generated paragraphs.
+    """
+    if prompt_obj is None:
+        return None
+    try:
+        ref_t = None
+        if isinstance(prompt_obj, dict) and "ref_text" in prompt_obj:
+            ref_t = str(prompt_obj.get("ref_text") or "")
+        elif hasattr(prompt_obj, "ref_text"):
+            ref_t = str(getattr(prompt_obj, "ref_text") or "")
+
+        if ref_t is not None:
+            orig_t = ref_t
+            # Strip trailing isolated single-word Whisper silence hallucinations at clip boundary
+            ref_t = re.sub(
+                r'[\s,.;:!-]+\b(water|thank you|thanks for watching|subtitles|bye|you)\b[.!?\s]*$',
+                '.',
+                ref_t.strip(),
+                flags=re.IGNORECASE
+            ).strip()
+            if ref_t and ref_t[-1] not in '.!?':
+                ref_t += '.'
+            ref_t = ref_t + ' '
+            if isinstance(prompt_obj, dict):
+                prompt_obj["ref_text"] = ref_t
+            else:
+                try:
+                    setattr(prompt_obj, "ref_text", ref_t)
+                except Exception:
+                    pass
+            print(f"Sanitized OmniVoice ref_text: '{orig_t}' -> '{ref_t}'")
+    except Exception as e:
+        print(f"OmniVoice prompt inspection note: {e}")
+    return prompt_obj
+
+
+def _trim_leading_prompt_bleed(audio_np, sr=24000):
+    """
+    Detects and removes any short (<220ms) isolated acoustic prompt tail bleed (e.g., an
+    unwanted syllable like 'water' leaked from the reference voice prompt) that occurs at the
+    very beginning of a generated segment and is separated from the main sentence by a brief pause.
+    """
+    if audio_np is None or len(audio_np) < int(0.8 * sr):
+        return audio_np
+    try:
+        win = int(0.015 * sr)
+        env = np.convolve(np.abs(audio_np), np.ones(win, dtype=np.float32) / float(win), mode='same')
+        peak = float(np.max(env)) + 1e-7
+        silence_thr = max(0.005, peak * 0.04)
+
+        # Trim pure leading silence up to first active sound (keep 25ms natural attack)
+        active = np.where(env > silence_thr)[0]
+        if len(active) == 0:
+            return audio_np
+        first_sound = int(active[0])
+
+        # Check if there is a short burst (<240ms) followed by a clear silence valley (>55ms)
+        burst_max_end = first_sound + int(0.24 * sr)
+        search_limit = min(len(audio_np) // 3, first_sound + int(0.38 * sr))
+        if search_limit > burst_max_end:
+            sub_env = env[first_sound:search_limit]
+            quiet_mask = sub_env < silence_thr
+            # Find contiguous quiet region of at least 55ms after initial short burst
+            min_quiet_len = int(0.055 * sr)
+            count = 0
+            cut_rel = None
+            for i, is_q in enumerate(quiet_mask):
+                if is_q:
+                    count += 1
+                    if count >= min_quiet_len and i >= int(0.04 * sr):
+                        cut_rel = i - (count // 2)
+                        break
+                else:
+                    count = 0
+            if cut_rel is not None:
+                new_start = max(0, first_sound + cut_rel)
+                audio_np = audio_np[new_start:]
+    except Exception as e:
+        print(f"Audio onset trim note: {e}")
+    return audio_np
+
+
 def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_edge_voice=None):
     """
     Maps language_mode into:
@@ -253,10 +442,11 @@ async def _edge_tts_save_async(text, voice, out_mp3):
     await communicate.save(out_mp3)
 
 def generate_edge_tts_audio(text, output_wav, edge_voice):
+    clean_text = sanitize_tts_spoken_text(text)
     raw_mp3 = f"{output_wav}.edge.mp3"
 
     def _run_edge_in_new_thread():
-        asyncio.run(_edge_tts_save_async(text, edge_voice, raw_mp3))
+        asyncio.run(_edge_tts_save_async(clean_text, edge_voice, raw_mp3))
 
     with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
         executor.submit(_run_edge_in_new_thread).result()
@@ -268,19 +458,26 @@ def generate_edge_tts_audio(text, output_wav, edge_voice):
 def generate_omnivoice_audio(text, output_wav, voice_clone_prompt=None, ref_voice_path=None, voice_ref_text=""):
     model = get_omnivoice_model()
     raw_wav = f"{output_wav}.omni.wav"
+    clean_text = sanitize_tts_spoken_text(text)
 
-    kwargs = {"text": text}
+    kwargs = {"text": " " + clean_text}
     if voice_clone_prompt is not None:
         kwargs["voice_clone_prompt"] = voice_clone_prompt
     elif ref_voice_path and os.path.exists(ref_voice_path):
         kwargs["ref_audio"] = ref_voice_path
         if voice_ref_text:
-            kwargs["ref_text"] = voice_ref_text
+            clean_ref_t = voice_ref_text.strip()
+            if clean_ref_t and clean_ref_t[-1] not in '.!?':
+                clean_ref_t += '.'
+            kwargs["ref_text"] = clean_ref_t + " "
 
     audio_list = model.generate(**kwargs)
     audio_data = audio_list[0]
     if hasattr(audio_data, "detach"):
         audio_data = audio_data.detach().cpu().numpy()
+    audio_data = np.asarray(audio_data, dtype=np.float32).squeeze()
+    audio_data = _trim_leading_prompt_bleed(audio_data, sr=24000)
+
     sf.write(raw_wav, audio_data, 24000)
     normalize_audio_to_wav(raw_wav, output_wav)
     if os.path.exists(raw_wav):
@@ -290,6 +487,7 @@ def generate_moss_tts_audio(text, output_wav, moss_ref_codes=None, ref_voice_pat
     processor, model = get_moss_tts_engine()
     moss_device = "cuda" if torch.cuda.is_available() else "cpu"
     raw_wav = f"{output_wav}.moss.wav"
+    clean_text = sanitize_tts_spoken_text(text)
 
     reference_arg = None
     if moss_ref_codes is not None:
@@ -298,7 +496,7 @@ def generate_moss_tts_audio(text, output_wav, moss_ref_codes=None, ref_voice_pat
         reference_arg = [ref_voice_path]
 
     user_msg = processor.build_user_message(
-        text=text,
+        text=clean_text,
         reference=reference_arg,
         language=target_lang
     )
@@ -345,7 +543,8 @@ def _synthesize_single_segment(
     ref_voice_path=None,
     voice_ref_text=""
 ):
-    if not text or not text.strip():
+    clean_text = sanitize_tts_spoken_text(text)
+    if not clean_text or clean_text == ".":
         run_ffmpeg(
             f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono:d=0.2 -c:a pcm_s16le {output_wav}",
             desc="Generate short silence segment"
@@ -353,10 +552,10 @@ def _synthesize_single_segment(
         return
 
     if tts_engine == "edge_tts":
-        generate_edge_tts_audio(text, output_wav, edge_voice)
+        generate_edge_tts_audio(clean_text, output_wav, edge_voice)
     elif tts_engine == "moss_tts":
         generate_moss_tts_audio(
-            text,
+            clean_text,
             output_wav,
             moss_ref_codes=moss_ref_codes,
             ref_voice_path=ref_voice_path,
@@ -364,7 +563,7 @@ def _synthesize_single_segment(
         )
     else:
         generate_omnivoice_audio(
-            text,
+            clean_text,
             output_wav,
             voice_clone_prompt=omnivoice_prompt,
             ref_voice_path=ref_voice_path,
@@ -1063,14 +1262,15 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
     """
     Generates captivating, dynamic phrase-by-phrase synchronized on-screen lyrics (.ass)
     that alternate positions across Bottom, Right, Top, and Left screen zones after
-    every 2 phrases, with enhanced Liberation Sans Bold typography and keyword color accents.
+    every 2 phrases, with enlarged high-visibility accessibility fonts (52-56px bold)
+    for visually impaired learners.
     """
     try:
         total_duration = max(1.0, float(sf.info(audio_wav_path).duration))
     except Exception:
         total_duration = 25.0
 
-    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=8)
+    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=7)
     ass_header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -1079,10 +1279,10 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
         "WrapStyle: 1\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: LyricBottom,Liberation Sans,42,&H00FFFFFF,&H0000D4FF,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,2,80,80,38,1\n"
-        "Style: LyricTop,Liberation Sans,40,&H00FFFFFF,&H0038BDF8,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,8,80,80,82,1\n"
-        "Style: LyricLeft,Liberation Sans,39,&H00FFFFFF,&H0000D4FF,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,1,68,580,128,1\n"
-        "Style: LyricRight,Liberation Sans,39,&H00FFFFFF,&H0038BDF8,&H000F172A,&H96080E1A,-1,0,0,0,100,100,0.5,0,1,3.5,2,3,580,68,128,1\n\n"
+        "Style: LyricBottom,Liberation Sans,54,&H00FFFFFF,&H0000D4FF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,2,70,70,34,1\n"
+        "Style: LyricTop,Liberation Sans,52,&H00FFFFFF,&H0038BDF8,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,8,70,70,82,1\n"
+        "Style: LyricLeft,Liberation Sans,50,&H00FFFFFF,&H0000D4FF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,1,68,540,126,1\n"
+        "Style: LyricRight,Liberation Sans,50,&H00FFFFFF,&H0038BDF8,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.5,2.5,3,540,68,126,1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -1185,6 +1385,7 @@ def handler(job):
         or "Interactive Video Lesson"
     ).strip()
     visual_blueprint = (job_input.get('visual_blueprint') or 'standard_30s').strip()
+    visual_template = (job_input.get('visual_template') or 'broadcast_studio').strip()
 
     voice_ref_url = job_input.get('voice_ref_url')
     avatar_url = job_input.get('avatar_url')
@@ -1210,7 +1411,8 @@ def handler(job):
     )
     print(
         f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | "
-        f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | Blueprint: {visual_blueprint}"
+        f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | "
+        f"Blueprint: {visual_blueprint} | Studio Template: {visual_template}"
     )
 
     # Resolve Cloudflare R2, Workers AI, and Pexels credentials
@@ -1251,8 +1453,8 @@ def handler(job):
             if voice_ref_url:
                 raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig", s3_client, r2_endpoint, bucket_name)
                 ref_voice_path = f"{workspace}/ref_voice.wav"
-                print("Normalizing reference audio to 24kHz 16-bit PCM WAV (trimmed to 12s max for optimal cloning)...")
-                normalize_audio_to_wav(raw_voice_path, ref_voice_path, max_duration_sec=12 if not voice_ref_text else None)
+                print("Preparing clean reference audio (smart silence-valley trim + 400ms silence pad to prevent word bleed)...")
+                prepare_clean_reference_voice_wav(raw_voice_path, ref_voice_path)
 
                 report_live_progress(
                     job, s3_client, bucket_name, job_id,
@@ -1266,9 +1468,13 @@ def handler(job):
                     print("Creating reusable OmniVoice voice clone prompt...")
                     try:
                         if voice_ref_text:
-                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path, ref_text=voice_ref_text)
+                            clean_rt = voice_ref_text.strip()
+                            if clean_rt and clean_rt[-1] not in '.!?':
+                                clean_rt += '.'
+                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path, ref_text=clean_rt + " ")
                         else:
                             omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path)
+                        omnivoice_prompt = sanitize_omnivoice_prompt_object(omnivoice_prompt)
                     except Exception as prompt_err:
                         print(f"OmniVoice prompt pre-encoding note ({prompt_err}); will pass ref_audio directly during generation.")
                         omnivoice_prompt = None
@@ -1496,6 +1702,7 @@ def handler(job):
                 block_start_sec=blk_start_sec,
                 total_video_duration_sec=total_video_duration_sec,
                 visual_blueprint=visual_blueprint,
+                visual_template=visual_template,
                 fps=24,
                 device=device,
                 run_ffmpeg_fn=run_ffmpeg,
@@ -1540,13 +1747,18 @@ def handler(job):
             bg_volume=bg_volume
         )
 
+        # Build clean, human-readable filename from Lesson Title
+        clean_slug = re.sub(r'[^A-Za-z0-9]+', '-', lesson_title).strip('-')[:65] or "AI-Lesson"
+        ext = "mp3" if output_format == 'audio' else "mp4"
+        download_filename = f"{clean_slug}-Lesson.{ext}"
+
         if output_format == 'audio':
             master_file = f"{workspace}/master_lesson.mp3"
             run_ffmpeg(
                 f"ffmpeg -y -i {mixed_master_wav} -c:a libmp3lame -b:a 320k -ar 44100 -ac 2 {master_file}",
                 desc="Encode mixed master audio to 320kbps MP3"
             )
-            r2_key = f"outputs/{job_id}_master.mp3"
+            r2_key = f"outputs/{job_id}/{download_filename}"
             content_type = "audio/mpeg"
         else:
             master_file = f"{workspace}/master_lesson.mp4"
@@ -1556,28 +1768,37 @@ def handler(job):
                 f"ffmpeg -y -i {temp_video} -i {mixed_master_wav} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ar 44100 -ac 2 -shortest {master_file}",
                 desc="Mux video with non-attenuated broadcast master audio"
             )
-            r2_key = f"outputs/{job_id}_master.mp4"
+            r2_key = f"outputs/{job_id}/{download_filename}"
             content_type = "video/mp4"
 
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step="Uploading finished HD Master Lesson to Cloudflare R2 storage...",
+            step=f"Uploading {download_filename} to Cloudflare R2 storage...",
             percent=96,
             time_left_sec=4
         )
 
-        print(f"Uploading {master_file} to R2 bucket {bucket_name} as {r2_key}...")
+        content_disp = f'attachment; filename="{download_filename}"'
+        print(f"Uploading {master_file} to R2 bucket {bucket_name} as {r2_key} (filename={download_filename})...")
         s3_client.upload_file(
             master_file,
             bucket_name,
             r2_key,
-            ExtraArgs={'ContentType': content_type}
+            ExtraArgs={
+                'ContentType': content_type,
+                'ContentDisposition': content_disp
+            }
         )
 
         try:
             download_url = s3_client.generate_presigned_url(
                 'get_object',
-                Params={'Bucket': bucket_name, 'Key': r2_key},
+                Params={
+                    'Bucket': bucket_name,
+                    'Key': r2_key,
+                    'ResponseContentDisposition': content_disp,
+                    'ResponseContentType': content_type
+                },
                 ExpiresIn=604800  # 7 days valid
             )
         except Exception as e:
@@ -1589,13 +1810,14 @@ def handler(job):
             step="Completed! Media rendered and saved to Cloudflare R2.",
             percent=100,
             time_left_sec=0,
-            extra={"download_url": download_url, "status": "COMPLETED"}
+            extra={"download_url": download_url, "filename": download_filename, "status": "COMPLETED"}
         )
 
-        print(f"Job completed successfully! Returning output with download_url: {download_url}")
+        print(f"Job completed successfully! Returning output with download_url: {download_url} ({download_filename})")
         return {
             "status": "success",
             "type": output_format,
+            "filename": download_filename,
             "download_url": download_url
         }
     finally:
