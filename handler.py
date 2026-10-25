@@ -1392,13 +1392,70 @@ def _build_active_karaoke_line_ass(safe_text, phrase_duration_sec):
     return " ".join(k_tokens)
 
 
-def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block_idx=0, aspect_ratio="16:9"):
+def _format_srt_timestamp(seconds):
+    seconds = max(0.0, float(seconds))
+    h = int(seconds // 3600)
+    m = int((seconds % 3600) // 60)
+    s = int(seconds % 60)
+    ms = int(round((seconds - int(seconds)) * 1000.0))
+    if ms >= 1000:
+        ms = 999
+    return f"{h:02d}:{m:02d}:{s:02d},{ms:03d}"
+
+
+def create_synced_srt_subtitles(synthesized_blocks, output_srt_path):
     """
-    Generates captivating, word-by-word Active Karaoke Highlighted on-screen captions (.ass)
-    that alternate positions across Bottom, Right, Top, and Left screen zones (for 16:9)
-    or Bottom/Center zones (for 9:16 Vertical Shorts/Reels), with enlarged high-visibility
-    accessibility fonts (52-56px bold) for visually impaired learners.
-    Also detects speech onset in `audio_wav_path` so captions never lead before speech starts.
+    Generates a standard YouTube-ready SubRip (.srt) Closed Caption file across
+    all blocks so viewers can toggle native YouTube [CC] captions on/off and
+    YouTube indexes 100% of the spoken lesson keywords for SEO.
+    """
+    srt_entries = []
+    cue_idx = 1
+    for item in synthesized_blocks:
+        blk_start = float(item.get("start_sec", 0.0))
+        blk_dur = max(1.0, float(item.get("duration_sec", 20.0)))
+        text = str(item.get("text") or "").strip()
+        phrases = _split_script_into_lyric_phrases(text, max_words_per_phrase=8)
+        if not phrases:
+            continue
+        weights = [max(1, len(p)) for p in phrases]
+        total_w = float(sum(weights))
+        curr_t = blk_start
+        for i, ph in enumerate(phrases):
+            dur = blk_dur * (weights[i] / total_w)
+            st = curr_t
+            et = (blk_start + blk_dur) if i == len(phrases) - 1 else (curr_t + dur)
+            curr_t = et
+            clean_ph = ph.replace("\n", " ").strip()
+            if clean_ph:
+                srt_entries.append(
+                    f"{cue_idx}\n{_format_srt_timestamp(st)} --> {_format_srt_timestamp(et)}\n{clean_ph}\n\n"
+                )
+                cue_idx += 1
+
+    with open(output_srt_path, "w", encoding="utf-8") as f:
+        f.write("".join(srt_entries))
+    return output_srt_path
+
+
+def create_synced_lyrics_ass(
+    spoken_text,
+    audio_wav_path,
+    output_sub_path,
+    block_idx=0,
+    total_blocks=1,
+    aspect_ratio="16:9",
+    caption_mode="smart_broadcast"
+):
+    """
+    Generates word-by-word Active Karaoke Highlighted captions (.ass) according to `caption_mode`:
+      - 'smart_broadcast' (Default for 16:9): Eliminates visual clutter by suppressing burned-in
+        lyrics during PowerPoint Slide / Chart views (where bullet text is already on screen),
+        and only showing clean bottom-anchored captions during Studio / B-Roll segments!
+      - 'slides_only': Suppresses all burned-in subtitles (relies on slides + .srt Closed Captions).
+      - 'full_karaoke' (or 9:16 Vertical Shorts): Displays active karaoke captions throughout,
+        anchored cleanly in the bottom safe zone so they never collide with slide headers.
+    Returns (output_sub_path, has_dialogue_events).
     """
     speech_onset_sec = 0.0
     try:
@@ -1406,7 +1463,6 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
         if wav_data.ndim > 1:
             wav_data = np.mean(wav_data, axis=1)
         total_duration = max(1.0, len(wav_data) / float(max(1, sr)))
-        # Detect first active speech sample above noise floor
         abs_w = np.abs(wav_data)
         peak_w = float(np.max(abs_w)) if len(abs_w) > 0 else 0.0
         if peak_w > 0.02:
@@ -1417,11 +1473,11 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
         total_duration = 25.0
 
     is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
+    mode_clean = str(caption_mode or "smart_broadcast").strip().lower()
     res_x, res_y = (1080, 1920) if is_vertical else (1920, 1080)
     phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=6 if is_vertical else 7)
 
-    # Note: In ASS Karaoke {\kf}, PrimaryColour is the ACTIVE highlighted word color (Gold &H0015CCFA / Cyan &H00F8BD38)
-    # and SecondaryColour is the UNSPOKEN word color (Crisp White &H00FFFFFF).
+    margin_v = 115 if is_vertical else 44
     ass_header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -1430,20 +1486,16 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
         "WrapStyle: 1\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        "Style: LyricBottom,Liberation Sans,55,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,65,65,42,1\n"
-        "Style: LyricTop,Liberation Sans,53,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,8,65,65,86,1\n"
-        "Style: LyricLeft,Liberation Sans,51,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,1,68,540,128,1\n"
-        "Style: LyricRight,Liberation Sans,51,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,3,540,68,128,1\n\n"
+        f"Style: LyricBottom,Liberation Sans,54,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,72,72,{margin_v},1\n"
+        f"Style: LyricAlt,Liberation Sans,54,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,72,72,{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
 
-    if not phrases:
+    if not phrases or (mode_clean == "slides_only" and not is_vertical):
         with open(output_sub_path, "w", encoding="utf-8") as f:
             f.write(ass_header)
-        return output_sub_path
-
-    style_cycle = ["LyricBottom", "LyricTop"] if is_vertical else ["LyricBottom", "LyricRight", "LyricTop", "LyricLeft"]
+        return output_sub_path, False
 
     weights = [max(1, len(p)) for p in phrases]
     total_weight = float(sum(weights))
@@ -1457,7 +1509,20 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
         end_t = total_duration if idx == len(phrases) - 1 else (curr_t + dur)
         curr_t = end_t
 
-        style_name = style_cycle[((idx // 2) + block_idx) % len(style_cycle)]
+        # In Smart Broadcast Mode on 16:9, suppress burned-in captions during PowerPoint Slide windows
+        # so the viewer reads the slide bullets/charts without competing bottom lyrics!
+        if mode_clean == "smart_broadcast" and not is_vertical:
+            mid_frac = ((start_t + end_t) * 0.5) / max(1.0, total_duration)
+            if block_idx == 0:
+                is_slide_window = (mid_frac >= 0.78)
+            elif block_idx == total_blocks - 1:
+                is_slide_window = (mid_frac < 0.22)
+            else:
+                is_slide_window = (0.0 <= mid_frac < 0.28) or (0.56 <= mid_frac < 0.80)
+            if is_slide_window:
+                continue
+
+        style_name = "LyricBottom" if (idx % 2 == 0) else "LyricAlt"
         safe_text = phrase.replace("{", "(").replace("}", ")").replace("\n", " ").strip()
         karaoke_text = _build_active_karaoke_line_ass(safe_text, max(0.3, end_t - start_t))
 
@@ -1467,7 +1532,7 @@ def create_synced_lyrics_ass(spoken_text, audio_wav_path, output_sub_path, block
 
     with open(output_sub_path, "w", encoding="utf-8") as f:
         f.write(ass_header + "".join(events))
-    return output_sub_path
+    return output_sub_path, (len(events) > 0)
 
 
 def burn_presentation_slides(input_video, subtitle_file, final_output):
@@ -1480,6 +1545,183 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
         final_output
     ]
     run_ffmpeg(cmd, desc="Burn synchronized active-karaoke captions")
+
+
+def publish_video_to_youtube_cloud(
+    video_path,
+    thumbnail_path,
+    srt_path,
+    youtube_seo,
+    youtube_oauth,
+    privacy_status="public"
+):
+    """
+    Streams the finished .mp4 video, 1280x720 .jpg Thumbnail, and .srt Closed Captions
+    directly from the RunPod GPU worker over 10Gbps cloud fiber to YouTube Data API v3
+    without requiring the user to download any files locally!
+    """
+    if not isinstance(youtube_oauth, dict):
+        return None
+    access_token = (youtube_oauth.get("access_token") or "").strip()
+    refresh_token = (youtube_oauth.get("refresh_token") or "").strip()
+    client_id = (youtube_oauth.get("client_id") or "").strip()
+    client_secret = (youtube_oauth.get("client_secret") or "").strip()
+
+    if not access_token and (refresh_token and client_id and client_secret):
+        try:
+            tok_resp = requests.post(
+                "https://oauth2.googleapis.com/token",
+                data={
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "refresh_token": refresh_token,
+                    "grant_type": "refresh_token",
+                },
+                timeout=15
+            )
+            if tok_resp.status_code == 200:
+                access_token = (tok_resp.json() or {}).get("access_token", "")
+            else:
+                print(f"YouTube OAuth refresh error HTTP {tok_resp.status_code}: {tok_resp.text[:200]}")
+        except Exception as auth_e:
+            print(f"YouTube OAuth token refresh exception: {auth_e}")
+
+    if not access_token or not os.path.exists(video_path):
+        return None
+
+    title_str = str((youtube_seo or {}).get("title") or "AI Video Lesson").strip()[:98]
+    desc_str = str((youtube_seo or {}).get("full_description") or "").strip()[:4900]
+    raw_tags = str((youtube_seo or {}).get("tags") or "").split(",")
+    tags_list = [t.strip() for t in raw_tags if t.strip()][:15]
+    priv = str(privacy_status or youtube_oauth.get("privacy_status") or "public").strip().lower()
+    if priv not in ("public", "unlisted", "private"):
+        priv = "public"
+
+    meta_body = {
+        "snippet": {
+            "title": title_str,
+            "description": desc_str,
+            "tags": tags_list,
+            "categoryId": "27",  # Education
+        },
+        "status": {
+            "privacyStatus": priv,
+            "selfDeclaredMadeForKids": False,
+        }
+    }
+
+    try:
+        file_size = os.path.getsize(video_path)
+        init_headers = {
+            "Authorization": f"Bearer {access_token}",
+            "Content-Type": "application/json; charset=UTF-8",
+            "X-Upload-Content-Length": str(file_size),
+            "X-Upload-Content-Type": "video/mp4",
+        }
+        init_resp = requests.post(
+            "https://www.googleapis.com/upload/youtube/v3/videos?uploadType=resumable&part=snippet,status",
+            headers=init_headers,
+            data=json.dumps(meta_body).encode("utf-8"),
+            timeout=25
+        )
+        if init_resp.status_code not in (200, 201):
+            print(f"YouTube resumable init failed HTTP {init_resp.status_code}: {init_resp.text[:250]}")
+            return {"error": f"YouTube upload init HTTP {init_resp.status_code}: {init_resp.text[:180]}"}
+
+        upload_url = init_resp.headers.get("Location")
+        if not upload_url:
+            return {"error": "YouTube API did not return a resumable Location header."}
+
+        with open(video_path, "rb") as vf:
+            up_resp = requests.put(
+                upload_url,
+                headers={
+                    "Authorization": f"Bearer {access_token}",
+                    "Content-Type": "video/mp4",
+                    "Content-Length": str(file_size),
+                },
+                data=vf,
+                timeout=600
+            )
+        if up_resp.status_code not in (200, 201):
+            print(f"YouTube video upload failed HTTP {up_resp.status_code}: {up_resp.text[:250]}")
+            return {"error": f"YouTube video transfer HTTP {up_resp.status_code}"}
+
+        vid_json = up_resp.json() or {}
+        video_id = vid_json.get("id")
+        if not video_id:
+            return {"error": "YouTube upload completed without a video ID."}
+
+        print(f"Successfully uploaded video to YouTube! Video ID: {video_id}")
+
+        # 2. Upload Custom 1280x720 Thumbnail (.jpg)
+        thumb_uploaded = False
+        if thumbnail_path and os.path.exists(thumbnail_path):
+            try:
+                with open(thumbnail_path, "rb") as tf:
+                    th_resp = requests.post(
+                        f"https://www.googleapis.com/upload/youtube/v3/thumbnails/set?videoId={video_id}&uploadType=media",
+                        headers={
+                            "Authorization": f"Bearer {access_token}",
+                            "Content-Type": "image/jpeg",
+                        },
+                        data=tf.read(),
+                        timeout=45
+                    )
+                thumb_uploaded = (th_resp.status_code in (200, 201))
+                if not thumb_uploaded:
+                    print(f"YouTube thumbnail set note HTTP {th_resp.status_code}: {th_resp.text[:180]}")
+            except Exception as th_e:
+                print(f"YouTube thumbnail upload note: {th_e}")
+
+        # 3. Upload .srt Closed Captions Track for YouTube [CC] & SEO
+        captions_uploaded = False
+        if srt_path and os.path.exists(srt_path) and os.path.getsize(srt_path) > 10:
+            try:
+                boundary = f"===============ailg_srt_{uuid.uuid4().hex}=="
+                cap_meta = json.dumps({
+                    "snippet": {
+                        "videoId": video_id,
+                        "language": "en",
+                        "name": "English (Official Lesson Captions)",
+                        "isDraft": False
+                    }
+                })
+                with open(srt_path, "r", encoding="utf-8", errors="ignore") as sf_in:
+                    srt_body = sf_in.read()
+                multipart_body = (
+                    f"--{boundary}\r\n"
+                    "Content-Type: application/json; charset=UTF-8\r\n\r\n"
+                    f"{cap_meta}\r\n"
+                    f"--{boundary}\r\n"
+                    "Content-Type: application/octet-stream\r\n\r\n"
+                    f"{srt_body}\r\n"
+                    f"--{boundary}--\r\n"
+                ).encode("utf-8")
+                cap_resp = requests.post(
+                    "https://www.googleapis.com/upload/youtube/v3/captions?uploadType=multipart&part=snippet",
+                    headers={
+                        "Authorization": f"Bearer {access_token}",
+                        "Content-Type": f"multipart/related; boundary={boundary}",
+                    },
+                    data=multipart_body,
+                    timeout=45
+                )
+                captions_uploaded = (cap_resp.status_code in (200, 201))
+            except Exception as cap_e:
+                print(f"YouTube captions upload note: {cap_e}")
+
+        return {
+            "video_id": video_id,
+            "watch_url": f"https://youtu.be/{video_id}",
+            "studio_url": f"https://studio.youtube.com/video/{video_id}/edit",
+            "privacy_status": priv,
+            "thumbnail_set": thumb_uploaded,
+            "captions_set": captions_uploaded,
+        }
+    except Exception as yt_err:
+        print(f"YouTube direct publish exception: {yt_err}")
+        return {"error": str(yt_err)}
 
 
 import threading
@@ -1541,7 +1783,13 @@ def handler(job):
     presenter_name = (job_input.get('presenter_name') or timeline_data.get('presenter_name') or '').strip()
     channel_name = (job_input.get('channel_name') or timeline_data.get('channel_name') or '').strip()
     aspect_ratio = (job_input.get('aspect_ratio') or '16:9').strip()
+    caption_mode = (job_input.get('caption_mode') or 'smart_broadcast').strip()
     enable_sfx = (str(job_input.get('enable_sfx', 'yes')).strip().lower() != 'no')
+    logo_url = (job_input.get('logo_url') or '').strip()
+    logo_position = (job_input.get('logo_position') or 'top_right').strip()
+    master_audio_url = (job_input.get('master_audio_url') or timeline_data.get('master_audio_url') or '').strip()
+    youtube_auto_publish = (str(job_input.get('youtube_auto_publish', 'no')).strip().lower() == 'yes')
+    youtube_oauth = job_input.get('youtube_oauth') if isinstance(job_input.get('youtube_oauth'), dict) else None
 
     voice_ref_url = job_input.get('voice_ref_url')
     avatar_url = job_input.get('avatar_url')
@@ -1568,7 +1816,8 @@ def handler(job):
     print(
         f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | "
         f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | "
-        f"Blueprint: {visual_blueprint} | Studio Template: {visual_template} | Aspect: {aspect_ratio} | SFX: {enable_sfx}"
+        f"Blueprint: {visual_blueprint} | Studio Template: {visual_template} | Aspect: {aspect_ratio} | "
+        f"Captions: {caption_mode} | SFX: {enable_sfx} | MasterAudio: {bool(master_audio_url)}"
     )
 
     # Resolve Cloudflare R2, Workers AI, and Pexels credentials
@@ -1595,132 +1844,222 @@ def handler(job):
 
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step=f"GPU Worker active: Initializing {tts_engine.upper()} & downloading reference media...",
+            step=f"GPU Worker active: Initializing {'Audio-to-Video Slicer' if master_audio_url else tts_engine.upper()} & downloading media...",
             percent=8,
-            time_left_sec=int(total_blocks * (8 if output_format == 'audio' else 26))
+            time_left_sec=int(total_blocks * (8 if output_format == 'audio' else 22))
         )
-
-        voice_ref_text = job_input.get('voice_ref_text', '').strip()
-        ref_voice_path = None
-        omnivoice_prompt = None
-        moss_ref_codes = None
-
-        if tts_engine in ("omnivoice", "moss_tts"):
-            if voice_ref_url:
-                raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig", s3_client, r2_endpoint, bucket_name)
-                ref_voice_path = f"{workspace}/ref_voice.wav"
-                print("Preparing clean reference audio (smart silence-valley trim + 400ms silence pad to prevent word bleed)...")
-                prepare_clean_reference_voice_wav(raw_voice_path, ref_voice_path)
-
-                report_live_progress(
-                    job, s3_client, bucket_name, job_id,
-                    step=f"Encoding Teacher Voice Clone Profile with {tts_engine.upper()}...",
-                    percent=11,
-                    time_left_sec=int(total_blocks * (7 if output_format == 'audio' else 24))
-                )
-
-                if tts_engine == "omnivoice":
-                    model = get_omnivoice_model()
-                    print("Creating reusable OmniVoice voice clone prompt...")
-                    try:
-                        if voice_ref_text:
-                            clean_rt = voice_ref_text.strip()
-                            if clean_rt and clean_rt[-1] not in '.!?':
-                                clean_rt += '.'
-                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path, ref_text=clean_rt + " ")
-                        else:
-                            omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path)
-                        omnivoice_prompt = sanitize_omnivoice_prompt_object(omnivoice_prompt)
-                    except Exception as prompt_err:
-                        print(f"OmniVoice prompt pre-encoding note ({prompt_err}); will pass ref_audio directly during generation.")
-                        omnivoice_prompt = None
-                elif tts_engine == "moss_tts":
-                    processor, _ = get_moss_tts_engine()
-                    print("Encoding reference audio into reusable MOSS-TTS RVQ codes...")
-                    try:
-                        moss_ref_codes = processor.encode_audios_from_path([ref_voice_path])
-                    except Exception as moss_err:
-                        print(f"MOSS-TTS pre-encoding note ({moss_err}); will pass reference path directly.")
-                        moss_ref_codes = None
-            else:
-                print(f"No reference audio provided for {tts_engine}; using default/auto voice generation.")
 
         raw_avatar_path = ""
         if output_format == 'video' and avatar_url:
-            raw_avatar_path = download_file(avatar_url, f"{workspace}/avatar_orig", s3_client, r2_endpoint, bucket_name)
+            # Preserve file extension (.mp4/.webm/.jpg/.png) so video avatar loops are recognized!
+            av_ext = os.path.splitext(str(avatar_url).split('?')[0])[1].lower()
+            if av_ext not in ('.mp4', '.webm', '.mov', '.mkv', '.avi', '.jpg', '.jpeg', '.png', '.webp'):
+                av_ext = '.jpg'
+            raw_avatar_path = download_file(avatar_url, f"{workspace}/avatar_orig{av_ext}", s3_client, r2_endpoint, bucket_name)
 
-        # =====================================================================
-        # PASS 1: Synthesize narration audio for all blocks first so we know
-        # the exact total video duration (for rescaling the 10-min rules to ANY
-        # duration) and can free TTS VRAM before running Wav2Lip-GAN + S3FD!
-        # =====================================================================
+        raw_logo_path = None
+        if output_format == 'video' and logo_url:
+            try:
+                lg_ext = os.path.splitext(str(logo_url).split('?')[0])[1].lower()
+                if lg_ext not in ('.png', '.webp', '.jpg', '.jpeg'):
+                    lg_ext = '.png'
+                raw_logo_path = download_file(logo_url, f"{workspace}/brand_logo{lg_ext}", s3_client, r2_endpoint, bucket_name)
+            except Exception as lg_err:
+                print(f"Brand logo download note: {lg_err}")
+                raw_logo_path = None
+
         synthesized_blocks = []
         total_video_duration_sec = 0.0
         tts_phase_span = 76 if output_format == 'audio' else 28
 
-        for idx_counter, block in enumerate(blocks_list):
-            idx = block.get('block_index', idx_counter)
-            text = block.get('spoken_script', '')
-            notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
-            slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
-
-            percent_start = int(12 + (idx_counter / max(1, total_blocks)) * tts_phase_span)
+        # =====================================================================
+        # PASS 1A: If `master_audio_url` is provided (Audio-to-Video Mode),
+        # slice the user's uploaded audio lesson directly across the blocks
+        # instead of running TTS synthesis!
+        # =====================================================================
+        if master_audio_url:
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} teacher narration ({int(global_volume*100)}% broadcast boost)...",
-                percent=percent_start,
-                time_left_sec=max(8, int((total_blocks - idx_counter) * (6 if output_format == 'audio' else 21)))
+                step="Downloading & normalizing uploaded Audio Lesson for video conversion...",
+                percent=14,
+                time_left_sec=int(total_blocks * 18)
             )
+            raw_master_audio = download_file(master_audio_url, f"{workspace}/uploaded_lesson_raw", s3_client, r2_endpoint, bucket_name)
+            norm_master_wav = f"{workspace}/uploaded_lesson_24k.wav"
+            normalize_audio_to_wav(raw_master_audio, norm_master_wav)
+            boost_and_normalize_speech_wav(norm_master_wav, volume_val=global_volume)
 
-            output_wav = f"{workspace}/audio_{idx}.wav"
-            delivery = block.get('delivery_style', 'normal')
-            blk_whisper = True if delivery == 'whisper' else global_whisper
-            blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
+            master_np, master_sr = sf.read(norm_master_wav, dtype='float32')
+            if master_np.ndim > 1:
+                master_np = np.mean(master_np, axis=1)
+            total_master_samples = len(master_np)
+            total_master_sec = max(2.0, total_master_samples / float(max(1, master_sr)))
 
-            synthesize_block_audio_with_pauses(
-                text=text,
-                output_wav=output_wav,
-                tts_engine=tts_engine,
-                target_lang=target_lang,
-                edge_voice=edge_voice,
-                omnivoice_prompt=omnivoice_prompt,
-                moss_ref_codes=moss_ref_codes,
-                ref_voice_path=ref_voice_path,
-                voice_ref_text=voice_ref_text,
-                workspace=workspace,
-                whisper_mode=blk_whisper,
-                speed_val=blk_speed,
-                pitch_val=global_pitch,
-                volume_val=global_volume
-            )
+            # Compute proportional weights from each block's spoken_script length
+            block_weights = []
+            for b in blocks_list:
+                txt_len = len(str(b.get('spoken_script') or '').split())
+                block_weights.append(max(5, txt_len))
+            sum_bw = float(max(1, sum(block_weights)))
 
-            try:
-                blk_dur = max(1.0, float(sf.info(output_wav).duration))
-            except Exception:
-                blk_dur = 30.0
+            curr_sample = 0
+            for idx_counter, block in enumerate(blocks_list):
+                idx = block.get('block_index', idx_counter)
+                text = str(block.get('spoken_script') or '').strip()
+                notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
+                slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
 
-            synthesized_blocks.append({
-                "idx_counter": idx_counter,
-                "idx": idx,
-                "block": block,
-                "text": text,
-                "notes": notes,
-                "slide_title": slide_title,
-                "audio_wav": output_wav,
-                "start_sec": total_video_duration_sec,
-                "duration_sec": blk_dur,
-            })
-            total_video_duration_sec += blk_dur
+                if idx_counter == len(blocks_list) - 1:
+                    end_sample = total_master_samples
+                else:
+                    seg_samples = int(round(total_master_samples * (block_weights[idx_counter] / sum_bw)))
+                    end_sample = min(total_master_samples, curr_sample + max(master_sr, seg_samples))
 
-            percent_after_tts = int(12 + ((idx_counter + 1) / max(1, total_blocks)) * tts_phase_span)
-            report_live_progress(
-                job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Narration audio ready ({blk_dur:.1f}s)...",
-                percent=percent_after_tts,
-                time_left_sec=max(6, int((total_blocks - idx_counter) * (5 if output_format == 'audio' else 19)))
-            )
+                slice_np = master_np[curr_sample:end_sample]
+                if len(slice_np) < master_sr:
+                    slice_np = np.pad(slice_np, (0, master_sr - len(slice_np)))
+                curr_sample = end_sample
 
-        print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
+                output_wav = f"{workspace}/audio_{idx}.wav"
+                sf.write(output_wav, slice_np.astype(np.float32), master_sr, subtype='PCM_16')
+                blk_dur = max(1.0, len(slice_np) / float(master_sr))
+
+                # If spoken_script is empty or placeholder, auto-transcribe the slice using Whisper on GPU
+                if len(text.split()) < 3:
+                    transcribed = _auto_transcribe_reference_audio(output_wav, max_words=120)
+                    if transcribed:
+                        text = transcribed
+                        if not notes:
+                            sents = [s.strip() for s in re.split(r'[\.\!\?]+', transcribed) if len(s.strip()) > 8]
+                            notes = sents[:3] if sents else [transcribed[:65]]
+
+                synthesized_blocks.append({
+                    "idx_counter": idx_counter,
+                    "idx": idx,
+                    "block": block,
+                    "text": text,
+                    "notes": notes,
+                    "slide_title": slide_title,
+                    "audio_wav": output_wav,
+                    "start_sec": total_video_duration_sec,
+                    "duration_sec": blk_dur,
+                })
+                total_video_duration_sec += blk_dur
+
+            print(f"Uploaded Audio Lesson ({total_master_sec:.1f}s) sliced into {len(synthesized_blocks)} video modules.")
+
+        else:
+            # =====================================================================
+            # PASS 1B: Standard TTS Narration Synthesis across all blocks
+            # =====================================================================
+            voice_ref_text = job_input.get('voice_ref_text', '').strip()
+            ref_voice_path = None
+            omnivoice_prompt = None
+            moss_ref_codes = None
+
+            if tts_engine in ("omnivoice", "moss_tts"):
+                if voice_ref_url:
+                    raw_voice_path = download_file(voice_ref_url, f"{workspace}/ref_voice_orig", s3_client, r2_endpoint, bucket_name)
+                    ref_voice_path = f"{workspace}/ref_voice.wav"
+                    print("Preparing clean reference audio (smart silence-valley trim + 400ms silence pad to prevent word bleed)...")
+                    prepare_clean_reference_voice_wav(raw_voice_path, ref_voice_path)
+
+                    report_live_progress(
+                        job, s3_client, bucket_name, job_id,
+                        step=f"Encoding Teacher Voice Clone Profile with {tts_engine.upper()}...",
+                        percent=11,
+                        time_left_sec=int(total_blocks * (7 if output_format == 'audio' else 24))
+                    )
+
+                    if tts_engine == "omnivoice":
+                        model = get_omnivoice_model()
+                        print("Creating reusable OmniVoice voice clone prompt...")
+                        try:
+                            if voice_ref_text:
+                                clean_rt = voice_ref_text.strip()
+                                if clean_rt and clean_rt[-1] not in '.!?':
+                                    clean_rt += '.'
+                                omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path, ref_text=clean_rt + " ")
+                            else:
+                                omnivoice_prompt = model.create_voice_clone_prompt(ref_audio=ref_voice_path)
+                            omnivoice_prompt = sanitize_omnivoice_prompt_object(omnivoice_prompt)
+                        except Exception as prompt_err:
+                            print(f"OmniVoice prompt pre-encoding note ({prompt_err}); will pass ref_audio directly during generation.")
+                            omnivoice_prompt = None
+                    elif tts_engine == "moss_tts":
+                        processor, _ = get_moss_tts_engine()
+                        print("Encoding reference audio into reusable MOSS-TTS RVQ codes...")
+                        try:
+                            moss_ref_codes = processor.encode_audios_from_path([ref_voice_path])
+                        except Exception as moss_err:
+                            print(f"MOSS-TTS pre-encoding note ({moss_err}); will pass reference path directly.")
+                            moss_ref_codes = None
+                else:
+                    print(f"No reference audio provided for {tts_engine}; using default/auto voice generation.")
+
+            for idx_counter, block in enumerate(blocks_list):
+                idx = block.get('block_index', idx_counter)
+                text = block.get('spoken_script', '')
+                notes = [str(n).strip() for n in (block.get('slide_notes') or []) if str(n).strip()]
+                slide_title = (block.get('slide_title') or (notes[0][:48] if notes else f"Key Concept #{idx_counter + 1}")).strip()
+
+                percent_start = int(12 + (idx_counter / max(1, total_blocks)) * tts_phase_span)
+                report_live_progress(
+                    job, s3_client, bucket_name, job_id,
+                    step=f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} teacher narration ({int(global_volume*100)}% broadcast boost)...",
+                    percent=percent_start,
+                    time_left_sec=max(8, int((total_blocks - idx_counter) * (6 if output_format == 'audio' else 21)))
+                )
+
+                output_wav = f"{workspace}/audio_{idx}.wav"
+                delivery = block.get('delivery_style', 'normal')
+                blk_whisper = True if delivery == 'whisper' else global_whisper
+                blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
+
+                synthesize_block_audio_with_pauses(
+                    text=text,
+                    output_wav=output_wav,
+                    tts_engine=tts_engine,
+                    target_lang=target_lang,
+                    edge_voice=edge_voice,
+                    omnivoice_prompt=omnivoice_prompt,
+                    moss_ref_codes=moss_ref_codes,
+                    ref_voice_path=ref_voice_path,
+                    voice_ref_text=voice_ref_text,
+                    workspace=workspace,
+                    whisper_mode=blk_whisper,
+                    speed_val=blk_speed,
+                    pitch_val=global_pitch,
+                    volume_val=global_volume
+                )
+
+                try:
+                    blk_dur = max(1.0, float(sf.info(output_wav).duration))
+                except Exception:
+                    blk_dur = 30.0
+
+                synthesized_blocks.append({
+                    "idx_counter": idx_counter,
+                    "idx": idx,
+                    "block": block,
+                    "text": text,
+                    "notes": notes,
+                    "slide_title": slide_title,
+                    "audio_wav": output_wav,
+                    "start_sec": total_video_duration_sec,
+                    "duration_sec": blk_dur,
+                })
+                total_video_duration_sec += blk_dur
+
+                percent_after_tts = int(12 + ((idx_counter + 1) / max(1, total_blocks)) * tts_phase_span)
+                report_live_progress(
+                    job, s3_client, bucket_name, job_id,
+                    step=f"Block {idx_counter+1}/{total_blocks}: Narration audio ready ({blk_dur:.1f}s)...",
+                    percent=percent_after_tts,
+                    time_left_sec=max(6, int((total_blocks - idx_counter) * (5 if output_format == 'audio' else 19)))
+                )
+
+            print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
 
         # Build YouTube Chapters, SEO Description & Tags package from exact block timestamps
         youtube_seo = build_youtube_seo_package(
@@ -1764,7 +2103,7 @@ def handler(job):
                 continue
 
             elapsed_render = time.time() - render_start_time
-            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 18.0
+            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 16.0
             time_left_blk = max(8, int((total_blocks - idx_counter) * sec_per_vid_blk))
 
             blk_base_pct = vid_phase_start + (idx_counter / float(max(1, total_blocks))) * vid_phase_span
@@ -1875,17 +2214,30 @@ def handler(job):
                 presenter_name=presenter_name,
                 channel_name=channel_name,
                 aspect_ratio=aspect_ratio,
+                logo_path=raw_logo_path,
+                logo_position=logo_position,
                 fps=24,
                 device=device,
                 run_ffmpeg_fn=run_ffmpeg,
                 progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk)
             )
 
-            # Burn dynamic alternating word-by-word active-karaoke captions
+            # Burn captions according to Smart Broadcast Mode (skips FFmpeg burn-in when no events are needed!)
             lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
-            create_synced_lyrics_ass(text, output_wav, lyrics_ass, block_idx=idx_counter, aspect_ratio=aspect_ratio)
+            _, has_ass_events = create_synced_lyrics_ass(
+                text,
+                output_wav,
+                lyrics_ass,
+                block_idx=idx_counter,
+                total_blocks=total_blocks,
+                aspect_ratio=aspect_ratio,
+                caption_mode=caption_mode
+            )
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
-            burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
+            if has_ass_events:
+                burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
+            else:
+                shutil.copyfile(raw_block_mp4, final_chunk)
 
             clip_files.append(final_chunk)
 
@@ -1945,11 +2297,42 @@ def handler(job):
             r2_key = f"outputs/{job_id}/{download_filename}"
             content_type = "video/mp4"
 
-        # Generate & Upload 1280x720 High-CTR YouTube Thumbnail (.jpg)
+        # Generate & Upload YouTube Closed Captions (.srt)
+        srt_url = ""
+        srt_filename = f"{clean_slug}-Captions.srt"
+        srt_local = f"{workspace}/youtube_captions.srt"
+        try:
+            create_synced_srt_subtitles(synthesized_blocks, srt_local)
+            if os.path.exists(srt_local) and os.path.getsize(srt_local) > 4:
+                srt_r2_key = f"outputs/{job_id}/{srt_filename}"
+                srt_disp = f'attachment; filename="{srt_filename}"'
+                s3_client.upload_file(
+                    srt_local,
+                    bucket_name,
+                    srt_r2_key,
+                    ExtraArgs={
+                        'ContentType': 'text/plain; charset=utf-8',
+                        'ContentDisposition': srt_disp
+                    }
+                )
+                srt_url = s3_client.generate_presigned_url(
+                    'get_object',
+                    Params={
+                        'Bucket': bucket_name,
+                        'Key': srt_r2_key,
+                        'ResponseContentDisposition': srt_disp,
+                        'ResponseContentType': 'text/plain; charset=utf-8'
+                    },
+                    ExpiresIn=604800
+                )
+        except Exception as srt_err:
+            print(f"SRT closed captions upload note: {srt_err}")
+
+        # Generate & Upload Unique 1280x720 High-CTR YouTube Thumbnail (.jpg)
         thumbnail_url = ""
         thumbnail_filename = f"{clean_slug}-Thumbnail.jpg"
+        thumb_local = f"{workspace}/youtube_thumbnail.jpg"
         try:
-            thumb_local = f"{workspace}/youtube_thumbnail.jpg"
             generate_youtube_thumbnail(
                 raw_avatar_path=raw_avatar_path,
                 cf_image_path=hero_thumbnail_bg_img,
@@ -1957,7 +2340,9 @@ def handler(job):
                 presenter_name=presenter_name,
                 channel_name=channel_name,
                 visual_template=visual_template,
-                output_jpg_path=thumb_local
+                output_jpg_path=thumb_local,
+                logo_path=raw_logo_path,
+                variant_seed=job_id
             )
             if os.path.exists(thumb_local):
                 thumb_r2_key = f"outputs/{job_id}/{thumbnail_filename}"
@@ -2018,9 +2403,26 @@ def handler(job):
             print(f"Presigned URL generation failed ({e}), falling back to endpoint URL...")
             download_url = f"{r2_endpoint}/{bucket_name}/{r2_key}"
 
+        # Optional Direct Cloud-to-YouTube Publishing (when requested & authorized)
+        youtube_publish_result = None
+        if output_format == 'video' and youtube_auto_publish and youtube_oauth:
+            report_live_progress(
+                job, s3_client, bucket_name, job_id,
+                step="Streaming Video, Thumbnail & Captions directly from Cloud to YouTube...",
+                percent=98,
+                time_left_sec=3
+            )
+            youtube_publish_result = publish_video_to_youtube_cloud(
+                video_path=master_file,
+                thumbnail_path=thumb_local if os.path.exists(thumb_local) else None,
+                srt_path=srt_local if os.path.exists(srt_local) else None,
+                youtube_seo=youtube_seo,
+                youtube_oauth=youtube_oauth
+            )
+
         report_live_progress(
             job, s3_client, bucket_name, job_id,
-            step="Completed! Media, YouTube Thumbnail & Chapters ready.",
+            step="Completed! Media, YouTube Thumbnail, Captions (.srt) & Chapters ready.",
             percent=100,
             time_left_sec=0,
             extra={
@@ -2028,7 +2430,10 @@ def handler(job):
                 "filename": download_filename,
                 "thumbnail_url": thumbnail_url,
                 "thumbnail_filename": thumbnail_filename,
+                "srt_url": srt_url,
+                "srt_filename": srt_filename,
                 "youtube_seo": youtube_seo,
+                "youtube_publish": youtube_publish_result,
                 "status": "COMPLETED"
             }
         )
@@ -2041,7 +2446,10 @@ def handler(job):
             "download_url": download_url,
             "thumbnail_url": thumbnail_url,
             "thumbnail_filename": thumbnail_filename,
-            "youtube_seo": youtube_seo
+            "srt_url": srt_url,
+            "srt_filename": srt_filename,
+            "youtube_seo": youtube_seo,
+            "youtube_publish": youtube_publish_result
         }
     finally:
         shutil.rmtree(workspace, ignore_errors=True)
