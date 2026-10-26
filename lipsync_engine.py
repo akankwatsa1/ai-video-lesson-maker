@@ -1451,25 +1451,45 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
     return card
 
 
-def _prepare_brand_logo_overlay(logo_path, max_w=176, max_h=72):
+def _prepare_brand_logo_overlay(logo_path, max_w=192, max_h=78):
     """
-    Loads an optional user/channel Brand Logo (.png/.webp/.jpg) and prepares both
-    a PIL RGBA image (for thumbnails) and pre-multiplied BGR + alpha arrays (for fast
-    per-frame video watermarking). Preserves PNG alpha transparency or wraps opaque
-    images in a sleek rounded glass pill.
+    Loads an optional user/channel Brand Logo (.png/.webp/.jpg/.gif) from either direct upload
+    or WordPress Site Media Library URL and prepares both a PIL RGBA image (for thumbnails)
+    and pre-multiplied BGR + alpha arrays (for fast per-frame video watermarking).
+    Includes OpenCV fallback if PIL encounters unusual color profiles.
     """
     if not logo_path or not os.path.exists(logo_path):
         return None
     try:
-        pil_logo = Image.open(logo_path).convert("RGBA")
+        pil_logo = None
+        try:
+            img_open = Image.open(logo_path)
+            if getattr(img_open, "is_animated", False):
+                img_open.seek(0)
+            pil_logo = img_open.convert("RGBA")
+        except Exception:
+            cv_img = cv2.imread(logo_path, cv2.IMREAD_UNCHANGED)
+            if cv_img is not None and cv_img.size > 0:
+                if cv_img.ndim == 2:
+                    pil_logo = Image.fromarray(cv_img).convert("RGBA")
+                elif cv_img.shape[2] == 4:
+                    rgba = cv2.cvtColor(cv_img, cv2.COLOR_BGRA2RGBA)
+                    pil_logo = Image.fromarray(rgba)
+                else:
+                    rgb = cv2.cvtColor(cv_img[:, :, :3], cv2.COLOR_BGR2RGB)
+                    pil_logo = Image.fromarray(rgb).convert("RGBA")
+
+        if pil_logo is None:
+            return None
+
         lw, lh = pil_logo.size
         if lw < 4 or lh < 4:
             return None
         sc = min(max_w / float(lw), max_h / float(lh))
-        nw, nh = max(16, int(lw * sc)), max(16, int(lh * sc))
+        nw, nh = max(20, int(lw * sc)), max(20, int(lh * sc))
         pil_logo = pil_logo.resize((nw, nh), Image.Resampling.LANCZOS)
 
-        # Check if logo has meaningful transparency; if fully opaque, frame it in a subtle rounded pill
+        # Check if logo has meaningful transparency; if fully opaque, frame it in a sleek rounded glass pill
         alpha_extrema = pil_logo.getchannel("A").getextrema()
         is_opaque = (alpha_extrema and alpha_extrema[0] > 250)
 
@@ -1480,8 +1500,8 @@ def _prepare_brand_logo_overlay(logo_path, max_w=176, max_h=72):
         b_draw.rounded_rectangle(
             [0, 0, box_w - 1, box_h - 1],
             radius=14,
-            fill=(10, 16, 32, 195 if is_opaque else 135),
-            outline=(255, 255, 255, 110),
+            fill=(10, 16, 32, 205 if is_opaque else 145),
+            outline=(255, 255, 255, 130),
             width=2
         )
         badge.paste(pil_logo, (pad_x, pad_y), pil_logo)
@@ -1748,10 +1768,13 @@ def _draw_broadcast_branding_overlays(
     theme=None
 ):
     """
-    Renders three high-retention broadcast television graphics onto `frame_bgr`:
+    Renders four high-retention broadcast television graphics onto `frame_bgr`:
       1. Sleek Intro Title Badge during the first 2.6 seconds of Block 1
       2. Animated Slide-Out Lower-Third Teacher Nameplate (t = 1.2s .. 7.8s in Block 1)
-      3. Branded YouTube Outro End-Screen Call-To-Action Banner during the final 3.6s of the last block
+      3. Periodic Big-Font Lesson Title / Topic Reminder Banner shown 3 TIMES across the
+         video (~18%, ~52%, and ~84% of total video duration, for ~4.5s each) to remind
+         viewers of the overarching subject being discussed!
+      4. Branded YouTube Outro End-Screen Call-To-Action Banner during the final 3.6s of the last block
     """
     H, W = frame_bgr.shape[:2]
     accent = (theme or {}).get("accent", (56, 189, 248))
@@ -1762,7 +1785,25 @@ def _draw_broadcast_branding_overlays(
     time_remaining = max(0.0, total_video_dur - t_global)
     show_outro = (block_idx == total_blocks - 1 and time_remaining <= 3.6)
 
-    if not (show_intro or show_lower_third or show_outro):
+    # Check if current global timestamp falls inside one of the 3 Big-Font Topic Reminder windows (~18%, ~52%, ~84%)
+    dur_safe = max(12.0, float(total_video_dur))
+    half_win = min(2.25, max(1.1, dur_safe * 0.06))
+    reminder_centers = [dur_safe * 0.18, dur_safe * 0.52, dur_safe * 0.84]
+    active_reminder_idx = -1
+    reminder_prog = 0.0
+    if not show_intro and not show_outro:
+        for r_idx, c_sec in enumerate(reminder_centers):
+            dist = abs(t_global - c_sec)
+            if dist <= half_win:
+                active_reminder_idx = r_idx
+                # Smooth ease-in / ease-out envelope at edges of the 4.5s window
+                edge_dist = half_win - dist
+                reminder_prog = min(1.0, max(0.0, edge_dist / min(0.55, half_win * 0.35)))
+                break
+
+    show_topic_reminder = (active_reminder_idx >= 0 and reminder_prog > 0.02)
+
+    if not (show_intro or show_lower_third or show_outro or show_topic_reminder):
         return frame_bgr
 
     pil_img = Image.fromarray(cv2.cvtColor(frame_bgr, cv2.COLOR_BGR2RGB))
@@ -1802,7 +1843,47 @@ def _draw_broadcast_branding_overlays(
         ch_prefix = f"{channel_name.upper()}  •  " if channel_name else "OFFICIAL LESSON  •  "
         draw.text((bx1 + 32, by1 + 17), f"{ch_prefix}{lesson_title[:36].upper()}", font=font_ib, fill=(255, 255, 255, alpha_i))
 
-    # 3. YouTube Outro End-Screen Call-To-Action Banner (final 3.6s of last block)
+    # 3. Periodic Big-Font Lesson Title / Topic Reminder Banner (Shown 3 Times Across Video!)
+    if show_topic_reminder:
+        ease_r = math.sin(reminder_prog * math.pi * 0.5)
+        alpha_r = int(246 * ease_r)
+        bw = min(W - 88, 1380)
+        bh = 132 if W >= H else 156
+        bx1 = (W - bw) // 2
+        target_y = 92 if W >= H else 172
+        by1 = int(target_y - (1.0 - ease_r) * 36)
+
+        # Deep broadcast glass banner with dual gold/cyan accent bars
+        draw.rounded_rectangle(
+            [bx1, by1, bx1 + bw, by1 + bh],
+            radius=24,
+            fill=(8, 14, 30, alpha_r),
+            outline=accent_alt + (alpha_r,),
+            width=4
+        )
+        draw.rounded_rectangle(
+            [bx1, by1, bx1 + 22, by1 + bh],
+            radius=10,
+            fill=accent + (alpha_r,)
+        )
+
+        # Top pill tag inside reminder card
+        font_tag_r = _load_font(22, bold=True)
+        tag_label = f"CURRENT TOPIC REMINDER ({active_reminder_idx + 1}/3)"
+        if slide_title and slide_title.lower() != lesson_title.lower():
+            tag_label += f"   •   {slide_title.upper()[:38]}"
+        draw.text((bx1 + 42, by1 + 16), tag_label, font=font_tag_r, fill=accent_alt + (alpha_r,))
+
+        # Big-Font Overarching Video Title (46px bold)
+        font_big_title = _load_font(46 if W >= H else 38, bold=True)
+        clean_big_topic = (lesson_title or "Interactive Video Lesson").strip().upper()
+        wrapped_topic = _wrap_text(draw, clean_big_topic, font_big_title, bw - 76)
+        headline_str = wrapped_topic[0] if wrapped_topic else clean_big_topic[:42]
+        # Subtle drop shadow for maximum legibility
+        draw.text((bx1 + 45, by1 + 55), headline_str, font=font_big_title, fill=(0, 0, 0, alpha_r))
+        draw.text((bx1 + 42, by1 + 52), headline_str, font=font_big_title, fill=(255, 255, 255, alpha_r))
+
+    # 4. YouTube Outro End-Screen Call-To-Action Banner (final 3.6s of last block)
     if show_outro:
         prog_o = min(1.0, (3.6 - time_remaining) / 0.5)
         alpha_o = int(242 * prog_o)

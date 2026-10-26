@@ -712,9 +712,19 @@ def synthesize_block_audio_with_pauses(
 
 def get_background_soundtrack(bg_preset, workspace):
     """
-    Synthesizes a rich, musical polyphonic studio background track (chord progressions,
-    plucked arpeggios, warm bassline, and gentle rhythm pulse) at a clearly audible
-    studio level (-13 dB RMS) so background music properly works across all lessons.
+    Synthesizes 10 distinct, rich polyphonic musical background soundtracks (chord progressions,
+    plucked arpeggios, warm basslines, harmonic pads, and genre-specific rhythm pulses) at a
+    balanced broadcast level (-13 dB RMS):
+      1. lofi_study          - Soft Study Lofi Beats (Calm & Focused)
+      2. african_acoustic    - Warm East African Acoustic Guitar (Uplifting)
+      3. corporate_tech      - Modern Corporate & Tech Motivational
+      4. cinematic_inspiring - Cinematic Inspiring Orchestra (Documentary & History)
+      5. classical_piano     - Gentle Classical Piano & Strings (Academic Lecture)
+      6. gospel_worship      - Warm Gospel & Spiritual Pad (Religious & Inspirational)
+      7. ambient_science     - Deep Ambient Space & Science Synth (STEM & Lab)
+      8. upbeat_afrobeat     - Rhythmic Upbeat Afro-Fusion Groove (Energetic Youth)
+      9. acoustic_folk       - Peaceful Acoustic Folk & Nature (Storytelling)
+      10. jazz_lounge        - Smooth Velvet Jazz Lounge (Executive & Business)
     """
     if not bg_preset or bg_preset == 'none':
         return None
@@ -725,37 +735,109 @@ def get_background_soundtrack(bg_preset, workspace):
         return asset_path
 
     synth_bg = f"{workspace}/bg_synth_{bg_preset}.wav"
-    print(f"Synthesizing polyphonic musical soundtrack for mood '{bg_preset}'...")
+    print(f"Synthesizing polyphonic musical soundtrack for genre '{bg_preset}'...")
 
     sr = 24000
     duration_sec = 64.0
     n_samples = int(sr * duration_sec)
     t = np.linspace(0.0, duration_sec, n_samples, endpoint=False, dtype=np.float32)
 
-    if bg_preset == 'lofi_study':
-        chords = [
-            (174.61, [220.00, 261.63, 329.63, 392.00]),  # Fmaj7
-            (164.81, [196.00, 246.94, 293.66, 392.00]),  # Em7
-            (146.83, [174.61, 220.00, 261.63, 329.63]),  # Dm7
-            (130.81, [196.00, 246.94, 261.63, 329.63]),  # Cmaj7
-        ]
-        beat_hz = 1.5
-    elif bg_preset == 'african_acoustic':
-        chords = [
-            (196.00, [246.94, 293.66, 392.00, 493.88]),  # G major
-            (130.81, [196.00, 261.63, 329.63, 523.25]),  # C major add9
-            (146.83, [220.00, 293.66, 369.99, 587.33]),  # D major
-            (196.00, [246.94, 293.66, 392.00, 587.33]),  # G major
-        ]
-        beat_hz = 2.0
-    else:
-        chords = [
-            (110.00, [220.00, 261.63, 329.63, 440.00]),  # Am
-            (87.31,  [174.61, 220.00, 261.63, 349.23]),  # F
-            (130.81, [196.00, 261.63, 329.63, 523.25]),  # C
-            (98.00,  [196.00, 246.94, 293.66, 392.00]),  # G
-        ]
-        beat_hz = 1.75
+    genre_presets = {
+        'lofi_study': (
+            [
+                (174.61, [220.00, 261.63, 329.63, 392.00]),  # Fmaj7
+                (164.81, [196.00, 246.94, 293.66, 392.00]),  # Em7
+                (146.83, [174.61, 220.00, 261.63, 329.63]),  # Dm7
+                (130.81, [196.00, 246.94, 261.63, 329.63]),  # Cmaj7
+            ],
+            1.45, 0.22, 0.16, 6.5
+        ),
+        'african_acoustic': (
+            [
+                (196.00, [246.94, 293.66, 392.00, 493.88]),  # G major
+                (130.81, [196.00, 261.63, 329.63, 523.25]),  # Cadd9
+                (146.83, [220.00, 293.66, 369.99, 587.33]),  # D major
+                (196.00, [246.94, 293.66, 392.00, 587.33]),  # G major
+            ],
+            2.0, 0.28, 0.18, 5.5
+        ),
+        'corporate_tech': (
+            [
+                (110.00, [220.00, 261.63, 329.63, 440.00]),  # Am
+                (87.31,  [174.61, 220.00, 261.63, 349.23]),  # F
+                (130.81, [196.00, 261.63, 329.63, 523.25]),  # C
+                (98.00,  [196.00, 246.94, 293.66, 392.00]),  # G
+            ],
+            1.75, 0.24, 0.18, 6.8
+        ),
+        'cinematic_inspiring': (
+            [
+                (146.83, [220.00, 293.66, 349.23, 440.00]),  # Dm
+                (116.54, [233.08, 293.66, 349.23, 466.16]),  # Bbmaj7
+                (174.61, [261.63, 349.23, 440.00, 523.25]),  # F
+                (130.81, [196.00, 261.63, 329.63, 392.00]),  # C
+            ],
+            1.20, 0.16, 0.12, 4.2
+        ),
+        'classical_piano': (
+            [
+                (130.81, [261.63, 329.63, 392.00, 523.25]),  # C
+                (98.00,  [246.94, 293.66, 392.00, 493.88]),  # G/B
+                (110.00, [220.00, 261.63, 329.63, 440.00]),  # Am
+                (87.31,  [174.61, 261.63, 349.23, 440.00]),  # F
+            ],
+            0.0, 0.30, 0.0, 4.8
+        ),
+        'gospel_worship': (
+            [
+                (155.56, [233.08, 311.13, 392.00, 466.16]),  # Ebmaj7
+                (116.54, [233.08, 293.66, 349.23, 440.00]),  # Bbadd9
+                (130.81, [196.00, 261.63, 311.13, 392.00]),  # Cm7
+                (103.83, [207.65, 261.63, 311.13, 415.30]),  # Abmaj7
+            ],
+            1.10, 0.14, 0.08, 3.6
+        ),
+        'ambient_science': (
+            [
+                (110.00, [220.00, 246.94, 329.63, 440.00]),  # Asus2
+                (146.83, [220.00, 293.66, 329.63, 493.88]),  # Dsus2/6
+                (98.00,  [196.00, 246.94, 293.66, 440.00]),  # Gadd9
+                (130.81, [196.00, 261.63, 329.63, 493.88]),  # Cmaj7
+            ],
+            1.35, 0.20, 0.07, 5.2
+        ),
+        'upbeat_afrobeat': (
+            [
+                (174.61, [261.63, 349.23, 440.00, 523.25]),  # F
+                (130.81, [261.63, 329.63, 392.00, 523.25]),  # C
+                (146.83, [220.00, 293.66, 349.23, 440.00]),  # Dm7
+                (116.54, [233.08, 293.66, 349.23, 466.16]),  # Bb
+            ],
+            2.15, 0.28, 0.22, 6.2
+        ),
+        'acoustic_folk': (
+            [
+                (146.83, [220.00, 293.66, 369.99, 440.00]),  # D
+                (110.00, [220.00, 277.18, 329.63, 440.00]),  # A
+                (123.47, [246.94, 293.66, 369.99, 493.88]),  # Bm7
+                (98.00,  [196.00, 246.94, 293.66, 392.00]),  # G
+            ],
+            1.65, 0.27, 0.12, 5.4
+        ),
+        'jazz_lounge': (
+            [
+                (146.83, [220.00, 261.63, 329.63, 440.00]),  # Dm9
+                (98.00,  [196.00, 246.94, 311.13, 369.99]),  # G13
+                (130.81, [196.00, 246.94, 293.66, 392.00]),  # Cmaj9
+                (110.00, [196.00, 233.08, 277.18, 349.23]),  # A7alt
+            ],
+            1.55, 0.20, 0.14, 5.8
+        ),
+    }
+
+    chords, beat_hz, pluck_amp, kick_amp, pluck_decay = genre_presets.get(
+        bg_preset, genre_presets['lofi_study']
+    )
 
     mix = np.zeros(n_samples, dtype=np.float32)
     chord_len_sec = 4.0
@@ -790,21 +872,22 @@ def get_background_soundtrack(bg_preset, workspace):
             if ae_i <= as_i:
                 continue
             nt = np.linspace(0.0, (ae_i - as_i) / float(sr), ae_i - as_i, endpoint=False, dtype=np.float32)
-            pluck_env = np.exp(-nt * 6.5) * (1.0 - np.exp(-nt * 120.0))
+            pluck_env = np.exp(-nt * pluck_decay) * (1.0 - np.exp(-nt * 120.0))
             pluck_wave = (
-                0.24 * np.sin(2.0 * np.pi * a_freq * nt)
-                + 0.10 * np.sin(2.0 * np.pi * (a_freq * 2.0) * nt)
-                + 0.04 * np.sin(2.0 * np.pi * (a_freq * 3.0) * nt)
+                pluck_amp * np.sin(2.0 * np.pi * a_freq * nt)
+                + (pluck_amp * 0.42) * np.sin(2.0 * np.pi * (a_freq * 2.0) * nt)
+                + (pluck_amp * 0.16) * np.sin(2.0 * np.pi * (a_freq * 3.0) * nt)
             ) * pluck_env
             chord_sig[as_i:ae_i] += pluck_wave
 
         mix[s_i:e_i] += chord_sig
 
-    beat_phase = (t * beat_hz) % 1.0
-    kick_env = np.exp(-beat_phase * 14.0)
-    kick_freq = 55.0 + 65.0 * np.exp(-beat_phase * 28.0)
-    kick_wave = 0.18 * np.sin(2.0 * np.pi * kick_freq * (beat_phase / beat_hz)) * kick_env
-    mix += kick_wave
+    if beat_hz > 0.1 and kick_amp > 0.01:
+        beat_phase = (t * beat_hz) % 1.0
+        kick_env = np.exp(-beat_phase * 14.0)
+        kick_freq = 55.0 + 65.0 * np.exp(-beat_phase * 28.0)
+        kick_wave = kick_amp * np.sin(2.0 * np.pi * kick_freq * (beat_phase / beat_hz)) * kick_env
+        mix += kick_wave
 
     peak = float(np.max(np.abs(mix))) + 1e-6
     mix = (mix / peak) * 0.55
@@ -969,6 +1052,36 @@ def _extract_clean_search_keywords(raw_text, max_words=4):
     return " ".join(keywords)
 
 
+def _is_specific_subject_requiring_ai_video(lesson_title, slide_title, pexels_query, block=None):
+    """
+    Detects whether a lesson block depicts a specific religious/biblical scene (e.g. Jesus
+    performing miracles, walking on water), a specific scientific/chemistry process or apparatus
+    (e.g. fractional distillation, electrolysis, titration), or when the LLM explicitly set
+    `requires_ai_video = True`.
+    """
+    if isinstance(block, dict):
+        req_flag = block.get("requires_ai_video")
+        if req_flag is True or str(req_flag).strip().lower() in ("true", "1", "yes"):
+            return True
+
+    combined = f"{lesson_title} {slide_title} {pexels_query} {(block or {}).get('image_prompt', '')}".lower()
+    specific_subject_keywords = (
+        # Biblical / Religious / Miracles / Historical
+        "jesus", "christ", "miracle", "walking on water", "walk on water", "sea of galilee",
+        "biblical", "bible", "gospel", "moses", "resurrection", "crucifixion", "apostle",
+        "disciple", "parable", "scripture", "prophet", "loaves", "blind", "healed", "red sea",
+        "ark", "angel", "heaven", "salvation",
+        # Chemistry / Physics / Biology Processes & Lab Apparatus
+        "distillation", "condenser", "fractionating", "fractional", "titration", "electrolysis",
+        "chromatography", "bunsen", "beaker", "flask", "evaporation", "precipitate",
+        "mitosis", "meiosis", "photosynthesis", "chloroplast", "mitochondria", "dna replication",
+        "ribosome", "enzyme", "krebs", "osmosis", "diffusion", "atomic", "electron", "covalent",
+        "ionic", "periodic table", "chemical reaction", "hydrocarbon", "polymer", "magnetic field",
+        "refraction", "diffraction", "thermodynamics", "circuit diagram"
+    )
+    return any(kw in combined for kw in specific_subject_keywords)
+
+
 def fetch_pexels_video_clips_for_block(
     pexels_api_key,
     pexels_query,
@@ -978,12 +1091,14 @@ def fetch_pexels_video_clips_for_block(
     workspace,
     block_idx,
     used_video_ids,
-    count=2
+    count=2,
+    strict_subject=False
 ):
     """
     Queries the Pexels Videos API (https://api.pexels.com/videos/search) for best-matching
     HD 16:9 landscape video clips (.mp4) for the current lesson block.
-    Avoids reusing video IDs across blocks so every block has fresh, captivating footage.
+    Avoids reusing video IDs across blocks and filters out generic unrelated clips when
+    `strict_subject` is True so AI Motion Video Clips can take over for specific scenes.
     """
     if not pexels_api_key or not str(pexels_api_key).strip():
         return []
@@ -995,17 +1110,22 @@ def fetch_pexels_video_clips_for_block(
 
     note_kw = _extract_clean_search_keywords(notes[0] if notes else "", max_words=3)
     candidate_queries = []
-    for raw_q in [
+    raw_candidates = [
         pexels_query,
         f"{slide_title} {lesson_title}",
         f"{slide_title} {note_kw}",
         lesson_title,
         slide_title,
-        "education science technology classroom"
-    ]:
+    ]
+    for raw_q in raw_candidates:
         cleaned = _extract_clean_search_keywords(raw_q, max_words=4)
         if cleaned and cleaned.lower() not in [q.lower() for q in candidate_queries]:
             candidate_queries.append(cleaned)
+
+    subject_tokens = [
+        w.lower() for w in re.findall(r'[A-Za-z]{4,}', f"{pexels_query} {slide_title} {lesson_title}")
+        if w.lower() not in ("lesson", "video", "introduction", "overview", "summary", "concept", "understanding")
+    ]
 
     downloaded_paths = []
     api_url = "https://api.pexels.com/videos/search"
@@ -1035,6 +1155,13 @@ def fetch_pexels_video_clips_for_block(
                 if dur < 3.0 or dur > 90.0:
                     continue
 
+                # Verify URL slug relevance when strict subject matching is needed
+                v_url_slug = str(v.get("url") or "").lower()
+                if strict_subject and subject_tokens:
+                    matches = sum(1 for tok in subject_tokens[:5] if tok in v_url_slug)
+                    if matches == 0:
+                        continue
+
                 video_files = v.get("video_files") or []
                 best_link = None
                 best_score = -1e9
@@ -1047,7 +1174,6 @@ def fetch_pexels_video_clips_for_block(
                         continue
                     if vw < vh or vw < 640:
                         continue
-                    # Prefer 1280x720 or 1920x1080 HD for fast download and crisp 16:9 rendering
                     score = -abs(vw - 1280)
                     if 1280 <= vw <= 1920:
                         score += 1000
@@ -1074,6 +1200,149 @@ def fetch_pexels_video_clips_for_block(
             continue
 
     return downloaded_paths
+
+
+def synthesize_ai_subject_video_clip(
+    cf_images,
+    output_mp4,
+    subject_text="",
+    duration_sec=8.0,
+    fps=24,
+    reverse_motion=False
+):
+    """
+    Synthesizes a custom 24fps 1280x720 HD AI Motion Video Clip (.mp4) directly from the
+    block's subject-accurate AI illustrations (e.g., Jesus walking on water / performing miracles,
+    or a chemistry distillation process in a laboratory).
+    Applies:
+      - Multi-angle dynamic 3D Ken Burns camera pan/zoom across the 3 AI scene illustrations
+      - Context-aware physics motion effects:
+          * Water / Sea / Miracle waves: animated lower-frame water ripple displacement + light shimmer
+          * Chemistry / Distillation / Lab process: rising vapor/bubble particles + thermal wave
+          * General scene: subtle volumetric light rays & floating atmospheric motes
+      - Smooth 0.75s cross-dissolves between scene stages
+    """
+    valid_imgs = []
+    for p in (cf_images or []):
+        if p and os.path.exists(p):
+            im = cv2.imread(p, cv2.IMREAD_COLOR)
+            if im is not None and im.size > 0:
+                valid_imgs.append(cv2.resize(im, (1280, 720), interpolation=cv2.INTER_LANCZOS4))
+    if not valid_imgs:
+        return None
+    if reverse_motion and len(valid_imgs) > 1:
+        valid_imgs = list(reversed(valid_imgs))
+
+    target_w, target_h = 1280, 720
+    total_frames = max(48, int(round(float(duration_sec) * fps)))
+    n_scenes = len(valid_imgs)
+    subj_lower = str(subject_text or "").lower()
+
+    is_water_scene = any(k in subj_lower for k in ("water", "sea", "wave", "lake", "ocean", "river", "jesus", "miracle", "galilee", "boat", "storm"))
+    is_chem_scene = any(k in subj_lower for k in ("distillation", "chemistry", "flask", "condenser", "boiling", "vapor", "steam", "beaker", "bunsen", "reaction", "liquid", "laboratory", "electrolysis", "titration"))
+
+    # Precompute coordinate grids for water ripple or heat shimmer
+    grid_x, grid_y = np.meshgrid(np.arange(target_w, dtype=np.float32), np.arange(target_h, dtype=np.float32))
+
+    #Deterministic particle seeds for vapor/bubbles or atmospheric light motes
+    rng = np.random.RandomState(42 if not reverse_motion else 137)
+    num_particles = 36
+    p_x = rng.uniform(0.12, 0.88, size=num_particles)
+    p_y = rng.uniform(0.15, 0.92, size=num_particles)
+    p_speed = rng.uniform(0.06, 0.16, size=num_particles)
+    p_radius = rng.randint(3, 9, size=num_particles)
+
+    temp_raw_mp4 = output_mp4 + ".raw.mp4"
+    writer = cv2.VideoWriter(
+        temp_raw_mp4,
+        cv2.VideoWriter_fourcc(*"mp4v"),
+        float(fps),
+        (target_w, target_h)
+    )
+    if not writer.isOpened():
+        return None
+
+    def _render_scene_camera(base_img, scene_idx, local_u):
+        # Smooth ease-in-out
+        ease_u = 0.5 - 0.5 * math.cos(math.pi * max(0.0, min(1.0, local_u)))
+        mode = (scene_idx + (1 if reverse_motion else 0)) % 3
+        if mode == 0:
+            zoom = 1.04 + 0.12 * ease_u
+            cx = 0.46 + 0.08 * ease_u
+            cy = 0.48 + 0.04 * ease_u
+        elif mode == 1:
+            zoom = 1.16 - 0.10 * ease_u
+            cx = 0.54 - 0.08 * ease_u
+            cy = 0.46 + 0.06 * ease_u
+        else:
+            zoom = 1.06 + 0.10 * ease_u
+            cx = 0.50 + 0.05 * math.sin(ease_u * math.pi)
+            cy = 0.52 - 0.06 * ease_u
+
+        crop_w = int(round(target_w / zoom))
+        crop_h = int(round(target_h / zoom))
+        x0 = max(0, min(target_w - crop_w, int(round(cx * target_w - crop_w * 0.5))))
+        y0 = max(0, min(target_h - crop_h, int(round(cy * target_h - crop_h * 0.5))))
+        cropped = base_img[y0:y0 + crop_h, x0:x0 + crop_w]
+        return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    for f_idx in range(total_frames):
+        t_sec = f_idx / float(fps)
+        pos = (f_idx / float(max(1, total_frames - 1))) * n_scenes
+        s_idx = min(n_scenes - 1, int(pos))
+        local_u = pos - s_idx
+
+        frame = _render_scene_camera(valid_imgs[s_idx], s_idx, local_u)
+        # Smooth cross-dissolve over the last 22% of each sub-scene
+        if s_idx < n_scenes - 1 and local_u > 0.78:
+            alpha = (local_u - 0.78) / 0.22
+            next_frame = _render_scene_camera(valid_imgs[s_idx + 1], s_idx + 1, 0.0)
+            frame = cv2.addWeighted(frame, 1.0 - alpha, next_frame, alpha, 0)
+
+        # Physics Motion Layer 1: Animated Water Waves (for walking on water / sea / liquid topics)
+        if is_water_scene:
+            water_top = int(target_h * 0.56)
+            sub_gx = grid_x[water_top:, :]
+            sub_gy = grid_y[water_top:, :]
+            depth_factor = (sub_gy - water_top) / float(max(1, target_h - water_top))
+            dx = (np.sin(sub_gy * 0.11 - t_sec * 4.8) * 5.5 + np.cos(sub_gx * 0.04 + t_sec * 3.2) * 2.5) * depth_factor
+            dy = np.cos(sub_gx * 0.06 + sub_gy * 0.08 - t_sec * 4.0) * 2.8 * depth_factor
+            map_x = np.clip(sub_gx + dx, 0, target_w - 1).astype(np.float32)
+            map_y = np.clip(sub_gy + dy, water_top, target_h - 1).astype(np.float32)
+            frame[water_top:, :] = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
+
+        # Physics Motion Layer 2: Rising Distillation Vapor / Bubbles or Golden Miracle Shimmer
+        overlay = frame.copy()
+        for p_i in range(num_particles):
+            cur_y = (p_y[p_i] - t_sec * p_speed[p_i]) % 0.85 + 0.08
+            cur_x = p_x[p_i] + 0.015 * math.sin(t_sec * 2.4 + p_i)
+            px = int(cur_x * target_w)
+            py = int(cur_y * target_h)
+            rad = int(p_radius[p_i])
+            if is_chem_scene:
+                # Translucent rising distillation bubbles / vapor droplets
+                cv2.circle(overlay, (px, py), rad, (245, 235, 210), -1, cv2.LINE_AA)
+                cv2.circle(overlay, (px, py), rad + 2, (255, 255, 255), 1, cv2.LINE_AA)
+            else:
+                # Warm golden-white atmospheric light motes
+                cv2.circle(overlay, (px, py), max(2, rad - 2), (180, 235, 255), -1, cv2.LINE_AA)
+        frame = cv2.addWeighted(frame, 0.84, overlay, 0.16, 0)
+
+        writer.write(frame)
+
+    writer.release()
+    try:
+        run_ffmpeg(
+            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset veryfast -pix_fmt yuv420p {output_mp4}",
+            desc="Encode synthesized AI Subject Motion Video Clip"
+        )
+        if os.path.exists(temp_raw_mp4):
+            os.remove(temp_raw_mp4)
+    except Exception:
+        if os.path.exists(temp_raw_mp4):
+            shutil.move(temp_raw_mp4, output_mp4)
+
+    return output_mp4 if (os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 5000) else None
 
 
 def _save_and_frame_image_bytes(img_bytes, output_png, title_text="", subtitle_text=""):
@@ -1103,6 +1372,29 @@ def _save_and_frame_image_bytes(img_bytes, output_png, title_text="", subtitle_t
     except Exception as e:
         print(f"Image decode warning: {e}")
         return False
+
+
+def _fetch_pollinations_ai_illustration(prompt_text, title_text, lesson_title, output_png, variant=0):
+    """
+    Free, zero-key AI Flux image generator fallback (Pollinations.ai) so specific biblical,
+    historical, or chemistry distillation prompts are always custom-rendered with 100% subject
+    accuracy even when Cloudflare Workers AI credentials are omitted or rate-limited.
+    """
+    try:
+        full_prompt = (
+            f"Detailed educational illustration and cinematic high resolution visual showing: {prompt_text}. "
+            f"Subject: {lesson_title} - {title_text}. Accurate anatomy and apparatus, vibrant studio lighting, 16:9 widescreen"
+        )
+        encoded = urllib.parse.quote(full_prompt[:450])
+        seed = 1000 + int(variant) * 37
+        url = f"https://image.pollinations.ai/prompt/{encoded}?width=1280&height=720&seed={seed}&nologo=true&model=flux"
+        r = requests.get(url, headers=HTTP_HEADERS, timeout=22)
+        if r.status_code == 200 and len(r.content) > 4000:
+            if _save_and_frame_image_bytes(r.content, output_png, title_text=title_text):
+                return output_png
+    except Exception as pol_err:
+        print(f"Pollinations AI fallback note: {pol_err}")
+    return None
 
 
 def _fetch_pexels_photo_illustration(prompt_text, title_text, lesson_title, pexels_api_key, output_png, variant=0):
@@ -1203,18 +1495,26 @@ def _fetch_wikimedia_commons_illustration(prompt_text, title_text, lesson_title,
 
 def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_token, output_png, variant=0, lesson_title="", pexels_api_key=""):
     """
-    4-Tier Contextual Image Generator:
+    5-Tier Subject-Accurate Contextual Image Generator:
       1. Cloudflare Workers AI Model Cascade (Flux-1-Schnell -> SDXL-Lightning -> SDXL-Base)
-      2. Pexels High-Res Landscape Photography (when Pexels API Key is configured)
-      3. Real Wikimedia Commons High-Res Educational Photography/Diagrams (no API key needed)
-      4. Procedural Multi-Node Studio Vector Infographic
+      2. Pollinations.ai Flux Custom Subject Generator (ensures exact scenes like Jesus walking
+         on water or chemistry distillation apparatus are custom-illustrated even without CF keys)
+      3. Pexels High-Res Landscape Photography (when Pexels API Key is configured)
+      4. Real Wikimedia Commons High-Res Educational Photography/Diagrams
+      5. Procedural Multi-Node Studio Vector Infographic
     """
     clean_prompt = str(prompt_text or title_text or "Educational lesson concept").strip()
+    angle_desc = [
+        "wide cinematic establishing view, clear subject focus",
+        "detailed close-up action and step-by-step process view",
+        "educational diagram and real-world demonstration perspective"
+    ][int(variant) % 3]
+
     if cf_account_id and cf_api_token:
         cf_models = [
-            ("@cf/black-forest-labs/flux-1-schnell", {"prompt": f"Clean educational textbook illustration and professional visual photograph showing: {clean_prompt}. Context: {lesson_title} - {title_text}. High resolution, vibrant studio lighting, clear subject focus, 16:9 widescreen.", "steps": 4}),
-            ("@cf/bytedance/stable-diffusion-xl-lightning", {"prompt": f"Educational photography and visual diagram of {clean_prompt}, {title_text}, high resolution, 16:9"}),
-            ("@cf/stabilityai/stable-diffusion-xl-base-1.0", {"prompt": f"Educational textbook illustration of {clean_prompt}, {title_text}, clear visual, 16:9"}),
+            ("@cf/black-forest-labs/flux-1-schnell", {"prompt": f"Subject-accurate educational illustration and cinematic high-resolution visual showing: {clean_prompt}. Topic: {lesson_title} - {title_text}. Perspective: {angle_desc}. Vibrant studio lighting, 16:9 widescreen.", "steps": 4}),
+            ("@cf/bytedance/stable-diffusion-xl-lightning", {"prompt": f"Detailed educational visual of {clean_prompt}, {title_text}, {angle_desc}, high resolution, 16:9"}),
+            ("@cf/stabilityai/stable-diffusion-xl-base-1.0", {"prompt": f"Educational textbook illustration of {clean_prompt}, {title_text}, {angle_desc}, clear visual, 16:9"}),
         ]
         headers = {
             "Authorization": f"Bearer {cf_api_token}",
@@ -1243,7 +1543,18 @@ def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_
             except Exception as cf_err:
                 print(f"Cloudflare Workers AI ({model_slug}) note: {cf_err}")
 
-    # Tier 2: Pexels High-Res Photography (if Pexels key is available)
+    # Tier 2: Pollinations.ai Flux Custom Subject Generator
+    pol_path = _fetch_pollinations_ai_illustration(
+        prompt_text=f"{clean_prompt}, {angle_desc}",
+        title_text=title_text,
+        lesson_title=lesson_title,
+        output_png=output_png,
+        variant=variant
+    )
+    if pol_path and os.path.exists(pol_path):
+        return pol_path
+
+    # Tier 3: Pexels High-Res Photography (if Pexels key is available)
     if pexels_api_key:
         px_path = _fetch_pexels_photo_illustration(
             prompt_text=clean_prompt,
@@ -1256,7 +1567,7 @@ def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_
         if px_path and os.path.exists(px_path):
             return px_path
 
-    # Tier 3: Real high-resolution educational photo/diagram from Wikimedia Commons
+    # Tier 4: Real high-resolution educational photo/diagram from Wikimedia Commons
     wm_path = _fetch_wikimedia_commons_illustration(
         prompt_text=clean_prompt,
         title_text=title_text,
@@ -1267,7 +1578,7 @@ def generate_cloudflare_ai_image(prompt_text, title_text, cf_account_id, cf_api_
     if wm_path and os.path.exists(wm_path):
         return wm_path
 
-    # Tier 4: Rich vector node diagram fallback
+    # Tier 5: Rich vector node diagram fallback
     return generate_fallback_illustration(clean_prompt, title_text, output_png, variant=variant)
 
 
@@ -1445,16 +1756,15 @@ def create_synced_lyrics_ass(
     block_idx=0,
     total_blocks=1,
     aspect_ratio="16:9",
-    caption_mode="smart_broadcast"
+    caption_mode="full_karaoke"
 ):
     """
     Generates word-by-word Active Karaoke Highlighted captions (.ass) according to `caption_mode`:
-      - 'smart_broadcast' (Default for 16:9): Eliminates visual clutter by suppressing burned-in
-        lyrics during PowerPoint Slide / Chart views (where bullet text is already on screen),
-        and only showing clean bottom-anchored captions during Studio / B-Roll segments!
+      - 'full_karaoke' (Default): Displays active word-by-word karaoke captions throughout the entire
+        video, anchored cleanly in the bottom safe zone so they never collide with slide headers.
+      - 'smart_broadcast': Eliminates visual clutter by suppressing burned-in lyrics during PowerPoint
+        Slide / Chart views and only showing captions during Studio / B-Roll segments.
       - 'slides_only': Suppresses all burned-in subtitles (relies on slides + .srt Closed Captions).
-      - 'full_karaoke' (or 9:16 Vertical Shorts): Displays active karaoke captions throughout,
-        anchored cleanly in the bottom safe zone so they never collide with slide headers.
     Returns (output_sub_path, has_dialogue_events).
     """
     speech_onset_sec = 0.0
@@ -1473,7 +1783,7 @@ def create_synced_lyrics_ass(
         total_duration = 25.0
 
     is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
-    mode_clean = str(caption_mode or "smart_broadcast").strip().lower()
+    mode_clean = str(caption_mode or "full_karaoke").strip().lower()
     res_x, res_y = (1080, 1920) if is_vertical else (1920, 1080)
     phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=6 if is_vertical else 7)
 
@@ -1559,6 +1869,7 @@ def publish_video_to_youtube_cloud(
     Streams the finished .mp4 video, 1280x720 .jpg Thumbnail, and .srt Closed Captions
     directly from the RunPod GPU worker over 10Gbps cloud fiber to YouTube Data API v3
     without requiring the user to download any files locally!
+    Supports scheduled publishing via `youtube_oauth['publish_at']` (ISO 8601 UTC).
     """
     if not isinstance(youtube_oauth, dict):
         return None
@@ -1594,8 +1905,20 @@ def publish_video_to_youtube_cloud(
     raw_tags = str((youtube_seo or {}).get("tags") or "").split(",")
     tags_list = [t.strip() for t in raw_tags if t.strip()][:15]
     priv = str(privacy_status or youtube_oauth.get("privacy_status") or "public").strip().lower()
-    if priv not in ("public", "unlisted", "private"):
+    publish_at = str(youtube_oauth.get("publish_at") or "").strip()
+
+    if publish_at or priv == "scheduled":
+        # YouTube Data API v3 requires privacyStatus='private' when status.publishAt is set
+        priv = "private"
+    elif priv not in ("public", "unlisted", "private"):
         priv = "public"
+
+    status_obj = {
+        "privacyStatus": priv,
+        "selfDeclaredMadeForKids": False,
+    }
+    if publish_at:
+        status_obj["publishAt"] = publish_at
 
     meta_body = {
         "snippet": {
@@ -1604,10 +1927,7 @@ def publish_video_to_youtube_cloud(
             "tags": tags_list,
             "categoryId": "27",  # Education
         },
-        "status": {
-            "privacyStatus": priv,
-            "selfDeclaredMadeForKids": False,
-        }
+        "status": status_obj,
     }
 
     try:
@@ -1652,7 +1972,7 @@ def publish_video_to_youtube_cloud(
         if not video_id:
             return {"error": "YouTube upload completed without a video ID."}
 
-        print(f"Successfully uploaded video to YouTube! Video ID: {video_id}")
+        print(f"Successfully uploaded video to YouTube! Video ID: {video_id} (publish_at={publish_at or 'immediate'})")
 
         # 2. Upload Custom 1280x720 Thumbnail (.jpg)
         thumb_uploaded = False
@@ -1715,7 +2035,8 @@ def publish_video_to_youtube_cloud(
             "video_id": video_id,
             "watch_url": f"https://youtu.be/{video_id}",
             "studio_url": f"https://studio.youtube.com/video/{video_id}/edit",
-            "privacy_status": priv,
+            "privacy_status": "scheduled" if publish_at else priv,
+            "publish_at": publish_at,
             "thumbnail_set": thumb_uploaded,
             "captions_set": captions_uploaded,
         }
@@ -1783,7 +2104,7 @@ def handler(job):
     presenter_name = (job_input.get('presenter_name') or timeline_data.get('presenter_name') or '').strip()
     channel_name = (job_input.get('channel_name') or timeline_data.get('channel_name') or '').strip()
     aspect_ratio = (job_input.get('aspect_ratio') or '16:9').strip()
-    caption_mode = (job_input.get('caption_mode') or 'smart_broadcast').strip()
+    caption_mode = (job_input.get('caption_mode') or 'full_karaoke').strip()
     enable_sfx = (str(job_input.get('enable_sfx', 'yes')).strip().lower() != 'no')
     logo_url = (job_input.get('logo_url') or '').strip()
     logo_position = (job_input.get('logo_position') or 'top_right').strip()
@@ -1861,7 +2182,7 @@ def handler(job):
         if output_format == 'video' and logo_url:
             try:
                 lg_ext = os.path.splitext(str(logo_url).split('?')[0])[1].lower()
-                if lg_ext not in ('.png', '.webp', '.jpg', '.jpeg'):
+                if lg_ext not in ('.png', '.webp', '.jpg', '.jpeg', '.gif'):
                     lg_ext = '.png'
                 raw_logo_path = download_file(logo_url, f"{workspace}/brand_logo{lg_ext}", s3_client, r2_endpoint, bucket_name)
             except Exception as lg_err:
@@ -2111,13 +2432,21 @@ def handler(job):
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Searching & downloading Pexels HD 16:9 video clips...",
+                step=f"Block {idx_counter+1}/{total_blocks}: Searching & generating subject-accurate HD 16:9 video clips...",
                 percent=int(blk_base_pct + blk_span_pct * 0.05),
                 time_left_sec=time_left_blk
             )
 
-            # 1. Fetch best-matching HD landscape video clips from Pexels for this block
+            # 1. Determine whether this block depicts a specific religious/biblical/chemistry/scientific
+            # scene where AI Motion Video Clips should be synthesized or prioritized over generic stock clips
             pexels_query = (block.get('pexels_query') or f"{slide_title} {lesson_title}").strip()
+            needs_ai_subject_video = _is_specific_subject_requiring_ai_video(
+                lesson_title=lesson_title,
+                slide_title=slide_title,
+                pexels_query=pexels_query,
+                block=block
+            )
+
             pexels_clips = fetch_pexels_video_clips_for_block(
                 pexels_api_key=pexels_api_key,
                 pexels_query=pexels_query,
@@ -2127,20 +2456,25 @@ def handler(job):
                 workspace=workspace,
                 block_idx=idx,
                 used_video_ids=used_pexels_video_ids,
-                count=2
+                count=2,
+                strict_subject=needs_ai_subject_video
             )
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Generating 3 Cloudflare Workers AI & Pexels Slide Visuals...",
+                step=f"Block {idx_counter+1}/{total_blocks}: Generating 3 Subject-Accurate AI & Studio Slide Visuals...",
                 percent=int(blk_base_pct + blk_span_pct * 0.16),
                 time_left_sec=max(6, int(time_left_blk * 0.85))
             )
 
-            # 2. Generate 3 distinct contextual visuals per block for PowerPoint Slides & Studio cards
-            prompt_1 = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {notes[0] if notes else slide_title}").strip()
-            prompt_2 = f"{lesson_title} - {slide_title} practical application: {notes[1] if len(notes) > 1 else slide_title}".strip()
-            prompt_3 = f"{lesson_title} - {slide_title} real-world case study: {notes[2] if len(notes) > 2 else (notes[-1] if notes else slide_title)}".strip()
+            # 2. Generate 3 distinct contextual visuals per block for PowerPoint Slides & AI Motion Video Clips
+            base_img_prompt = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {notes[0] if notes else slide_title}").strip()
+            prompt_1 = base_img_prompt
+            prompt_2 = f"{base_img_prompt} — step-by-step action demonstration: {notes[1] if len(notes) > 1 else slide_title}".strip()
+            prompt_3 = f"{base_img_prompt} — close-up detailed outcome: {notes[2] if len(notes) > 2 else (notes[-1] if notes else slide_title)}".strip()
+
+            # For specific subjects (e.g. Jesus walking on water / chemistry distillation), do not use generic Pexels photos as image fallback
+            px_key_for_images = "" if needs_ai_subject_video else pexels_api_key
 
             cf_img_1 = generate_cloudflare_ai_image(
                 prompt_text=prompt_1,
@@ -2150,7 +2484,7 @@ def handler(job):
                 output_png=f"{workspace}/cf_{idx}_1.png",
                 variant=idx_counter * 3,
                 lesson_title=lesson_title,
-                pexels_api_key=pexels_api_key
+                pexels_api_key=px_key_for_images
             )
             cf_img_2 = generate_cloudflare_ai_image(
                 prompt_text=prompt_2,
@@ -2160,7 +2494,7 @@ def handler(job):
                 output_png=f"{workspace}/cf_{idx}_2.png",
                 variant=idx_counter * 3 + 1,
                 lesson_title=lesson_title,
-                pexels_api_key=pexels_api_key
+                pexels_api_key=px_key_for_images
             )
             cf_img_3 = generate_cloudflare_ai_image(
                 prompt_text=prompt_3,
@@ -2170,10 +2504,38 @@ def handler(job):
                 output_png=f"{workspace}/cf_{idx}_3.png",
                 variant=idx_counter * 3 + 2,
                 lesson_title=lesson_title,
-                pexels_api_key=pexels_api_key
+                pexels_api_key=px_key_for_images
             )
             if hero_thumbnail_bg_img is None and cf_img_1:
                 hero_thumbnail_bg_img = cf_img_1
+
+            # 3. Synthesize custom 24fps HD AI Subject Motion Video Clips whenever the topic is a specific
+            # biblical/religious miracle (e.g., Jesus walking on water), a scientific/chemistry process
+            # (e.g., fractional distillation), or when Pexels cannot provide 2 matching HD video clips!
+            if needs_ai_subject_video or len(pexels_clips) < 2:
+                subject_desc = f"{lesson_title} {slide_title} {base_img_prompt}"
+                ai_clip_1 = synthesize_ai_subject_video_clip(
+                    cf_images=[cf_img_1, cf_img_2, cf_img_3],
+                    output_mp4=f"{workspace}/ai_subject_{idx}_1.mp4",
+                    subject_text=subject_desc,
+                    duration_sec=8.0,
+                    fps=24,
+                    reverse_motion=False
+                )
+                ai_clip_2 = synthesize_ai_subject_video_clip(
+                    cf_images=[cf_img_2, cf_img_3, cf_img_1],
+                    output_mp4=f"{workspace}/ai_subject_{idx}_2.mp4",
+                    subject_text=subject_desc,
+                    duration_sec=8.0,
+                    fps=24,
+                    reverse_motion=True
+                )
+                synthesized_ai_clips = [c for c in (ai_clip_1, ai_clip_2) if c and os.path.exists(c)]
+                if needs_ai_subject_video and synthesized_ai_clips:
+                    # Lead with our custom subject-accurate AI video clips
+                    pexels_clips = (synthesized_ai_clips + pexels_clips)[:2]
+                elif synthesized_ai_clips:
+                    pexels_clips = (pexels_clips + synthesized_ai_clips)[:2]
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
