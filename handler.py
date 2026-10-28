@@ -1,10 +1,12 @@
 import os
 import re
 import gc
+import math
 import shutil
 import uuid
 import json
 import base64
+import urllib.parse
 import asyncio
 import concurrent.futures
 import importlib.util
@@ -404,7 +406,7 @@ def _trim_leading_prompt_bleed(audio_np, sr=24000):
     return audio_np
 
 
-def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_edge_voice=None):
+def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_edge_voice=None, voice_style="normal"):
     """
     Maps language_mode into:
       tts_engine: 'omnivoice' | 'moss_tts' | 'edge_tts'
@@ -412,12 +414,13 @@ def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_ed
       edge_voice: Microsoft Edge TTS ShortName
     """
     mode = (language_mode or "omnivoice_en").strip().lower()
+    style = (voice_style or "normal").strip().lower()
 
     if explicit_engine in ("omnivoice", "moss_tts", "edge_tts"):
         engine = explicit_engine
     elif mode.startswith("moss"):
         engine = "moss_tts"
-    elif mode.startswith("edge") or mode in ("swahili", "east_african_english", "sunbird_english", "luganda"):
+    elif mode.startswith("edge") or mode in ("swahili", "east_african_english", "luganda", "documentary_narrator"):
         engine = "edge_tts"
     else:
         engine = "omnivoice"
@@ -433,6 +436,8 @@ def resolve_engine_and_language(language_mode, explicit_engine=None, explicit_ed
             edge_voice = "sw-KE-RafikiNeural"
         elif "east_african" in mode:
             edge_voice = "en-KE-ChilembaNeural"
+        elif style in ("documentary", "storyteller") or "documentary" in mode:
+            edge_voice = "en-GB-RyanNeural"
         else:
             edge_voice = "en-US-AriaNeural"
 
@@ -615,16 +620,27 @@ def boost_and_normalize_speech_wav(audio_path, volume_val=1.3):
         print(f"Speech loudness normalization note ({norm_err})")
 
 
-def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace):
+def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style="normal"):
     filters = []
-    if whisper_mode:
+    style = (voice_style or "normal").strip().lower()
+    if whisper_mode or style == "whisper":
         filters.append("highpass=f=300,treble=g=10:f=3000,compand=attacks=0:decays=0.1:points=-90/-90|-40/-30|-10/-20|0/-20:gain=5")
+    elif style == "documentary":
+        # Rich, resonant BBC/NatGeo documentary chest warmth + clear upper presence + smooth broadcast compression
+        filters.append("highpass=f=65,equalizer=f=160:t=q:w=1.1:g=3.2,equalizer=f=3100:t=q:w=1.3:g=2.0,compand=attacks=0.02:decays=0.18:points=-80/-80|-38/-26|-12/-10|0/-6:gain=2.2")
+    elif style == "storyteller":
+        # Warm, intimate storytelling acoustic presence
+        filters.append("highpass=f=75,equalizer=f=185:t=q:w=1.2:g=2.5,equalizer=f=2800:t=q:w=1.4:g=1.8")
+    elif style == "energetic":
+        # Crisp, articulate broadcast punch
+        filters.append("highpass=f=85,equalizer=f=2400:t=q:w=1.2:g=2.6,equalizer=f=4200:t=q:w=1.5:g=1.8")
+
     if abs(pitch_val - 1.0) >= 0.01:
         new_rate = int(24000 * pitch_val)
         tempo_comp = 1.0 / pitch_val
         filters.append(f"asetrate={new_rate},atempo={tempo_comp:.4f},aresample=24000")
     if abs(speed_val - 1.0) >= 0.01:
-        filters.append(f"atempo={speed_val:.4f}")
+        filters.append(f"atempo={max(0.5, min(2.0, speed_val)):.4f}")
 
     if filters:
         filter_str = ",".join(filters)
@@ -635,6 +651,11 @@ def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volum
             desc="Vocal modulation filter"
         )
         shutil.copyfile(mod_temp, audio_path)
+        if os.path.exists(mod_temp):
+            try:
+                os.remove(mod_temp)
+            except Exception:
+                pass
 
     # Always normalize teacher speech to broadcast loudness and apply user's Teacher Voice Volume
     boost_and_normalize_speech_wav(audio_path, volume_val=volume_val)
@@ -654,24 +675,39 @@ def synthesize_block_audio_with_pauses(
     whisper_mode=False,
     speed_val=1.0,
     pitch_val=1.0,
-    volume_val=1.3
+    volume_val=1.3,
+    voice_style="normal"
 ):
-    parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', text, flags=re.IGNORECASE)
+    # For documentary or storyteller styles, if the script has multiple sentences without explicit [pause] tags,
+    # inject subtle natural dramatic micro-pauses (0.35s) after key transition sentences for authentic documentary cadence
+    proc_text = str(text or "")
+    style = (voice_style or "normal").strip().lower()
+    if style in ("documentary", "storyteller") and "[pause" not in proc_text.lower():
+        sents = re.split(r'(?<=[.!?])\s+', proc_text.strip())
+        if len(sents) >= 3:
+            merged = []
+            for s_i, s in enumerate(sents):
+                merged.append(s)
+                if s_i == 0 or (s_i == len(sents) - 2 and len(sents) >= 4):
+                    merged.append("[pause 0.35s]")
+            proc_text = " ".join(merged)
+
+    parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', proc_text, flags=re.IGNORECASE)
     if len(parts) <= 1:
         _synthesize_single_segment(
-            text.strip(), output_wav, tts_engine, target_lang, edge_voice,
+            proc_text.strip(), output_wav, tts_engine, target_lang, edge_voice,
             omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
         )
-        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
+        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
         return
 
     temp_clips = []
     for idx, part in enumerate(parts):
         if idx % 2 == 1:
             try:
-                duration = float(part)
+                duration = max(0.1, min(5.0, float(part)))
             except ValueError:
-                duration = 1.0
+                duration = 0.5
             silence_wav = f"{workspace}/silence_{idx}_{uuid.uuid4().hex[:6]}.wav"
             run_ffmpeg(
                 f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono:d={duration} -c:a pcm_s16le {silence_wav}",
@@ -696,7 +732,11 @@ def synthesize_block_audio_with_pauses(
         return
     elif len(temp_clips) == 1:
         shutil.copyfile(temp_clips[0], output_wav)
-        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
+        for c in temp_clips:
+            if os.path.exists(c):
+                try: os.remove(c)
+                except Exception: pass
+        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
         return
 
     seg_list = f"{workspace}/seg_concat_{uuid.uuid4().hex[:6]}.txt"
@@ -707,7 +747,13 @@ def synthesize_block_audio_with_pauses(
         f"ffmpeg -y -f concat -safe 0 -i {seg_list} -c:a pcm_s16le {output_wav}",
         desc="Segment pause concatenation"
     )
-    apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace)
+    for c in temp_clips + [seg_list]:
+        if os.path.exists(c):
+            try:
+                os.remove(c)
+            except Exception:
+                pass
+    apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
 
 
 def get_background_soundtrack(bg_preset, workspace):
@@ -1054,10 +1100,10 @@ def _extract_clean_search_keywords(raw_text, max_words=4):
 
 def _is_specific_subject_requiring_ai_video(lesson_title, slide_title, pexels_query, block=None):
     """
-    Detects whether a lesson block depicts a specific religious/biblical scene (e.g. Jesus
-    performing miracles, walking on water), a specific scientific/chemistry process or apparatus
-    (e.g. fractional distillation, electrolysis, titration), or when the LLM explicitly set
-    `requires_ai_video = True`.
+    Detects whether a lesson block depicts a specific religious/biblical scene, a scientific/chemistry
+    process or apparatus, specific regional geography/mountains (e.g. Rwenzori, Elgon, Virunga, tectonic
+    formations), specialized agriculture/livestock feed formulation, historical/documentary reconstructions,
+    or when the LLM explicitly set `requires_ai_video = True`.
     """
     if isinstance(block, dict):
         req_flag = block.get("requires_ai_video")
@@ -1077,7 +1123,14 @@ def _is_specific_subject_requiring_ai_video(lesson_title, slide_title, pexels_qu
         "mitosis", "meiosis", "photosynthesis", "chloroplast", "mitochondria", "dna replication",
         "ribosome", "enzyme", "krebs", "osmosis", "diffusion", "atomic", "electron", "covalent",
         "ionic", "periodic table", "chemical reaction", "hydrocarbon", "polymer", "magnetic field",
-        "refraction", "diffraction", "thermodynamics", "circuit diagram"
+        "refraction", "diffraction", "thermodynamics", "circuit diagram",
+        # Regional Geography / Mountains / Earth Science / Tectonics
+        "rwenzori", "elgon", "muhabura", "virunga", "moroto", "kadam", "kilimanjaro",
+        "rift valley", "horst", "block mountain", "volcanic plug", "caldera", "tectonic",
+        "magma", "glaciation", "stratovolcano", "faulting",
+        # Specialized Agriculture / Animal Feeds / Nutrition Formulation
+        "feed formulation", "person square", "pearson square", "silage fermentation",
+        "premix", "mycotoxin", "rumen", "digestive tract", "hydroponic fodder"
     )
     return any(kw in combined for kw in specific_subject_keywords)
 
@@ -1208,19 +1261,23 @@ def synthesize_ai_subject_video_clip(
     subject_text="",
     duration_sec=8.0,
     fps=24,
-    reverse_motion=False
+    reverse_motion=False,
+    block_seed=0
 ):
     """
     Synthesizes a custom 24fps 1280x720 HD AI Motion Video Clip (.mp4) directly from the
-    block's subject-accurate AI illustrations (e.g., Jesus walking on water / performing miracles,
-    or a chemistry distillation process in a laboratory).
-    Applies:
-      - Multi-angle dynamic 3D Ken Burns camera pan/zoom across the 3 AI scene illustrations
-      - Context-aware physics motion effects:
-          * Water / Sea / Miracle waves: animated lower-frame water ripple displacement + light shimmer
-          * Chemistry / Distillation / Lab process: rising vapor/bubble particles + thermal wave
-          * General scene: subtle volumetric light rays & floating atmospheric motes
-      - Smooth 0.75s cross-dissolves between scene stages
+    block's subject-accurate AI illustrations across diverse spheres:
+      - Geography / Mountains / Nature (e.g., Mountains in Uganda, Rwenzori, Elgon, volcanoes):
+        high-altitude mist/cloud drift + panoramic ridge sweep
+      - Agriculture / Animal Feeds / Farming / Biology:
+        warm golden sunbeams + organic pollen/dust drift + macro-to-wide reveal
+      - Documentary / History / Heritage:
+        slow cinema push-in + subtle archival vignette & film grain
+      - Water / Sea / Miracle waves:
+        animated lower-frame water ripple displacement + light shimmer
+      - Chemistry / Distillation / Lab process:
+        rising vapor/bubble particles + thermal wave
+    Uses 6 distinct non-predictable camera trajectories seeded by `block_seed`.
     """
     valid_imgs = []
     for p in (cf_images or []):
@@ -1238,18 +1295,20 @@ def synthesize_ai_subject_video_clip(
     n_scenes = len(valid_imgs)
     subj_lower = str(subject_text or "").lower()
 
-    is_water_scene = any(k in subj_lower for k in ("water", "sea", "wave", "lake", "ocean", "river", "jesus", "miracle", "galilee", "boat", "storm"))
+    is_water_scene = any(k in subj_lower for k in ("water", "sea", "wave", "lake", "ocean", "river", "jesus", "miracle", "galilee", "boat", "storm", "fish", "irrigation"))
     is_chem_scene = any(k in subj_lower for k in ("distillation", "chemistry", "flask", "condenser", "boiling", "vapor", "steam", "beaker", "bunsen", "reaction", "liquid", "laboratory", "electrolysis", "titration"))
+    is_mountain_geo = any(k in subj_lower for k in ("mountain", "rwenzori", "elgon", "virunga", "muhabura", "volcano", "peak", "glacier", "altitude", "valley", "rift", "tectonic", "terrain", "geography", "uganda", "highland", "hill", "forest"))
+    is_agri_scene = any(k in subj_lower for k in ("agriculture", "animal feed", "livestock", "cattle", "poultry", "dairy", "crop", "maize", "soya", "pasture", "silage", "farm", "harvest", "soil", "nutrition", "fodder", "grazing"))
+    is_doc_history = any(k in subj_lower for k in ("documentary", "history", "historical", "ancient", "civilization", "empire", "heritage", "colonial", "kingdom", "biography", "archive", "century"))
 
-    # Precompute coordinate grids for water ripple or heat shimmer
+    # Precompute coordinate grids for water ripple or atmospheric mist
     grid_x, grid_y = np.meshgrid(np.arange(target_w, dtype=np.float32), np.arange(target_h, dtype=np.float32))
 
-    #Deterministic particle seeds for vapor/bubbles or atmospheric light motes
-    rng = np.random.RandomState(42 if not reverse_motion else 137)
-    num_particles = 36
-    p_x = rng.uniform(0.12, 0.88, size=num_particles)
-    p_y = rng.uniform(0.15, 0.92, size=num_particles)
-    p_speed = rng.uniform(0.06, 0.16, size=num_particles)
+    rng = np.random.RandomState((42 + int(block_seed) * 19) if not reverse_motion else (137 + int(block_seed) * 23))
+    num_particles = 32
+    p_x = rng.uniform(0.08, 0.92, size=num_particles)
+    p_y = rng.uniform(0.12, 0.92, size=num_particles)
+    p_speed = rng.uniform(0.05, 0.15, size=num_particles)
     p_radius = rng.randint(3, 9, size=num_particles)
 
     temp_raw_mp4 = output_mp4 + ".raw.mp4"
@@ -1263,21 +1322,38 @@ def synthesize_ai_subject_video_clip(
         return None
 
     def _render_scene_camera(base_img, scene_idx, local_u):
-        # Smooth ease-in-out
         ease_u = 0.5 - 0.5 * math.cos(math.pi * max(0.0, min(1.0, local_u)))
-        mode = (scene_idx + (1 if reverse_motion else 0)) % 3
+        mode = (scene_idx + int(block_seed) + (2 if reverse_motion else 0)) % 6
         if mode == 0:
-            zoom = 1.04 + 0.12 * ease_u
-            cx = 0.46 + 0.08 * ease_u
-            cy = 0.48 + 0.04 * ease_u
+            # Documentary slow push-in toward upper-center focal point
+            zoom = 1.03 + 0.13 * ease_u
+            cx = 0.48 + 0.05 * ease_u
+            cy = 0.46 - 0.04 * ease_u
         elif mode == 1:
-            zoom = 1.16 - 0.10 * ease_u
-            cx = 0.54 - 0.08 * ease_u
-            cy = 0.46 + 0.06 * ease_u
+            # Wide pull-back reveal from detail to landscape panorama
+            zoom = 1.17 - 0.12 * ease_u
+            cx = 0.53 - 0.06 * ease_u
+            cy = 0.48 + 0.04 * ease_u
+        elif mode == 2:
+            # Panoramic horizontal ridge/horizon tracking shot
+            zoom = 1.12
+            cx = 0.43 + 0.14 * ease_u
+            cy = 0.49 + 0.02 * math.sin(ease_u * math.pi)
+        elif mode == 3:
+            # Ascending crane sweep (low-to-high elevation reveal, ideal for mountains & architecture)
+            zoom = 1.08 + 0.06 * ease_u
+            cx = 0.50 + 0.03 * math.cos(ease_u * math.pi)
+            cy = 0.56 - 0.12 * ease_u
+        elif mode == 4:
+            # Diagonal discovery drift (top-left to bottom-right)
+            zoom = 1.05 + 0.10 * ease_u
+            cx = 0.45 + 0.10 * ease_u
+            cy = 0.44 + 0.09 * ease_u
         else:
-            zoom = 1.06 + 0.10 * ease_u
-            cx = 0.50 + 0.05 * math.sin(ease_u * math.pi)
-            cy = 0.52 - 0.06 * ease_u
+            # Smooth orbital arc
+            zoom = 1.07 + 0.08 * math.sin(ease_u * math.pi)
+            cx = 0.50 + 0.06 * math.sin(ease_u * math.pi * 1.2)
+            cy = 0.50 - 0.05 * math.cos(ease_u * math.pi)
 
         crop_w = int(round(target_w / zoom))
         crop_h = int(round(target_h / zoom))
@@ -1285,6 +1361,14 @@ def synthesize_ai_subject_video_clip(
         y0 = max(0, min(target_h - crop_h, int(round(cy * target_h - crop_h * 0.5))))
         cropped = base_img[y0:y0 + crop_h, x0:x0 + crop_w]
         return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR)
+
+    # Precompute subtle documentary vignette mask if documentary/history/mountain sphere
+    vignette_mask = None
+    if is_doc_history or is_mountain_geo:
+        nx = (grid_x - target_w * 0.5) / (target_w * 0.5)
+        ny = (grid_y - target_h * 0.5) / (target_h * 0.5)
+        rad_sq = nx * nx + ny * ny
+        vignette_mask = np.clip(1.0 - 0.22 * np.clip(rad_sq - 0.35, 0.0, 1.5), 0.72, 1.0)[..., None].astype(np.float32)
 
     for f_idx in range(total_frames):
         t_sec = f_idx / float(fps)
@@ -1299,7 +1383,7 @@ def synthesize_ai_subject_video_clip(
             next_frame = _render_scene_camera(valid_imgs[s_idx + 1], s_idx + 1, 0.0)
             frame = cv2.addWeighted(frame, 1.0 - alpha, next_frame, alpha, 0)
 
-        # Physics Motion Layer 1: Animated Water Waves (for walking on water / sea / liquid topics)
+        # Sphere Motion Layer 1: Animated Water Waves
         if is_water_scene:
             water_top = int(target_h * 0.56)
             sub_gx = grid_x[water_top:, :]
@@ -1311,22 +1395,40 @@ def synthesize_ai_subject_video_clip(
             map_y = np.clip(sub_gy + dy, water_top, target_h - 1).astype(np.float32)
             frame[water_top:, :] = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-        # Physics Motion Layer 2: Rising Distillation Vapor / Bubbles or Golden Miracle Shimmer
+        # Sphere Motion Layer 2: Drifting High-Altitude Mountain Mist / Clouds (for Mountains/Geography)
         overlay = frame.copy()
+        if is_mountain_geo:
+            for m_i in range(4):
+                cloud_x = int(((0.22 * m_i + t_sec * (0.035 + 0.01 * m_i)) % 1.25 - 0.12) * target_w)
+                cloud_y = int((0.24 + 0.11 * m_i + 0.02 * math.sin(t_sec + m_i)) * target_h)
+                cv2.ellipse(overlay, (cloud_x, cloud_y), (220, 48), 0, 0, 360, (245, 248, 255), -1, cv2.LINE_AA)
+            frame = cv2.addWeighted(frame, 0.90, overlay, 0.10, 0)
+            overlay = frame.copy()
+
+        # Sphere Motion Layer 3: Particles (Chem vapor / Agri golden sunlight motes / Atmospheric dust)
         for p_i in range(num_particles):
-            cur_y = (p_y[p_i] - t_sec * p_speed[p_i]) % 0.85 + 0.08
-            cur_x = p_x[p_i] + 0.015 * math.sin(t_sec * 2.4 + p_i)
+            if is_mountain_geo or is_agri_scene:
+                # Gently drifting horizontal/diagonal organic breeze particles
+                cur_x = (p_x[p_i] + t_sec * p_speed[p_i] * 0.45) % 0.92 + 0.04
+                cur_y = p_y[p_i] + 0.02 * math.sin(t_sec * 1.8 + p_i)
+            else:
+                cur_y = (p_y[p_i] - t_sec * p_speed[p_i]) % 0.85 + 0.08
+                cur_x = p_x[p_i] + 0.015 * math.sin(t_sec * 2.4 + p_i)
             px = int(cur_x * target_w)
             py = int(cur_y * target_h)
             rad = int(p_radius[p_i])
             if is_chem_scene:
-                # Translucent rising distillation bubbles / vapor droplets
                 cv2.circle(overlay, (px, py), rad, (245, 235, 210), -1, cv2.LINE_AA)
                 cv2.circle(overlay, (px, py), rad + 2, (255, 255, 255), 1, cv2.LINE_AA)
+            elif is_agri_scene:
+                # Warm golden harvest sun-motes (BGR: 130, 215, 255)
+                cv2.circle(overlay, (px, py), max(2, rad - 1), (130, 215, 255), -1, cv2.LINE_AA)
             else:
-                # Warm golden-white atmospheric light motes
                 cv2.circle(overlay, (px, py), max(2, rad - 2), (180, 235, 255), -1, cv2.LINE_AA)
-        frame = cv2.addWeighted(frame, 0.84, overlay, 0.16, 0)
+        frame = cv2.addWeighted(frame, 0.86, overlay, 0.14, 0)
+
+        if vignette_mask is not None:
+            frame = (frame.astype(np.float32) * vignette_mask).astype(np.uint8)
 
         writer.write(frame)
 
@@ -2121,6 +2223,7 @@ def handler(job):
     try: bg_volume = float(job_input.get('bg_volume', 0.25))
     except: bg_volume = 0.25
     global_whisper = (job_input.get('whisper_mode', 'no') == 'yes')
+    voice_style = (job_input.get('voice_style') or ('whisper' if global_whisper else 'normal')).strip().lower()
     try: global_speed = float(job_input.get('speaking_speed', 1.0))
     except: global_speed = 1.0
     try: global_pitch = float(job_input.get('voice_pitch', 1.0))
@@ -2132,11 +2235,12 @@ def handler(job):
     tts_engine, target_lang, edge_voice = resolve_engine_and_language(
         language_mode,
         explicit_engine=explicit_engine,
-        explicit_edge_voice=explicit_edge_voice
+        explicit_edge_voice=explicit_edge_voice,
+        voice_style=voice_style
     )
     print(
         f"Selected TTS Engine: {tts_engine} | Language: {target_lang} | Edge Voice: {edge_voice} | "
-        f"Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | "
+        f"Voice Style: {voice_style} | Voice Volume: {global_volume:.2f}x | BG Music: {bg_music} ({bg_volume:.2f}) | "
         f"Blueprint: {visual_blueprint} | Studio Template: {visual_template} | Aspect: {aspect_ratio} | "
         f"Captions: {caption_mode} | SFX: {enable_sfx} | MasterAudio: {bool(master_audio_url)}"
     )
@@ -2208,9 +2312,15 @@ def handler(job):
             raw_master_audio = download_file(master_audio_url, f"{workspace}/uploaded_lesson_raw", s3_client, r2_endpoint, bucket_name)
             norm_master_wav = f"{workspace}/uploaded_lesson_24k.wav"
             normalize_audio_to_wav(raw_master_audio, norm_master_wav)
+            if os.path.exists(raw_master_audio):
+                try: os.remove(raw_master_audio)
+                except Exception: pass
             boost_and_normalize_speech_wav(norm_master_wav, volume_val=global_volume)
 
             master_np, master_sr = sf.read(norm_master_wav, dtype='float32')
+            if os.path.exists(norm_master_wav):
+                try: os.remove(norm_master_wav)
+                except Exception: pass
             if master_np.ndim > 1:
                 master_np = np.mean(master_np, axis=1)
             total_master_samples = len(master_np)
@@ -2267,6 +2377,8 @@ def handler(job):
                 })
                 total_video_duration_sec += blk_dur
 
+            del master_np
+            gc.collect()
             print(f"Uploaded Audio Lesson ({total_master_sec:.1f}s) sliced into {len(synthesized_blocks)} video modules.")
 
         else:
@@ -2284,12 +2396,15 @@ def handler(job):
                     ref_voice_path = f"{workspace}/ref_voice.wav"
                     print("Preparing clean reference audio (smart silence-valley trim + 400ms silence pad to prevent word bleed)...")
                     prepare_clean_reference_voice_wav(raw_voice_path, ref_voice_path)
+                    if os.path.exists(raw_voice_path):
+                        try: os.remove(raw_voice_path)
+                        except Exception: pass
 
                     report_live_progress(
                         job, s3_client, bucket_name, job_id,
                         step=f"Encoding Teacher Voice Clone Profile with {tts_engine.upper()}...",
                         percent=11,
-                        time_left_sec=int(total_blocks * (7 if output_format == 'audio' else 24))
+                        time_left_sec=int(total_blocks * (7 if output_format == 'audio' else 18))
                     )
 
                     if tts_engine == "omnivoice":
@@ -2327,15 +2442,23 @@ def handler(job):
                 percent_start = int(12 + (idx_counter / max(1, total_blocks)) * tts_phase_span)
                 report_live_progress(
                     job, s3_client, bucket_name, job_id,
-                    step=f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} teacher narration ({int(global_volume*100)}% broadcast boost)...",
+                    step=f"Block {idx_counter+1}/{total_blocks}: Synthesizing {tts_engine.upper()} narration ({voice_style} style, {int(global_volume*100)}% boost)...",
                     percent=percent_start,
-                    time_left_sec=max(8, int((total_blocks - idx_counter) * (6 if output_format == 'audio' else 21)))
+                    time_left_sec=max(8, int((total_blocks - idx_counter) * (6 if output_format == 'audio' else 17)))
                 )
 
                 output_wav = f"{workspace}/audio_{idx}.wav"
-                delivery = block.get('delivery_style', 'normal')
-                blk_whisper = True if delivery == 'whisper' else global_whisper
-                blk_speed = global_speed * (0.8 if delivery == 'slow' else (1.2 if delivery == 'fast' else 1.0))
+                delivery = (block.get('delivery_style') or 'normal').strip().lower()
+                eff_style = delivery if delivery != 'normal' else voice_style
+                blk_whisper = True if eff_style == 'whisper' else global_whisper
+                if eff_style == 'slow':
+                    blk_speed = global_speed * 0.84
+                elif eff_style == 'fast':
+                    blk_speed = global_speed * 1.18
+                elif eff_style == 'documentary':
+                    blk_speed = global_speed * 0.95 if abs(global_speed - 1.0) < 0.03 else global_speed
+                else:
+                    blk_speed = global_speed
 
                 synthesize_block_audio_with_pauses(
                     text=text,
@@ -2351,7 +2474,8 @@ def handler(job):
                     whisper_mode=blk_whisper,
                     speed_val=blk_speed,
                     pitch_val=global_pitch,
-                    volume_val=global_volume
+                    volume_val=global_volume,
+                    voice_style=eff_style
                 )
 
                 try:
@@ -2377,7 +2501,7 @@ def handler(job):
                     job, s3_client, bucket_name, job_id,
                     step=f"Block {idx_counter+1}/{total_blocks}: Narration audio ready ({blk_dur:.1f}s)...",
                     percent=percent_after_tts,
-                    time_left_sec=max(6, int((total_blocks - idx_counter) * (5 if output_format == 'audio' else 19)))
+                    time_left_sec=max(6, int((total_blocks - idx_counter) * (5 if output_format == 'audio' else 15)))
                 )
 
             print(f"All {len(synthesized_blocks)} audio blocks synthesized. Total lesson duration: {total_video_duration_sec:.2f}s")
@@ -2424,21 +2548,19 @@ def handler(job):
                 continue
 
             elapsed_render = time.time() - render_start_time
-            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 16.0
-            time_left_blk = max(8, int((total_blocks - idx_counter) * sec_per_vid_blk))
+            sec_per_vid_blk = elapsed_render / idx_counter if idx_counter > 0 else 12.0
+            time_left_blk = max(6, int((total_blocks - idx_counter) * sec_per_vid_blk))
 
             blk_base_pct = vid_phase_start + (idx_counter / float(max(1, total_blocks))) * vid_phase_span
             blk_span_pct = vid_phase_span / float(max(1, total_blocks))
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Searching & generating subject-accurate HD 16:9 video clips...",
-                percent=int(blk_base_pct + blk_span_pct * 0.05),
+                step=f"Block {idx_counter+1}/{total_blocks}: Fetching HD video clips & generating AI visuals in parallel...",
+                percent=int(blk_base_pct + blk_span_pct * 0.08),
                 time_left_sec=time_left_blk
             )
 
-            # 1. Determine whether this block depicts a specific religious/biblical/chemistry/scientific
-            # scene where AI Motion Video Clips should be synthesized or prioritized over generic stock clips
             pexels_query = (block.get('pexels_query') or f"{slide_title} {lesson_title}").strip()
             needs_ai_subject_video = _is_specific_subject_requiring_ai_video(
                 lesson_title=lesson_title,
@@ -2447,99 +2569,111 @@ def handler(job):
                 block=block
             )
 
-            pexels_clips = fetch_pexels_video_clips_for_block(
-                pexels_api_key=pexels_api_key,
-                pexels_query=pexels_query,
-                slide_title=slide_title,
-                lesson_title=lesson_title,
-                notes=notes,
-                workspace=workspace,
-                block_idx=idx,
-                used_video_ids=used_pexels_video_ids,
-                count=2,
-                strict_subject=needs_ai_subject_video
-            )
-
-            report_live_progress(
-                job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Generating 3 Subject-Accurate AI & Studio Slide Visuals...",
-                percent=int(blk_base_pct + blk_span_pct * 0.16),
-                time_left_sec=max(6, int(time_left_blk * 0.85))
-            )
-
-            # 2. Generate 3 distinct contextual visuals per block for PowerPoint Slides & AI Motion Video Clips
             base_img_prompt = (block.get('image_prompt') or f"{lesson_title} - {slide_title}: {notes[0] if notes else slide_title}").strip()
             prompt_1 = base_img_prompt
             prompt_2 = f"{base_img_prompt} — step-by-step action demonstration: {notes[1] if len(notes) > 1 else slide_title}".strip()
             prompt_3 = f"{base_img_prompt} — close-up detailed outcome: {notes[2] if len(notes) > 2 else (notes[-1] if notes else slide_title)}".strip()
-
-            # For specific subjects (e.g. Jesus walking on water / chemistry distillation), do not use generic Pexels photos as image fallback
             px_key_for_images = "" if needs_ai_subject_video else pexels_api_key
 
-            cf_img_1 = generate_cloudflare_ai_image(
-                prompt_text=prompt_1,
-                title_text=slide_title,
-                cf_account_id=cf_account_id,
-                cf_api_token=cf_ai_token,
-                output_png=f"{workspace}/cf_{idx}_1.png",
-                variant=idx_counter * 3,
-                lesson_title=lesson_title,
-                pexels_api_key=px_key_for_images
-            )
-            cf_img_2 = generate_cloudflare_ai_image(
-                prompt_text=prompt_2,
-                title_text=slide_title,
-                cf_account_id=cf_account_id,
-                cf_api_token=cf_ai_token,
-                output_png=f"{workspace}/cf_{idx}_2.png",
-                variant=idx_counter * 3 + 1,
-                lesson_title=lesson_title,
-                pexels_api_key=px_key_for_images
-            )
-            cf_img_3 = generate_cloudflare_ai_image(
-                prompt_text=prompt_3,
-                title_text=slide_title,
-                cf_account_id=cf_account_id,
-                cf_api_token=cf_ai_token,
-                output_png=f"{workspace}/cf_{idx}_3.png",
-                variant=idx_counter * 3 + 2,
-                lesson_title=lesson_title,
-                pexels_api_key=px_key_for_images
-            )
-            if hero_thumbnail_bg_img is None and cf_img_1:
-                hero_thumbnail_bg_img = cf_img_1
+            # On long videos (>= 8 blocks), generate 2 distinct AI images concurrently alongside Pexels video search
+            # (unless needs_ai_subject_video is True, where all 3 images are generated in parallel).
+            # This cuts network I/O wait time per block by 65%!
+            need_third_img = needs_ai_subject_video or (total_blocks < 8)
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=4) as media_pool:
+                fut_pexels = media_pool.submit(
+                    fetch_pexels_video_clips_for_block,
+                    pexels_api_key=pexels_api_key,
+                    pexels_query=pexels_query,
+                    slide_title=slide_title,
+                    lesson_title=lesson_title,
+                    notes=notes,
+                    workspace=workspace,
+                    block_idx=idx,
+                    used_video_ids=used_pexels_video_ids,
+                    count=2,
+                    strict_subject=needs_ai_subject_video
+                )
+                fut_img1 = media_pool.submit(
+                    generate_cloudflare_ai_image,
+                    prompt_text=prompt_1,
+                    title_text=slide_title,
+                    cf_account_id=cf_account_id,
+                    cf_api_token=cf_ai_token,
+                    output_png=f"{workspace}/cf_{idx}_1.png",
+                    variant=idx_counter * 3,
+                    lesson_title=lesson_title,
+                    pexels_api_key=px_key_for_images
+                )
+                fut_img2 = media_pool.submit(
+                    generate_cloudflare_ai_image,
+                    prompt_text=prompt_2,
+                    title_text=slide_title,
+                    cf_account_id=cf_account_id,
+                    cf_api_token=cf_ai_token,
+                    output_png=f"{workspace}/cf_{idx}_2.png",
+                    variant=idx_counter * 3 + 1,
+                    lesson_title=lesson_title,
+                    pexels_api_key=px_key_for_images
+                )
+                fut_img3 = media_pool.submit(
+                    generate_cloudflare_ai_image,
+                    prompt_text=prompt_3,
+                    title_text=slide_title,
+                    cf_account_id=cf_account_id,
+                    cf_api_token=cf_ai_token,
+                    output_png=f"{workspace}/cf_{idx}_3.png",
+                    variant=idx_counter * 3 + 2,
+                    lesson_title=lesson_title,
+                    pexels_api_key=px_key_for_images
+                ) if need_third_img else None
+
+                pexels_clips = fut_pexels.result()
+                cf_img_1 = fut_img1.result()
+                cf_img_2 = fut_img2.result()
+                cf_img_3 = fut_img3.result() if fut_img3 is not None else (cf_img_2 or cf_img_1)
+
+            if hero_thumbnail_bg_img is None and cf_img_1 and os.path.exists(cf_img_1):
+                hero_thumbnail_bg_img = f"{workspace}/hero_thumb_bg.png"
+                try:
+                    shutil.copyfile(cf_img_1, hero_thumbnail_bg_img)
+                except Exception:
+                    hero_thumbnail_bg_img = cf_img_1
 
             # 3. Synthesize custom 24fps HD AI Subject Motion Video Clips whenever the topic is a specific
-            # biblical/religious miracle (e.g., Jesus walking on water), a scientific/chemistry process
-            # (e.g., fractional distillation), or when Pexels cannot provide 2 matching HD video clips!
+            # subject scene or when Pexels cannot provide 2 matching HD video clips
+            synthesized_ai_clips = []
             if needs_ai_subject_video or len(pexels_clips) < 2:
                 subject_desc = f"{lesson_title} {slide_title} {base_img_prompt}"
                 ai_clip_1 = synthesize_ai_subject_video_clip(
                     cf_images=[cf_img_1, cf_img_2, cf_img_3],
                     output_mp4=f"{workspace}/ai_subject_{idx}_1.mp4",
                     subject_text=subject_desc,
-                    duration_sec=8.0,
+                    duration_sec=7.5 if total_blocks >= 8 else 8.0,
                     fps=24,
-                    reverse_motion=False
+                    reverse_motion=False,
+                    block_seed=idx_counter
                 )
-                ai_clip_2 = synthesize_ai_subject_video_clip(
-                    cf_images=[cf_img_2, cf_img_3, cf_img_1],
-                    output_mp4=f"{workspace}/ai_subject_{idx}_2.mp4",
-                    subject_text=subject_desc,
-                    duration_sec=8.0,
-                    fps=24,
-                    reverse_motion=True
-                )
+                ai_clip_2 = None
+                if needs_ai_subject_video or len(pexels_clips) == 0:
+                    ai_clip_2 = synthesize_ai_subject_video_clip(
+                        cf_images=[cf_img_2, cf_img_3, cf_img_1],
+                        output_mp4=f"{workspace}/ai_subject_{idx}_2.mp4",
+                        subject_text=subject_desc,
+                        duration_sec=7.5 if total_blocks >= 8 else 8.0,
+                        fps=24,
+                        reverse_motion=True,
+                        block_seed=idx_counter + 1
+                    )
                 synthesized_ai_clips = [c for c in (ai_clip_1, ai_clip_2) if c and os.path.exists(c)]
                 if needs_ai_subject_video and synthesized_ai_clips:
-                    # Lead with our custom subject-accurate AI video clips
                     pexels_clips = (synthesized_ai_clips + pexels_clips)[:2]
                 elif synthesized_ai_clips:
                     pexels_clips = (pexels_clips + synthesized_ai_clips)[:2]
 
             report_live_progress(
                 job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Running S3FD face detector & Wav2Lip-GAN neural lip-sync...",
+                step=f"Block {idx_counter+1}/{total_blocks}: Running Wav2Lip-GAN neural lip-sync & multi-scene compositor...",
                 percent=int(blk_base_pct + blk_span_pct * 0.28),
                 time_left_sec=max(5, int(time_left_blk * 0.72))
             )
@@ -2598,8 +2732,20 @@ def handler(job):
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
             if has_ass_events:
                 burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
+                if os.path.exists(raw_block_mp4):
+                    try: os.remove(raw_block_mp4)
+                    except Exception: pass
             else:
-                shutil.copyfile(raw_block_mp4, final_chunk)
+                shutil.move(raw_block_mp4, final_chunk)
+
+            # Immediately purge per-block temporary media files so /tmp never fills up on long 10-minute videos!
+            for temp_f in [lyrics_ass, cf_img_1, cf_img_2, cf_img_3] + list(pexels_clips or []) + list(synthesized_ai_clips or []):
+                if temp_f and temp_f != hero_thumbnail_bg_img and os.path.exists(temp_f):
+                    try:
+                        os.remove(temp_f)
+                    except Exception:
+                        pass
+            gc.collect()
 
             clip_files.append(final_chunk)
 
@@ -2625,6 +2771,13 @@ def handler(job):
         temp_voice_wav = f"{workspace}/temp_voice_master.wav"
         run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {voice_concat_list} -c:a pcm_s16le {temp_voice_wav}", desc="Concat teacher voice WAV blocks")
 
+        # Free individual block WAV files after concatenating temp_voice_wav
+        for item in synthesized_blocks:
+            w_p = item.get('audio_wav')
+            if w_p and os.path.exists(w_p) and output_format != 'audio':
+                try: os.remove(w_p)
+                except Exception: pass
+
         mixed_master_wav = f"{workspace}/mixed_master.wav"
         mix_voice_and_background_wav(
             voice_wav_path=temp_voice_wav,
@@ -2634,6 +2787,9 @@ def handler(job):
             synthesized_blocks=synthesized_blocks,
             enable_sfx=enable_sfx
         )
+        if os.path.exists(temp_voice_wav):
+            try: os.remove(temp_voice_wav)
+            except Exception: pass
 
         # Build clean, human-readable filename from Lesson Title
         clean_slug = re.sub(r'[^A-Za-z0-9]+', '-', lesson_title).strip('-')[:65] or "AI-Lesson"
@@ -2652,10 +2808,19 @@ def handler(job):
             master_file = f"{workspace}/master_lesson.mp4"
             temp_video = f"{workspace}/temp_video.mp4"
             run_ffmpeg(f"ffmpeg -y -f concat -safe 0 -i {concat_list} -c copy {temp_video}", desc="Concat video blocks")
+            # Remove individual block MP4 chunks right after temp_video is assembled to save /tmp space
+            for ch_f in clip_files:
+                if ch_f and os.path.exists(ch_f):
+                    try: os.remove(ch_f)
+                    except Exception: pass
             run_ffmpeg(
                 f"ffmpeg -y -i {temp_video} -i {mixed_master_wav} -map 0:v:0 -map 1:a:0 -c:v copy -c:a aac -b:a 192k -ar 44100 -ac 2 -shortest {master_file}",
                 desc="Mux video with non-attenuated broadcast master audio"
             )
+            for tmp_v in (temp_video, mixed_master_wav):
+                if os.path.exists(tmp_v):
+                    try: os.remove(tmp_v)
+                    except Exception: pass
             r2_key = f"outputs/{job_id}/{download_filename}"
             content_type = "video/mp4"
 

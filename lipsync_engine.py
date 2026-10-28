@@ -844,15 +844,66 @@ def _build_studio_desk_foreground(presenter_w=680, presenter_h=820):
     return bgr, alpha
 
 
+_AVATAR_BASE_CACHE = {}
+
+
+def _get_cached_avatar_base(raw_avatar_path, presenter_w=680, presenter_h=820, device="cuda"):
+    """
+    Caches S3FD face detection, chest-up portrait crop, video avatar loop frames,
+    torso articulation grids, and studio desk overlay across blocks so a 10-minute
+    (20-block) video only runs S3FD and video avatar decoding ONCE per job.
+    """
+    cache_key = f"{raw_avatar_path}|{presenter_w}x{presenter_h}"
+    if cache_key in _AVATAR_BASE_CACHE:
+        return _AVATAR_BASE_CACHE[cache_key]
+
+    presenter_bgr, (x1, y1, x2, y2), _ = prepare_presenter_portrait(
+        raw_avatar_path, presenter_w, presenter_h, device=device
+    )
+    video_loop_frames = _extract_video_avatar_loop(
+        raw_avatar_path, presenter_w, presenter_h, device=device
+    )
+    face_crop_orig = presenter_bgr[y1:y2, x1:x2].copy()
+    fh, fw = face_crop_orig.shape[:2]
+    mouth_mask = _create_full_opacity_mouth_mask(fw, fh)
+    torso_grids = _precompute_torso_articulation_grids(presenter_w, presenter_h, y2)
+    desk_bgr, desk_alpha = _build_studio_desk_foreground(presenter_w, presenter_h)
+
+    base_entry = {
+        "presenter_bgr": presenter_bgr,
+        "video_loop_frames": video_loop_frames,
+        "bbox": (x1, y1, x2, y2),
+        "face_crop_orig": face_crop_orig,
+        "mouth_mask": mouth_mask,
+        "torso_grids": torso_grids,
+        "desk_bgr": desk_bgr,
+        "desk_alpha": desk_alpha,
+    }
+    # Keep at most 2 entries in cache to bound RAM usage
+    if len(_AVATAR_BASE_CACHE) >= 2:
+        _AVATAR_BASE_CACHE.clear()
+    _AVATAR_BASE_CACHE[cache_key] = base_entry
+    return base_entry
+
+
 def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24, device="cuda"):
     """
     Pre-renders the lip-synced, blinking, head-swaying, shoulder-articulated teacher portrait
     state (680x820) for a block. Supports both static photo avatars (.jpg/.png/.webp) AND
     short real-human video avatar loops (.mp4/.webm/.mov)!
+    Uses cross-block avatar caching and stride-2 neural lip interpolation for fast long-video rendering.
     """
     presenter_w, presenter_h = 680, 820
-    presenter_bgr, (x1, y1, x2, y2), _ = prepare_presenter_portrait(raw_avatar_path, presenter_w, presenter_h, device=device)
-    video_loop_frames = _extract_video_avatar_loop(raw_avatar_path, presenter_w, presenter_h, device=device)
+    base = _get_cached_avatar_base(raw_avatar_path, presenter_w, presenter_h, device=device)
+    presenter_bgr = base["presenter_bgr"]
+    video_loop_frames = base["video_loop_frames"]
+    x1, y1, x2, y2 = base["bbox"]
+    face_crop_orig = base["face_crop_orig"]
+    mouth_mask = base["mouth_mask"]
+    torso_grids = base["torso_grids"]
+    desk_bgr = base["desk_bgr"]
+    desk_alpha = base["desk_alpha"]
+    fh, fw = face_crop_orig.shape[:2]
 
     mel, wav_16k = _compute_melspectrogram(audio_wav_path)
     mel_step_size = 16
@@ -892,10 +943,6 @@ def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24,
         smoothed = np.convolve(frame_energies, [0.25, 0.50, 0.25], mode="same")
         frame_energies = [float(x) for x in smoothed]
 
-    face_crop_orig = presenter_bgr[y1:y2, x1:x2].copy()
-    fh, fw = face_crop_orig.shape[:2]
-    mouth_mask = _create_full_opacity_mouth_mask(fw, fh)
-
     wav2lip_model = get_wav2lip_model(device=device)
     predicted_faces = []
 
@@ -906,21 +953,42 @@ def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24,
         face_concat = np.concatenate((face_masked, face_96), axis=2) / 255.0
         face_tensor_single = torch.from_numpy(np.transpose(face_concat, (2, 0, 1))).float().unsqueeze(0).to(device)
 
+        # For blocks >= 8 seconds (192+ frames), evaluate Wav2Lip at 12Hz (stride=2) and
+        # linearly blend intermediate frames—cutting Wav2Lip GPU compute by 50% with smooth 24fps lips!
+        stride = 2 if num_frames >= 192 else 1
+        key_indices = list(range(0, num_frames, stride))
+        key_mels = [mel_chunks[k] for k in key_indices]
+        key_preds = []
+
         batch_size = 64
+        use_cuda_amp = str(device).startswith("cuda") and torch.cuda.is_available()
         with torch.no_grad():
-            for b_start in range(0, num_frames, batch_size):
-                b_mels = np.array(mel_chunks[b_start:b_start + batch_size])
+            for b_start in range(0, len(key_mels), batch_size):
+                b_mels = np.array(key_mels[b_start:b_start + batch_size])
                 b_len = len(b_mels)
                 b_mels = np.reshape(b_mels, (b_len, b_mels.shape[1], b_mels.shape[2], 1))
                 mel_tensor = torch.from_numpy(np.transpose(b_mels, (0, 3, 1, 2))).float().to(device)
                 img_tensor = face_tensor_single.repeat(b_len, 1, 1, 1)
-                preds = wav2lip_model(mel_tensor, img_tensor)
-                preds_np = (preds.detach().cpu().numpy().transpose(0, 2, 3, 1) * 255.0).astype(np.uint8)
+                if use_cuda_amp:
+                    with torch.cuda.amp.autocast():
+                        preds = wav2lip_model(mel_tensor, img_tensor)
+                else:
+                    preds = wav2lip_model(mel_tensor, img_tensor)
+                preds_np = (preds.detach().cpu().float().numpy().transpose(0, 2, 3, 1) * 255.0).clip(0, 255).astype(np.uint8)
                 for p in preds_np:
-                    predicted_faces.append(p)
+                    key_preds.append(p)
 
-    torso_grids = _precompute_torso_articulation_grids(presenter_w, presenter_h, y2)
-    desk_bgr, desk_alpha = _build_studio_desk_foreground(presenter_w, presenter_h)
+        if stride == 1:
+            predicted_faces = key_preds
+        else:
+            n_keys = len(key_preds)
+            for f_idx in range(num_frames):
+                k0 = min(n_keys - 1, f_idx // stride)
+                if f_idx % stride == 0 or k0 + 1 >= n_keys:
+                    predicted_faces.append(key_preds[k0])
+                else:
+                    blended = cv2.addWeighted(key_preds[k0], 0.5, key_preds[k0 + 1], 0.5, 0)
+                    predicted_faces.append(blended)
 
     return {
         "presenter_bgr": presenter_bgr,
@@ -2356,18 +2424,79 @@ def render_dynamic_lesson_block(
     broll_ov1_bgr, broll_ov1_a = _build_broll_overlay_rgba(lesson_title, slide_title, broll_note_1, block_idx, total_blocks, visual_template=visual_template)
     broll_ov2_bgr, broll_ov2_a = _build_broll_overlay_rgba(lesson_title, slide_title, broll_note_2, block_idx, total_blocks, visual_template=visual_template)
 
+    # Pre-multiply B-Roll overlay strips on active Y bands only (y=18..122 and y=714..920)
+    # so per-frame B-Roll compositing avoids allocating 100MB of full-screen float32 arrays!
+    broll_bands = [(18, 122), (714, 920)]
+    broll_ov1_strips = [
+        (y1, y2, (broll_ov1_bgr[y1:y2] * broll_ov1_a[y1:y2]), (1.0 - broll_ov1_a[y1:y2]))
+        for (y1, y2) in broll_bands
+    ]
+    broll_ov2_strips = [
+        (y1, y2, (broll_ov2_bgr[y1:y2] * broll_ov2_a[y1:y2]), (1.0 - broll_ov2_a[y1:y2]))
+        for (y1, y2) in broll_bands
+    ]
+    del broll_ov1_bgr, broll_ov1_a, broll_ov2_bgr, broll_ov2_a
+
     # 3. Rescale the 10-minute (600s) blueprint to the actual total video duration D
     D = max(block_dur_sec, float(total_video_duration_sec))
-    t_intro_window = min(30.0, max(8.0, D * 0.15))
-    t_outro_window = min(30.0, max(8.0, D * 0.15))
+    t_intro_window = min(26.0, max(7.0, D * 0.12))
+    t_outro_window = min(26.0, max(7.0, D * 0.12))
+    is_doc_mode = (visual_blueprint == "documentary_cinema" or visual_template == "documentary_split")
+
+    # Block-seeded choreography variation so multi-block videos are dynamic and never predictable
+    pattern_id = (block_idx * 5 + total_blocks * 3) % 6
+    cut_jitter = ((block_idx * 17) % 9 - 4) * 0.015  # -0.06 .. +0.06 organic cut variation
 
     def _get_mode_for_frame(f_idx):
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
         frac_local = t_local / max(1.0, block_dur_sec)
 
+        # Documentary Cinema Blueprint: prioritizes immersive full-screen B-roll & AI motion footage (~72%)
+        # interwoven with documentary data/archival cards and concise narrator anchor appearances
+        if is_doc_mode:
+            if block_idx == 0 and frac_local < 0.34:
+                return "studio_lipsync"
+            if block_idx == total_blocks - 1 and frac_local > 0.72:
+                return "studio_lipsync"
+            doc_pat = block_idx % 4
+            if doc_pat == 0:
+                if frac_local < 0.38 + cut_jitter:
+                    return "broll_1"
+                elif frac_local < 0.58 + cut_jitter:
+                    return "slide_1"
+                elif frac_local < 0.86:
+                    return "broll_2"
+                else:
+                    return "studio_lipsync"
+            elif doc_pat == 1:
+                if frac_local < 0.24 + cut_jitter:
+                    return "slide_1"
+                elif frac_local < 0.62 + cut_jitter:
+                    return "broll_1"
+                elif frac_local < 0.82:
+                    return "slide_2"
+                else:
+                    return "broll_2"
+            elif doc_pat == 2:
+                if frac_local < 0.18:
+                    return "studio_lipsync"
+                elif frac_local < 0.54 + cut_jitter:
+                    return "broll_1"
+                elif frac_local < 0.76 + cut_jitter:
+                    return "slide_2"
+                else:
+                    return "broll_2"
+            else:
+                if frac_local < 0.42 + cut_jitter:
+                    return "broll_2"
+                elif frac_local < 0.66 + cut_jitter:
+                    return "slide_1"
+                else:
+                    return "broll_1"
+
         if block_idx == 0 or t_global < t_intro_window:
-            if frac_local < 0.56:
+            if frac_local < 0.52:
                 return "studio_lipsync"
             elif frac_local < 0.78:
                 return "broll_1"
@@ -2375,71 +2504,107 @@ def render_dynamic_lesson_block(
                 return "slide_1"
 
         if block_idx == total_blocks - 1 or t_global > (D - t_outro_window):
-            if frac_local < 0.22:
+            if frac_local < 0.24:
                 return "slide_2"
-            elif frac_local < 0.44:
+            elif frac_local < 0.50:
                 return "broll_1"
             else:
                 return "studio_lipsync"
 
         if visual_blueprint == "90s_avatar":
-            if frac_local < 0.45:
+            if frac_local < 0.42 + cut_jitter:
                 return "studio_lipsync"
-            elif frac_local < 0.72:
-                return "broll_1"
-            elif frac_local < 0.88:
-                return "slide_2"
+            elif frac_local < 0.70 + cut_jitter:
+                return "broll_1" if (block_idx % 2 == 0) else "slide_1"
+            elif frac_local < 0.86:
+                return "slide_2" if (block_idx % 2 == 0) else "broll_2"
             else:
                 return "studio_lipsync"
 
-        if frac_local < 0.28:
-            return "slide_1"
-        elif frac_local < 0.56:
-            return "broll_1"
-        elif frac_local < 0.80:
-            return "slide_2"
+        # 6 Distinct Non-Predictable Choreography Patterns for Standard & Long-Form Lessons
+        c1 = max(0.18, min(0.34, 0.26 + cut_jitter))
+        c2 = max(0.44, min(0.62, 0.53 - cut_jitter * 0.5))
+        c3 = max(0.72, min(0.86, 0.79 + cut_jitter * 0.5))
+
+        if pattern_id == 0:
+            # Visual Hook B-Roll -> Concept Slide -> Deep-Dive B-Roll -> Summary Slide
+            if frac_local < c1: return "broll_1"
+            elif frac_local < c2: return "slide_1"
+            elif frac_local < c3: return "broll_2"
+            else: return "slide_2"
+        elif pattern_id == 1:
+            # Concept Slide -> Live B-Roll -> Studio Instructor -> Summary Slide
+            if frac_local < c1: return "slide_1"
+            elif frac_local < c2: return "broll_1"
+            elif frac_local < c3: return "studio_lipsync"
+            else: return "slide_2"
+        elif pattern_id == 2:
+            # Studio Instructor Hook -> B-Roll 1 -> Slide 2 (with Chart/Notes) -> B-Roll 2
+            if frac_local < 0.22: return "studio_lipsync"
+            elif frac_local < 0.52: return "broll_1"
+            elif frac_local < 0.78: return "slide_2"
+            else: return "broll_2"
+        elif pattern_id == 3:
+            # Dual Visual Immersion: B-Roll 1 -> Slide 1 -> B-Roll 2 -> Studio Anchor
+            if frac_local < 0.30: return "broll_1"
+            elif frac_local < 0.56: return "slide_1"
+            elif frac_local < 0.82: return "broll_2"
+            else: return "studio_lipsync"
+        elif pattern_id == 4:
+            # Structured Breakdown: Slide 1 -> B-Roll 2 -> Slide 2 -> B-Roll 1
+            if frac_local < c1: return "slide_1"
+            elif frac_local < c2: return "broll_2"
+            elif frac_local < c3: return "slide_2"
+            else: return "broll_1"
         else:
-            return "broll_2" if (block_idx % 2 == 0 or pexels_stream_2.is_valid()) else "studio_lipsync"
+            # Documentary-Academic Hybrid: B-Roll 1 -> Studio Anchor -> B-Roll 2 -> Slide 2
+            if frac_local < 0.28: return "broll_1"
+            elif frac_local < 0.48: return "studio_lipsync"
+            elif frac_local < 0.76: return "broll_2"
+            else: return "slide_2"
 
     last_broll_frame = {"broll_1": (-1, None), "broll_2": (-1, None)}
+    cam_dir = (block_idx % 4)
 
     def _render_single_mode_frame(mode_name, f_idx):
         prog = (f_idx % max(1, num_frames // 3)) / float(max(1, num_frames // 3))
         W, H = 1920, 1080
         # 2-Camera Multi-Cam Close-Up Punch-In every alternating 5.5s window during speaking
         use_closeup_cam = ((f_idx // max(1, int(fps * 5.5))) % 2 == 1)
-        # During 55% of Slide & B-Roll sub-windows on 16:9, cut to 100% Full-Screen Slide/B-Roll
-        # (skips avatar rendering completely on those frames, saving 15-25% GPU compute!)
-        show_pip_on_cutaway = is_vertical or (prog >= 0.55)
+        # In Documentary mode, keep 75% of cutaway frames 100% full-screen (PiP only on final 25%);
+        # in Standard mode, keep 55% of cutaway frames 100% full-screen (skipping avatar compute on those frames!)
+        pip_threshold = 0.75 if is_doc_mode else 0.55
+        show_pip_on_cutaway = is_vertical or (prog >= pip_threshold)
 
         if mode_name == "studio_lipsync":
             pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
             full_frame = studio_bg_bgr.copy()
             comp_slot = (pres_bgr.astype(np.float32) * card_alpha + base_slot * (1.0 - card_alpha)).astype(np.uint8)
             full_frame[pres_slot_y:pres_slot_y + presenter_h, pres_slot_x:pres_slot_x + presenter_w] = comp_slot
-            wide_out = _apply_organic_camera_breathing(full_frame, f_idx, fps=fps)
+            wide_out = full_frame
 
         elif mode_name in ("slide_1", "slide_2"):
             base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
             ix1, iy1, ix2, iy2 = slide_img_box
             iw, ih = ix2 - ix1, iy2 - iy1
-            zoom = 1.0 + 0.06 * prog
+            zoom = (1.07 - 0.06 * prog) if (cam_dir % 2 == 1 and mode_name == "slide_2") else (1.0 + 0.07 * prog)
+            pan_x = (1.0 - zoom) * (iw * (0.45 + 0.10 * prog if cam_dir < 2 else 0.55 - 0.10 * prog))
+            pan_y = (1.0 - zoom) * (ih * 0.5)
             sub_img = base[iy1:iy2, ix1:ix2]
             M = np.float32([
-                [zoom, 0.0, (1.0 - zoom) * (iw * 0.5)],
-                [0.0, zoom, (1.0 - zoom) * (ih * 0.5)]
+                [zoom, 0.0, pan_x],
+                [0.0, zoom, pan_y]
             ])
             base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
             pres_bgr = None
             if show_pip_on_cutaway:
                 pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
                 base = _overlay_pip_presenter(base, pres_bgr, pos=pip_slide_pos, border_rgb=accent_rgb)
-            wide_out = _apply_organic_camera_breathing(base, f_idx, fps=fps)
+            wide_out = base
 
         else:
             is_second = (mode_name == "broll_2")
-            ov_bgr = broll_ov2_bgr if is_second else broll_ov1_bgr
-            ov_a = broll_ov2_a if is_second else broll_ov1_a
+            ov_strips = broll_ov2_strips if is_second else broll_ov1_strips
             p_stream = pexels_stream_2 if is_second else pexels_stream_1
 
             cached_idx, cached_img = last_broll_frame.get(mode_name, (-1, None))
@@ -2451,9 +2616,20 @@ def render_dynamic_lesson_block(
                     moved = pexels_bgr
                 else:
                     canvas = broll_canvas_2 if is_second else broll_canvas_1
-                    zoom = (1.14 - 0.10 * prog) if is_second else (1.02 + 0.12 * prog)
-                    tx = (22.0 * (1.0 - prog)) if is_second else (-24.0 * prog)
-                    ty = (12.0 * (1.0 - prog)) if is_second else (-14.0 * prog)
+                    # Vary Ken-Burns camera trajectory by block & scene so motion is never repetitive
+                    traj = (block_idx + (1 if is_second else 0)) % 4
+                    if traj == 0:
+                        zoom = 1.02 + 0.12 * prog
+                        tx, ty = -24.0 * prog, -14.0 * prog
+                    elif traj == 1:
+                        zoom = 1.14 - 0.10 * prog
+                        tx, ty = 22.0 * (1.0 - prog), 12.0 * (1.0 - prog)
+                    elif traj == 2:
+                        zoom = 1.05 + 0.09 * prog
+                        tx, ty = 26.0 * (prog - 0.5), -16.0 * prog
+                    else:
+                        zoom = 1.12 - 0.08 * prog
+                        tx, ty = -20.0 * (1.0 - prog), 15.0 * (prog - 0.5)
                     M = np.float32([
                         [zoom, 0.0, (1.0 - zoom) * (W * 0.5) + tx],
                         [0.0, zoom, (1.0 - zoom) * (H * 0.5) + ty]
@@ -2462,7 +2638,10 @@ def render_dynamic_lesson_block(
                     moved = _render_bokeh_particles(moved, f_idx, fps=fps)
                 last_broll_frame[mode_name] = (f_idx, moved)
 
-            comp = (moved.astype(np.float32) * (1.0 - ov_a) + ov_bgr * ov_a).astype(np.uint8)
+            comp = moved.copy()
+            for (sy1, sy2, premul_bgr, inv_a) in ov_strips:
+                comp[sy1:sy2] = (comp[sy1:sy2].astype(np.float32) * inv_a + premul_bgr).astype(np.uint8)
+
             pres_bgr = None
             if show_pip_on_cutaway:
                 pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
@@ -2480,7 +2659,7 @@ def render_dynamic_lesson_block(
     writer = cv2.VideoWriter(silent_mp4, fourcc, float(fps), (out_w, out_h))
 
     modes = [_get_mode_for_frame(i) for i in range(num_frames)]
-    transition_len = 9
+    transition_len = 7
     tick_33 = max(1, num_frames // 3)
     tick_66 = max(2, (num_frames * 2) // 3)
 
@@ -2546,6 +2725,10 @@ def render_dynamic_lesson_block(
     pexels_stream_1.close()
     pexels_stream_2.close()
 
+    # Release large per-block numpy buffers before running FFmpeg mux
+    del talk_state, slide1_bgr, slide2_bgr, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame
+    gc.collect()
+
     if callable(progress_cb):
         try:
             progress_cb(0.92, "Encoding H.264 video stream & burning active karaoke captions...")
@@ -2569,7 +2752,10 @@ def render_dynamic_lesson_block(
 
     for tmp in (silent_mp4, p1_png, p2_png):
         if os.path.exists(tmp):
-            os.remove(tmp)
+            try:
+                os.remove(tmp)
+            except Exception:
+                pass
 
     return output_mp4_path
 
