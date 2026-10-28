@@ -2727,6 +2727,7 @@ def render_dynamic_lesson_block(
     pexels_stream_2.close()
 
     # Release large per-block numpy buffers before running FFmpeg mux
+    import gc
     del talk_state, slide1_bgr, slide2_bgr, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame
     gc.collect()
 

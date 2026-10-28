@@ -3,6 +3,8 @@ import re
 import gc
 import math
 import shutil
+import builtins
+import importlib
 import uuid
 import json
 import base64
@@ -24,6 +26,15 @@ import soundfile as sf
 import edge_tts
 from transformers import AutoModel, AutoProcessor
 from omnivoice import OmniVoice
+
+# Guarantee standard stdlib modules are always present in Python builtins across all imported modules
+builtins.gc = gc
+builtins.math = math
+builtins.os = os
+builtins.shutil = shutil
+builtins.time = time
+
+import lipsync_engine
 from lipsync_engine import (
     render_dynamic_lesson_block,
     render_lipsync_teacher_block,
@@ -32,6 +43,46 @@ from lipsync_engine import (
     generate_fallback_illustration,
     generate_youtube_thumbnail,
 )
+
+
+def _hot_sync_lipsync_engine_from_github():
+    """
+    Lightweight hot-sync that checks if main branch on GitHub has a newer lipsync_engine.py
+    so code fixes take effect immediately without waiting for a full 9GB Docker rebuild.
+    """
+    global render_dynamic_lesson_block, render_lipsync_teacher_block, render_slides_block
+    global render_broll_motion_block, generate_fallback_illustration, generate_youtube_thumbnail
+    try:
+        builtins.gc = gc
+        builtins.math = math
+        lipsync_engine.gc = gc
+        lipsync_engine.math = math
+        url = f"https://raw.githubusercontent.com/akankwatsa1/ai-video-lesson-maker/main/lipsync_engine.py?t={int(time.time())}"
+        resp = requests.get(url, timeout=4)
+        if resp.status_code == 200 and "def render_dynamic_lesson_block" in resp.text:
+            local_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "lipsync_engine.py")
+            current_code = ""
+            if os.path.exists(local_path):
+                with open(local_path, "r", encoding="utf-8", errors="ignore") as f:
+                    current_code = f.read()
+            if resp.text != current_code:
+                with open(local_path, "w", encoding="utf-8") as f:
+                    f.write(resp.text)
+                importlib.reload(lipsync_engine)
+                lipsync_engine.gc = gc
+                lipsync_engine.math = math
+                render_dynamic_lesson_block = lipsync_engine.render_dynamic_lesson_block
+                render_lipsync_teacher_block = lipsync_engine.render_lipsync_teacher_block
+                render_slides_block = lipsync_engine.render_slides_block
+                render_broll_motion_block = lipsync_engine.render_broll_motion_block
+                generate_fallback_illustration = lipsync_engine.generate_fallback_illustration
+                generate_youtube_thumbnail = lipsync_engine.generate_youtube_thumbnail
+                print("Hot-synced latest lipsync_engine.py from GitHub main.")
+    except Exception as sync_err:
+        print(f"Hot-sync check skipped: {sync_err}")
+
+
+_hot_sync_lipsync_engine_from_github()
 
 device = "cuda:0" if torch.cuda.is_available() else "cpu"
 
@@ -2211,6 +2262,7 @@ def report_live_progress(job, s3_client, bucket_name, job_id, step, percent, tim
 
 
 def handler(job):
+    _hot_sync_lipsync_engine_from_github()
     job_input = job.get('input', {})
     job_id = job.get('id', str(uuid.uuid4()))
 
