@@ -319,6 +319,25 @@ def sanitize_tts_spoken_text(raw_text):
     return txt
 
 
+def _auto_transcribe_reference_audio(audio_wav_path, max_words=120):
+    """
+    Safe helper for transcribing an audio slice if spoken_script is empty.
+    Returns empty string gracefully if no local ASR pipeline is loaded.
+    """
+    try:
+        if not audio_wav_path or not os.path.exists(audio_wav_path):
+            return ""
+        # Check if OmniVoice model has an internal whisper/ASR transcriber
+        if _OMNIVOICE_MODEL is not None and hasattr(_OMNIVOICE_MODEL, "transcribe"):
+            res = _OMNIVOICE_MODEL.transcribe(audio_wav_path)
+            if isinstance(res, str) and res.strip():
+                words = res.strip().split()
+                return " ".join(words[:max_words])
+    except Exception as e:
+        print(f"Auto transcribe slice note: {e}")
+    return ""
+
+
 def sanitize_omnivoice_prompt_object(prompt_obj):
     """
     Ensures the Whisper-transcribed `ref_text` inside an OmniVoice voice_clone_prompt
