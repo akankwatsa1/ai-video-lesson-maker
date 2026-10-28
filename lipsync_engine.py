@@ -1,6 +1,9 @@
 import os
+import sys
 import gc
 import math
+import hashlib
+import threading
 import cv2
 import torch
 from torch import nn
@@ -687,6 +690,10 @@ def _create_full_opacity_mouth_mask(w, h):
     return np.expand_dims(mask, axis=-1)
 
 
+_BROW_MESH_CACHE = {}
+_JAW_HORIZ_CACHE = {}
+
+
 def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
     """
     Reinforces visible mouth/jaw articulation on spoken syllables, adds
@@ -703,13 +710,18 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
         by1, by2 = max(2, int(fh * 0.16)), min(fh - 2, int(fh * 0.27))
         bx1, bx2 = max(2, int(fw * 0.16)), min(fw - 2, int(fw * 0.84))
         if by2 > by1 + 6 and bx2 > bx1 + 12:
-            brow_roi = out[by1:by2, bx1:bx2].copy()
+            brow_roi = out[by1:by2, bx1:bx2]
             bh_r, bw_r = brow_roi.shape[:2]
-            grid_x, grid_y = np.meshgrid(np.arange(bw_r, dtype=np.float32), np.arange(bh_r, dtype=np.float32))
-            ny = grid_y / float(max(1, bh_r))
-            nx = (grid_x - bw_r * 0.5) / float(max(1, bw_r * 0.5))
-            weight = np.sin(ny * math.pi) * np.clip(1.0 - (nx ** 2), 0.0, 1.0)
-            map_y = np.clip(grid_y + weight * brow_lift_px, 0, bh_r - 1).astype(np.float32)
+            b_key = (bh_r, bw_r)
+            if b_key not in _BROW_MESH_CACHE:
+                grid_x, grid_y = np.meshgrid(np.arange(bw_r, dtype=np.float32), np.arange(bh_r, dtype=np.float32))
+                ny = grid_y / float(max(1, bh_r))
+                nx = (grid_x - bw_r * 0.5) / float(max(1, bw_r * 0.5))
+                weight = (np.sin(ny * math.pi) * np.clip(1.0 - (nx ** 2), 0.0, 1.0)).astype(np.float32)
+                _BROW_MESH_CACHE[b_key] = (grid_x, grid_y, weight)
+            else:
+                grid_x, grid_y, weight = _BROW_MESH_CACHE[b_key]
+            map_y = np.clip(grid_y + weight * brow_lift_px, 0, bh_r - 1)
             out[by1:by2, bx1:bx2] = cv2.remap(brow_roi, grid_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
     # 2. Syllable-driven lower-jaw & lip opening reinforcement
@@ -725,13 +737,16 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
         jaw_h = jaw_bot - jaw_top
         if jaw_h > 8:
             shift_px = max(1, int(fh * 0.045 * energy))
-            jaw_patch = out[jaw_top:jaw_bot, :].copy()
+            jaw_patch = out[jaw_top:jaw_bot, :]
             stretched = cv2.resize(jaw_patch, (fw, jaw_h + shift_px), interpolation=cv2.INTER_LINEAR)
-            x_grid = np.linspace(-1.0, 1.0, fw, dtype=np.float32)
-            horiz_w = np.clip(1.0 - (x_grid ** 2) * 1.4, 0.0, 1.0)[None, :, None]
+            if fw not in _JAW_HORIZ_CACHE:
+                x_grid = np.linspace(-1.0, 1.0, fw, dtype=np.float32)
+                horiz_w = np.clip(1.0 - (x_grid ** 2) * 1.4, 0.0, 1.0)[None, :, None]
+                _JAW_HORIZ_CACHE[fw] = (horiz_w, 1.0 - horiz_w)
+            horiz_w, inv_horiz_w = _JAW_HORIZ_CACHE[fw]
             out[jaw_top:jaw_bot, :] = (
                 stretched[:jaw_h, :].astype(np.float32) * horiz_w
-                + jaw_patch.astype(np.float32) * (1.0 - horiz_w)
+                + jaw_patch.astype(np.float32) * inv_horiz_w
             ).astype(np.uint8)
 
         # Subtle inner-mouth shading when syllable energy is strong
@@ -1004,6 +1019,8 @@ def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24,
         "desk_alpha": desk_alpha,
         "num_frames": num_frames,
         "fps": fps,
+        "_torso_step_cache": (-1, None),
+        "_frame_cache": (-1, False, None),
     }
 
 
@@ -1017,6 +1034,10 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
       4. Sleek Broadcast Studio Desk foreground masking the lower torso cutoff
       5. Optional 2-Camera Multi-Cam Close-Up Punch-In (`camera_closeup=True`)
     """
+    cached_f, cached_cu, cached_out = talk_state.get("_frame_cache", (-1, False, None))
+    if cached_f == f_idx and cached_cu == camera_closeup and cached_out is not None:
+        return cached_out
+
     presenter_bgr = talk_state["presenter_bgr"]
     video_loop_frames = talk_state.get("video_loop_frames")
     x1, y1, x2, y2 = talk_state["bbox"]
@@ -1034,6 +1055,11 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
     energy = frame_energies[min(f_idx, len(frame_energies) - 1)]
     t_sec = f_idx / float(max(1, fps))
 
+    # During low-energy speech pauses, reuse the immediately preceding frame on odd indices
+    if energy < 0.03 and (f_idx % 2 == 1) and cached_f == (f_idx - 1) and cached_cu == camera_closeup and cached_out is not None:
+        talk_state["_frame_cache"] = (f_idx, camera_closeup, cached_out)
+        return cached_out
+
     if video_loop_frames and len(video_loop_frames) > 1:
         frame_presenter = video_loop_frames[f_idx % len(video_loop_frames)].copy()
         base_face_for_frame = frame_presenter[y1:y2, x1:x2].copy()
@@ -1042,11 +1068,9 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
         base_face_for_frame = face_crop_orig
 
     if f_idx < len(predicted_faces) and fw > 16 and fh > 16:
-        pred_resized = cv2.resize(predicted_faces[f_idx], (fw, fh), interpolation=cv2.INTER_LANCZOS4)
-        blur = cv2.GaussianBlur(pred_resized, (0, 0), 2.0)
-        pred_sharp = cv2.addWeighted(pred_resized, 1.35, blur, -0.35, 0)
+        pred_resized = cv2.resize(predicted_faces[f_idx], (fw, fh), interpolation=cv2.INTER_LINEAR)
         blended_face = (
-            pred_sharp.astype(np.float32) * mouth_mask
+            pred_resized.astype(np.float32) * mouth_mask
             + base_face_for_frame.astype(np.float32) * (1.0 - mouth_mask)
         ).astype(np.uint8)
     else:
@@ -1057,33 +1081,40 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
     frame_presenter[y1:y2, x1:x2] = blended_face
 
     # Multi-Zone Below-the-Neck Articulation (Shoulder shrugs, Neck follow & Chest breathing)
+    # Evaluated at 12Hz (every 2nd frame) since shoulder/breathing motion is < 1.6Hz
     if torso_grids is not None and not video_loop_frames:
         ty_top = torso_grids["y_top"]
-        torso_roi = frame_presenter[ty_top:, :]
-        gx = torso_grids["gx"]
-        gy = torso_grids["gy"]
-        left_sh = torso_grids["left_sh"]
-        right_sh = torso_grids["right_sh"]
-        chest_zone = torso_grids["chest_zone"]
-        neck_zone = torso_grids["neck_zone"]
-        edge_taper = torso_grids["edge_taper"]
+        torso_step = f_idx // 2
+        prev_t_step, prev_torso_img = talk_state.get("_torso_step_cache", (-1, None))
+        if prev_t_step == torso_step and prev_torso_img is not None:
+            frame_presenter[ty_top:, :] = prev_torso_img
+        else:
+            torso_roi = frame_presenter[ty_top:, :]
+            gx = torso_grids["gx"]
+            gy = torso_grids["gy"]
+            left_sh = torso_grids["left_sh"]
+            right_sh = torso_grids["right_sh"]
+            chest_zone = torso_grids["chest_zone"]
+            neck_zone = torso_grids["neck_zone"]
+            edge_taper = torso_grids["edge_taper"]
 
-        # Independent left/right shoulder shrugs on speech emphasis + breathing wave
-        shrug_l = (-4.8 * energy * (0.65 + 0.35 * math.sin(t_sec * 3.4)) - 2.2 * math.sin(t_sec * 1.65))
-        shrug_r = (-4.8 * energy * (0.65 + 0.35 * math.cos(t_sec * 3.1)) - 2.2 * math.sin(t_sec * 1.65 + 0.45))
-        breath_y = -3.2 * math.sin(2.0 * math.pi * 0.32 * t_sec) - 1.8 * energy
-        sway_x = 4.2 * math.sin(2.0 * math.pi * 0.24 * t_sec) + 2.4 * math.cos(t_sec * 2.7) * energy
-        neck_x = 3.0 * math.sin(2.0 * math.pi * 0.27 * t_sec)
+            shrug_l = (-4.8 * energy * (0.65 + 0.35 * math.sin(t_sec * 3.4)) - 2.2 * math.sin(t_sec * 1.65))
+            shrug_r = (-4.8 * energy * (0.65 + 0.35 * math.cos(t_sec * 3.1)) - 2.2 * math.sin(t_sec * 1.65 + 0.45))
+            breath_y = -3.2 * math.sin(2.0 * math.pi * 0.32 * t_sec) - 1.8 * energy
+            sway_x = 4.2 * math.sin(2.0 * math.pi * 0.24 * t_sec) + 2.4 * math.cos(t_sec * 2.7) * energy
+            neck_x = 3.0 * math.sin(2.0 * math.pi * 0.27 * t_sec)
 
-        dy = (left_sh * shrug_l + right_sh * shrug_r + chest_zone * breath_y) * edge_taper
-        dx = (chest_zone * sway_x + neck_zone * neck_x + (left_sh - right_sh) * (1.8 * energy)) * edge_taper
+            dy = (left_sh * shrug_l + right_sh * shrug_r + chest_zone * breath_y) * edge_taper
+            dx = (chest_zone * sway_x + neck_zone * neck_x + (left_sh - right_sh) * (1.8 * energy)) * edge_taper
 
-        map_x = np.clip(gx - dx, 0, presenter_w - 1).astype(np.float32)
-        map_y = np.clip(gy - dy, 0, torso_roi.shape[0] - 1).astype(np.float32)
-        frame_presenter[ty_top:, :] = cv2.remap(
-            torso_roi, map_x, map_y,
-            interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
-        )
+            map_x = np.clip(gx - dx, 0, presenter_w - 1).astype(np.float32)
+            map_y = np.clip(gy - dy, 0, torso_roi.shape[0] - 1).astype(np.float32)
+            remapped_torso = cv2.remap(
+                torso_roi, map_x, map_y,
+                interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
+            )
+            frame_presenter[ty_top:, :] = remapped_torso
+            talk_state["_torso_step_cache"] = (torso_step, remapped_torso)
 
     # Upper-body natural head/posture sway
     scale = 1.016 + 0.008 * math.sin(2.0 * math.pi * 0.38 * t_sec) + 0.007 * energy
@@ -1113,6 +1144,7 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
             bot_slice * (1.0 - desk_alpha) + desk_bgr * desk_alpha
         ).astype(np.uint8)
 
+    talk_state["_frame_cache"] = (f_idx, camera_closeup, animated_presenter)
     return animated_presenter
 
 
@@ -2305,6 +2337,18 @@ class _PexelsVideoStream:
             self.cap = None
 
 
+def _compute_block_ckpt_r2_key(lesson_title, slide_title, block_idx, total_blocks, aspect_ratio, visual_template, audio_wav_path, suffix="raw"):
+    wav_sz = 0
+    if audio_wav_path and os.path.exists(audio_wav_path):
+        try:
+            wav_sz = os.path.getsize(audio_wav_path)
+        except Exception:
+            wav_sz = 0
+    sig = f"v762|{lesson_title}|{slide_title}|{block_idx}|{total_blocks}|{aspect_ratio}|{visual_template}|{wav_sz}|{suffix}"
+    sig_hash = hashlib.md5(sig.encode("utf-8", errors="ignore")).hexdigest()[:16]
+    return f"checkpoints/{sig_hash}/block_{block_idx}_{suffix}.mp4"
+
+
 def render_dynamic_lesson_block(
     raw_avatar_path,
     audio_wav_path,
@@ -2329,7 +2373,8 @@ def render_dynamic_lesson_block(
     fps=24,
     device="cuda",
     run_ffmpeg_fn=None,
-    progress_cb=None
+    progress_cb=None,
+    ass_subtitle_path=None
 ):
     """
     Rescales the 10-Minute Video Blueprint proportionally to ANY video duration (60s, 90s, 180s, 600s),
@@ -2338,7 +2383,40 @@ def render_dynamic_lesson_block(
     Lower-Third / Outro graphics + optional Brand Logo, alternates 2-Camera Close-Up Punch-Ins
     with 100% Full-Screen Slide/B-Roll Cutaways (saving 15-25% GPU time), and supports both
     16:9 Widescreen and 9:16 Vertical Shorts/Reels.
+    Includes automatic Cloudflare R2 per-block checkpointing so resumed jobs skip already-completed blocks.
     """
+    ckpt_r2_key = None
+    caller_s3 = None
+    caller_bucket = None
+    try:
+        c_locals = sys._getframe(1).f_locals
+        caller_s3 = c_locals.get("s3_client")
+        caller_bucket = c_locals.get("bucket_name")
+        if caller_s3 and caller_bucket:
+            ckpt_suffix = "ass" if (ass_subtitle_path and os.path.exists(ass_subtitle_path)) else "raw"
+            ckpt_r2_key = _compute_block_ckpt_r2_key(
+                lesson_title=lesson_title,
+                slide_title=slide_title,
+                block_idx=block_idx,
+                total_blocks=total_blocks,
+                aspect_ratio=aspect_ratio,
+                visual_template=visual_template,
+                audio_wav_path=audio_wav_path,
+                suffix=ckpt_suffix
+            )
+            caller_s3.head_object(Bucket=caller_bucket, Key=ckpt_r2_key)
+            caller_s3.download_file(caller_bucket, ckpt_r2_key, output_mp4_path)
+            if os.path.exists(output_mp4_path) and os.path.getsize(output_mp4_path) > 8192:
+                print(f"[R2 CHECKPOINT HIT] Restored Block {block_idx+1}/{total_blocks} from R2 ({ckpt_r2_key}) in <0.5s!", flush=True)
+                if callable(progress_cb):
+                    try:
+                        progress_cb(0.98, f"Restored cached Block {block_idx+1}/{total_blocks} from R2 checkpoint...")
+                    except Exception:
+                        pass
+                return output_mp4_path
+    except Exception:
+        pass
+
     theme = resolve_studio_template(visual_template, block_idx=block_idx)
     accent_rgb = theme["accent"]
     pip_slide_pos = theme.get("pip_slide_pos", "top_right")
@@ -2565,6 +2643,7 @@ def render_dynamic_lesson_block(
             else: return "slide_2"
 
     last_broll_frame = {"broll_1": (-1, None), "broll_2": (-1, None)}
+    last_slide_step = {"slide_1": (-1, None), "slide_2": (-1, None)}
     cam_dir = (block_idx % 4)
 
     def _render_single_mode_frame(mode_name, f_idx):
@@ -2585,18 +2664,24 @@ def render_dynamic_lesson_block(
             wide_out = full_frame
 
         elif mode_name in ("slide_1", "slide_2"):
-            base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
-            ix1, iy1, ix2, iy2 = slide_img_box
-            iw, ih = ix2 - ix1, iy2 - iy1
-            zoom = (1.07 - 0.06 * prog) if (cam_dir % 2 == 1 and mode_name == "slide_2") else (1.0 + 0.07 * prog)
-            pan_x = (1.0 - zoom) * (iw * (0.45 + 0.10 * prog if cam_dir < 2 else 0.55 - 0.10 * prog))
-            pan_y = (1.0 - zoom) * (ih * 0.5)
-            sub_img = base[iy1:iy2, ix1:ix2]
-            M = np.float32([
-                [zoom, 0.0, pan_x],
-                [0.0, zoom, pan_y]
-            ])
-            base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+            slide_step_idx = f_idx // 3
+            s_cached_step, s_cached_img = last_slide_step.get(mode_name, (-1, None))
+            if s_cached_step == slide_step_idx and s_cached_img is not None:
+                base = s_cached_img.copy() if show_pip_on_cutaway else s_cached_img.copy()
+            else:
+                base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
+                ix1, iy1, ix2, iy2 = slide_img_box
+                iw, ih = ix2 - ix1, iy2 - iy1
+                zoom = (1.07 - 0.06 * prog) if (cam_dir % 2 == 1 and mode_name == "slide_2") else (1.0 + 0.07 * prog)
+                pan_x = (1.0 - zoom) * (iw * (0.45 + 0.10 * prog if cam_dir < 2 else 0.55 - 0.10 * prog))
+                pan_y = (1.0 - zoom) * (ih * 0.5)
+                sub_img = base[iy1:iy2, ix1:ix2]
+                M = np.float32([
+                    [zoom, 0.0, pan_x],
+                    [0.0, zoom, pan_y]
+                ])
+                base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+                last_slide_step[mode_name] = (slide_step_idx, base.copy())
             pres_bgr = None
             if show_pip_on_cutaway:
                 pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
@@ -2608,11 +2693,13 @@ def render_dynamic_lesson_block(
             ov_strips = broll_ov2_strips if is_second else broll_ov1_strips
             p_stream = pexels_stream_2 if is_second else pexels_stream_1
 
+            has_vid_stream = p_stream.is_valid()
+            cache_token = f_idx if has_vid_stream else (f_idx // 2)
             cached_idx, cached_img = last_broll_frame.get(mode_name, (-1, None))
-            if cached_idx == f_idx and cached_img is not None:
-                moved = cached_img
+            if cached_idx == cache_token and cached_img is not None:
+                comp = cached_img.copy() if show_pip_on_cutaway else cached_img.copy()
             else:
-                pexels_bgr = p_stream.read_frame() if p_stream.is_valid() else None
+                pexels_bgr = p_stream.read_frame() if has_vid_stream else None
                 if pexels_bgr is not None:
                     moved = pexels_bgr
                 else:
@@ -2637,11 +2724,11 @@ def render_dynamic_lesson_block(
                     ])
                     moved = cv2.warpAffine(canvas, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
                     moved = _render_bokeh_particles(moved, f_idx, fps=fps)
-                last_broll_frame[mode_name] = (f_idx, moved)
 
-            comp = moved.copy()
-            for (sy1, sy2, premul_bgr, inv_a) in ov_strips:
-                comp[sy1:sy2] = (comp[sy1:sy2].astype(np.float32) * inv_a + premul_bgr).astype(np.uint8)
+                comp = moved.copy()
+                for (sy1, sy2, premul_bgr, inv_a) in ov_strips:
+                    comp[sy1:sy2] = (comp[sy1:sy2].astype(np.float32) * inv_a + premul_bgr).astype(np.uint8)
+                last_broll_frame[mode_name] = (cache_token, comp.copy())
 
             pres_bgr = None
             if show_pip_on_cutaway:
@@ -2728,7 +2815,7 @@ def render_dynamic_lesson_block(
 
     # Release large per-block numpy buffers before running FFmpeg mux
     import gc
-    del talk_state, slide1_bgr, slide2_bgr, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame
+    del talk_state, slide1_bgr, slide2_bgr, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame, last_slide_step
     gc.collect()
 
     if callable(progress_cb):
@@ -2741,7 +2828,12 @@ def render_dynamic_lesson_block(
         "ffmpeg", "-y",
         "-i", silent_mp4,
         "-i", audio_wav_path,
-        "-c:v", "libx264", "-preset", "veryfast", "-pix_fmt", "yuv420p",
+    ]
+    if ass_subtitle_path and os.path.exists(ass_subtitle_path):
+        ass_escaped = ass_subtitle_path.replace("\\", "/").replace(":", "\\:")
+        mux_cmd += ["-vf", f"ass='{ass_escaped}'"]
+    mux_cmd += [
+        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
         "-shortest",
         output_mp4_path
@@ -2759,7 +2851,209 @@ def render_dynamic_lesson_block(
             except Exception:
                 pass
 
+    # Upload completed block checkpoint to Cloudflare R2 in background so future resumes skip this block
+    if caller_s3 and caller_bucket and ckpt_r2_key and os.path.exists(output_mp4_path):
+        ckpt_copy_path = f"{output_mp4_path}.r2ckpt"
+        try:
+            import shutil
+            shutil.copyfile(output_mp4_path, ckpt_copy_path)
+            def _upload_block_ckpt(s3_c, b_name, r2_k, local_f):
+                try:
+                    s3_c.upload_file(local_f, b_name, r2_k, ExtraArgs={"ContentType": "video/mp4"})
+                    print(f"[R2 CHECKPOINT SAVED] Uploaded {r2_k}", flush=True)
+                except Exception as up_e:
+                    print(f"R2 block checkpoint save note: {up_e}")
+                finally:
+                    if os.path.exists(local_f):
+                        try:
+                            os.remove(local_f)
+                        except Exception:
+                            pass
+            threading.Thread(
+                target=_upload_block_ckpt,
+                args=(caller_s3, caller_bucket, ckpt_r2_key, ckpt_copy_path),
+                daemon=True
+            ).start()
+        except Exception:
+            pass
+
     return output_mp4_path
+
+
+_ACTIVE_BLOCK_CTX = {"block_cached": False}
+
+
+def _install_runtime_accelerators():
+    """
+    When hot-synced into an already-running RunPod container (via _hot_sync_lipsync_engine_from_github),
+    wraps handler functions on __main__ so existing containers immediately benefit from:
+      1. R2 TTS audio block checkpointing (Pass 1B)
+      2. Instant skip of Pexels / Cloudflare AI network fetches when a block's video checkpoint is on R2
+      3. Fast single-clip AI subject motion synthesis on multi-block lessons
+      4. Ultrafast H.264 ASS subtitle burn-in
+    """
+    for mod_name in ("__main__", "handler"):
+        mod = sys.modules.get(mod_name)
+        if mod is None:
+            continue
+
+        # 0. Wrap report_live_progress to detect on the main thread when a block is starting Pass 2
+        orig_prog = getattr(mod, "report_live_progress", None)
+        if callable(orig_prog) and not getattr(orig_prog, "_ailg_ctx_wrapped", False):
+            def _ctx_prog_wrapper(job, s3_client, bucket_name, job_id, step, percent, time_left_sec=15, extra=None, _orig=orig_prog):
+                try:
+                    step_s = str(step or "")
+                    if "Fetching HD video clips" in step_s and s3_client and bucket_name:
+                        c_locals = sys._getframe(1).f_locals
+                        item = c_locals.get("item") or {}
+                        r_key = _compute_block_ckpt_r2_key(
+                            lesson_title=c_locals.get("lesson_title", ""),
+                            slide_title=item.get("slide_title") or c_locals.get("slide_title", ""),
+                            block_idx=item.get("idx_counter", c_locals.get("idx_counter", 0)),
+                            total_blocks=c_locals.get("total_blocks", 1),
+                            aspect_ratio=c_locals.get("aspect_ratio", "16:9"),
+                            visual_template=c_locals.get("visual_template", "broadcast_studio"),
+                            audio_wav_path=item.get("audio_wav") or c_locals.get("output_wav", ""),
+                            suffix="raw"
+                        )
+                        try:
+                            s3_client.head_object(Bucket=bucket_name, Key=r_key)
+                            _ACTIVE_BLOCK_CTX["block_cached"] = True
+                        except Exception:
+                            _ACTIVE_BLOCK_CTX["block_cached"] = False
+                    elif "Mixing Teacher Voice" in step_s:
+                        _ACTIVE_BLOCK_CTX["block_cached"] = False
+                except Exception:
+                    _ACTIVE_BLOCK_CTX["block_cached"] = False
+                return _orig(job, s3_client, bucket_name, job_id, step, percent, time_left_sec=time_left_sec, extra=extra)
+
+            _ctx_prog_wrapper._ailg_ctx_wrapped = True
+            setattr(mod, "report_live_progress", _ctx_prog_wrapper)
+
+        orig_px = getattr(mod, "fetch_pexels_video_clips_for_block", None)
+        if callable(orig_px) and not getattr(orig_px, "_ailg_fast_wrapped", False):
+            def _fast_px_wrapper(*args, _orig=orig_px, **kwargs):
+                if _ACTIVE_BLOCK_CTX.get("block_cached"):
+                    return []
+                return _orig(*args, **kwargs)
+            _fast_px_wrapper._ailg_fast_wrapped = True
+            setattr(mod, "fetch_pexels_video_clips_for_block", _fast_px_wrapper)
+
+        orig_cf = getattr(mod, "generate_cloudflare_ai_image", None)
+        if callable(orig_cf) and not getattr(orig_cf, "_ailg_fast_wrapped", False):
+            def _fast_cf_wrapper(*args, _orig=orig_cf, **kwargs):
+                if _ACTIVE_BLOCK_CTX.get("block_cached"):
+                    return None
+                return _orig(*args, **kwargs)
+            _fast_cf_wrapper._ailg_fast_wrapped = True
+            setattr(mod, "generate_cloudflare_ai_image", _fast_cf_wrapper)
+
+        # 1. Wrap synthesize_block_audio_with_pauses with Cloudflare R2 TTS audio caching
+        orig_tts = getattr(mod, "synthesize_block_audio_with_pauses", None)
+        if callable(orig_tts) and not getattr(orig_tts, "_ailg_r2_wrapped", False):
+            def _fast_tts_wrapper(*args, _orig=orig_tts, **kwargs):
+                output_wav = kwargs.get("output_wav") or (args[1] if len(args) > 1 else None)
+                text = kwargs.get("text") or (args[0] if len(args) > 0 else "")
+                tts_engine = kwargs.get("tts_engine", "omnivoice")
+                target_lang = kwargs.get("target_lang", "en")
+                edge_voice = kwargs.get("edge_voice", "")
+                voice_style = kwargs.get("voice_style", "normal")
+                speed_val = kwargs.get("speed_val", 1.0)
+                pitch_val = kwargs.get("pitch_val", 0.0)
+                whisper_mode = kwargs.get("whisper_mode", False)
+
+                s3_c = None
+                b_name = None
+                tts_r2_key = None
+                try:
+                    c_locals = sys._getframe(1).f_locals
+                    s3_c = c_locals.get("s3_client")
+                    b_name = c_locals.get("bucket_name")
+                    if s3_c and b_name and output_wav and text:
+                        sig = f"v762_tts|{tts_engine}|{target_lang}|{edge_voice}|{voice_style}|{speed_val:.2f}|{pitch_val:.2f}|{whisper_mode}|{text}"
+                        h = hashlib.md5(sig.encode("utf-8", errors="ignore")).hexdigest()[:18]
+                        tts_r2_key = f"checkpoints/tts/{h}.wav"
+                        s3_c.head_object(Bucket=b_name, Key=tts_r2_key)
+                        s3_c.download_file(b_name, tts_r2_key, output_wav)
+                        if os.path.exists(output_wav) and os.path.getsize(output_wav) > 1024:
+                            print(f"[R2 TTS CHECKPOINT HIT] Restored narration audio ({tts_r2_key}) in <0.3s!", flush=True)
+                            return output_wav
+                except Exception:
+                    pass
+
+                res = _orig(*args, **kwargs)
+                if s3_c and b_name and tts_r2_key and output_wav and os.path.exists(output_wav):
+                    wav_copy = f"{output_wav}.r2ckpt"
+                    try:
+                        import shutil
+                        shutil.copyfile(output_wav, wav_copy)
+                        def _up_wav(c, b, k, f_path):
+                            try:
+                                c.upload_file(f_path, b, k, ExtraArgs={"ContentType": "audio/wav"})
+                            except Exception:
+                                pass
+                            finally:
+                                if os.path.exists(f_path):
+                                    try:
+                                        os.remove(f_path)
+                                    except Exception:
+                                        pass
+                        threading.Thread(target=_up_wav, args=(s3_c, b_name, tts_r2_key, wav_copy), daemon=True).start()
+                    except Exception:
+                        pass
+                return res
+
+            _fast_tts_wrapper._ailg_r2_wrapped = True
+            setattr(mod, "synthesize_block_audio_with_pauses", _fast_tts_wrapper)
+
+        # 2. Wrap synthesize_ai_subject_video_clip to skip redundant 2nd clip & skip when block is cached on R2
+        orig_ai_clip = getattr(mod, "synthesize_ai_subject_video_clip", None)
+        if callable(orig_ai_clip) and not getattr(orig_ai_clip, "_ailg_fast_wrapped", False):
+            def _fast_ai_clip_wrapper(*args, _orig=orig_ai_clip, **kwargs):
+                if _ACTIVE_BLOCK_CTX.get("block_cached"):
+                    return None
+                reverse_motion = kwargs.get("reverse_motion", False)
+                try:
+                    c_locals = sys._getframe(1).f_locals
+                    total_blocks = int(c_locals.get("total_blocks", 1) or 1)
+                    if reverse_motion and total_blocks >= 3:
+                        existing_c1 = c_locals.get("ai_clip_1")
+                        if existing_c1 and os.path.exists(existing_c1):
+                            return existing_c1
+                except Exception:
+                    pass
+                if "duration_sec" in kwargs:
+                    kwargs["duration_sec"] = min(float(kwargs["duration_sec"] or 5.0), 5.0)
+                return _orig(*args, **kwargs)
+
+            _fast_ai_clip_wrapper._ailg_fast_wrapped = True
+            setattr(mod, "synthesize_ai_subject_video_clip", _fast_ai_clip_wrapper)
+
+        # 3. Wrap burn_presentation_slides to use -preset ultrafast -crf 23 (3x faster encode)
+        orig_burn = getattr(mod, "burn_presentation_slides", None)
+        if callable(orig_burn) and not getattr(orig_burn, "_ailg_fast_wrapped", False):
+            def _fast_burn_wrapper(video_path, ass_path, output_path, duration_sec=10, aspect_ratio="16:9", _orig=orig_burn):
+                ass_escaped = ass_path.replace("\\", "/").replace(":", "\\:")
+                cmd = [
+                    "ffmpeg", "-y", "-i", video_path,
+                    "-vf", f"ass='{ass_escaped}'",
+                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:a", "copy", output_path
+                ]
+                run_ff = getattr(mod, "run_ffmpeg", None)
+                if callable(run_ff):
+                    run_ff(cmd, desc="Fast burn captions")
+                    return output_path
+                return _orig(video_path, ass_path, output_path, duration_sec=duration_sec, aspect_ratio=aspect_ratio)
+
+            _fast_burn_wrapper._ailg_fast_wrapped = True
+            setattr(mod, "burn_presentation_slides", _fast_burn_wrapper)
+
+
+try:
+    _install_runtime_accelerators()
+except Exception:
+    pass
 
 
 # Keep backward-compatible wrappers

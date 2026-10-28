@@ -77,7 +77,11 @@ def _hot_sync_lipsync_engine_from_github():
                 render_broll_motion_block = lipsync_engine.render_broll_motion_block
                 generate_fallback_illustration = lipsync_engine.generate_fallback_illustration
                 generate_youtube_thumbnail = lipsync_engine.generate_youtube_thumbnail
+                if hasattr(lipsync_engine, "_install_runtime_accelerators"):
+                    lipsync_engine._install_runtime_accelerators()
                 print("Hot-synced latest lipsync_engine.py from GitHub main.")
+            elif hasattr(lipsync_engine, "_install_runtime_accelerators"):
+                lipsync_engine._install_runtime_accelerators()
     except Exception as sync_err:
         print(f"Hot-sync check skipped: {sync_err}")
 
@@ -1505,7 +1509,7 @@ def synthesize_ai_subject_video_clip(
     writer.release()
     try:
         run_ffmpeg(
-            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset veryfast -pix_fmt yuv420p {output_mp4}",
+            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p {output_mp4}",
             desc="Encode synthesized AI Subject Motion Video Clip"
         )
         if os.path.exists(temp_raw_mp4):
@@ -2720,18 +2724,18 @@ def handler(job):
                     cf_images=[cf_img_1, cf_img_2, cf_img_3],
                     output_mp4=f"{workspace}/ai_subject_{idx}_1.mp4",
                     subject_text=subject_desc,
-                    duration_sec=7.5 if total_blocks >= 8 else 8.0,
+                    duration_sec=5.0,
                     fps=24,
                     reverse_motion=False,
                     block_seed=idx_counter
                 )
-                ai_clip_2 = None
-                if needs_ai_subject_video or len(pexels_clips) == 0:
+                ai_clip_2 = ai_clip_1
+                if total_blocks < 3 and (needs_ai_subject_video or len(pexels_clips) == 0):
                     ai_clip_2 = synthesize_ai_subject_video_clip(
                         cf_images=[cf_img_2, cf_img_3, cf_img_1],
                         output_mp4=f"{workspace}/ai_subject_{idx}_2.mp4",
                         subject_text=subject_desc,
-                        duration_sec=7.5 if total_blocks >= 8 else 8.0,
+                        duration_sec=5.0,
                         fps=24,
                         reverse_motion=True,
                         block_seed=idx_counter + 1
@@ -2761,11 +2765,22 @@ def handler(job):
                     )
                 return _cb
 
-            raw_block_mp4 = f"{workspace}/block_raw_{idx}.mp4"
+            # Prepare captions before block muxing so subtitles burn in a SINGLE FFmpeg pass!
+            lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
+            _, has_ass_events = create_synced_lyrics_ass(
+                text,
+                output_wav,
+                lyrics_ass,
+                block_idx=idx_counter,
+                total_blocks=total_blocks,
+                aspect_ratio=aspect_ratio,
+                caption_mode=caption_mode
+            )
+            final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
             render_dynamic_lesson_block(
                 raw_avatar_path=raw_avatar_path,
                 audio_wav_path=output_wav,
-                output_mp4_path=raw_block_mp4,
+                output_mp4_path=final_chunk,
                 lesson_title=lesson_title,
                 slide_title=slide_title,
                 slide_notes=notes,
@@ -2786,28 +2801,9 @@ def handler(job):
                 fps=24,
                 device=device,
                 run_ffmpeg_fn=run_ffmpeg,
-                progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk)
+                progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk),
+                ass_subtitle_path=(lyrics_ass if has_ass_events else None)
             )
-
-            # Burn captions according to Smart Broadcast Mode (skips FFmpeg burn-in when no events are needed!)
-            lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
-            _, has_ass_events = create_synced_lyrics_ass(
-                text,
-                output_wav,
-                lyrics_ass,
-                block_idx=idx_counter,
-                total_blocks=total_blocks,
-                aspect_ratio=aspect_ratio,
-                caption_mode=caption_mode
-            )
-            final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
-            if has_ass_events:
-                burn_presentation_slides(raw_block_mp4, lyrics_ass, final_chunk)
-                if os.path.exists(raw_block_mp4):
-                    try: os.remove(raw_block_mp4)
-                    except Exception: pass
-            else:
-                shutil.move(raw_block_mp4, final_chunk)
 
             # Immediately purge per-block temporary media files so /tmp never fills up on long 10-minute videos!
             for temp_f in [lyrics_ass, cf_img_1, cf_img_2, cf_img_3] + list(pexels_clips or []) + list(synthesized_ai_clips or []):
