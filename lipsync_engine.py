@@ -12,6 +12,11 @@ import numpy as np
 import librosa
 from scipy import signal
 from PIL import Image, ImageDraw, ImageFont, ImageFilter
+import re
+import subprocess
+import shutil
+import json
+import time
 
 # ==============================================================================
 # 1. S3FD NEURAL FACE DETECTOR (OFFICIAL WAV2LIP DETECTOR)
@@ -2455,6 +2460,322 @@ def render_powerpoint_slide_frame(
 
 
 # ==============================================================================
+# 5B. WEBSITE STEP-BY-STEP TUTORIAL & HOW-TO COMPOSITOR (ANIMATED CURSOR & WEBCAM)
+# ==============================================================================
+
+def _draw_realistic_mouse_cursor(draw, cx, cy, is_clicking=False, click_progress=0.0):
+    """
+    Renders an authentic, crisp desktop pointer mouse cursor at (cx, cy)
+    with smooth drop shadow, white interior, black outline, and an optional
+    expanding radiant click ripple wave (Loom/Camtasia style) when clicking.
+    """
+    # If clicking, draw expanding concentric click pulse / ripple rings
+    if is_clicking and click_progress > 0.0:
+        max_r = 42
+        r = int(6 + (max_r - 6) * click_progress)
+        alpha = int(220 * (1.0 - click_progress))
+        draw.ellipse([cx - r, cy - r, cx + r, cy + r], outline=(56, 189, 248, alpha), width=3)
+        r_inner = max(2, int(r * 0.45))
+        draw.ellipse([cx - r_inner, cy - r_inner, cx + r_inner, cy + r_inner], fill=(255, 255, 255, int(alpha * 0.7)))
+
+    scale = 0.90 if is_clicking else 1.0
+    pts = [
+        (0, 0),
+        (0, int(26 * scale)),
+        (int(7 * scale), int(20 * scale)),
+        (int(13 * scale), int(29 * scale)),
+        (int(17 * scale), int(27 * scale)),
+        (int(11 * scale), int(18 * scale)),
+        (int(19 * scale), int(18 * scale))
+    ]
+    # Drop shadow
+    shadow_pts = [(cx + 2 + px, cy + 3 + py) for px, py in pts]
+    draw.polygon(shadow_pts, fill=(0, 0, 0, 95))
+    # Crisp pointer body
+    cursor_pts = [(cx + px, cy + py) for px, py in pts]
+    draw.polygon(cursor_pts, fill=(255, 255, 255, 255), outline=(15, 23, 42, 255))
+
+
+def render_tutorial_walkthrough_screen(
+    lesson_title,
+    slide_title,
+    slide_notes,
+    tutorial_url="",
+    tutorial_step=1,
+    tutorial_action="",
+    f_idx=0,
+    num_frames=240,
+    fps=24,
+    pres_bgr=None,
+    visual_template="broadcast_studio",
+    theme=None,
+    aspect_ratio="16:9",
+    presenter_name="",
+    channel_name=""
+):
+    """
+    Renders an authentic, broadcast-grade Website Step-by-Step Tutorial Walkthrough scene:
+      1. Realistic Browser Window Mockup with MacOS/Windows traffic lights, active tab,
+         SSL lock icon and clean step URL.
+      2. Simulated webpage UI with Step Badge, Step Action heading, and target button/card.
+      3. Crisp moving mouse cursor that glides smoothly toward the target interactive element,
+         clicks with an expanding ripple wave, and triggers an active clicked button state!
+      4. Studio Teacher Avatar webcam frame with glowing border ring and nameplate,
+         perfectly lip-synced and speaking with the audio.
+    """
+    if theme is None:
+        theme = resolve_studio_template(visual_template, block_idx=tutorial_step - 1)
+
+    is_vertical = (aspect_ratio == "9:16")
+    W = 1080 if is_vertical else 1920
+    H = 1920 if is_vertical else 1080
+
+    accent = theme.get("accent", (56, 189, 248))
+    accent_alt = theme.get("accent_alt", (245, 158, 11))
+
+    # Base background: deep studio backdrop
+    bg_start = theme.get("bg_gradient_start", (15, 23, 42))
+    bg_end = theme.get("bg_gradient_end", (30, 41, 59))
+    base_bg = np.zeros((H, W, 3), dtype=np.uint8)
+    for y_i in range(H):
+        ratio = y_i / float(H)
+        col = [
+            int(bg_start[c] * (1.0 - ratio) + bg_end[c] * ratio)
+            for c in range(3)
+        ]
+        base_bg[y_i, :] = col
+
+    pil_canvas = Image.fromarray(cv2.cvtColor(base_bg, cv2.COLOR_BGR2RGB))
+    draw = ImageDraw.Draw(pil_canvas, "RGBA")
+
+    # Clean URL handling
+    clean_url = str(tutorial_url or "https://example.com/portal/step-1").strip()
+    if not re.match(r"^https?://", clean_url, re.I):
+        clean_url = "https://" + clean_url
+    domain_match = re.search(r"https?://([^/]+)", clean_url, re.I)
+    domain_str = domain_match.group(1) if domain_match else "website.com"
+
+    act_label = str(tutorial_action or "").strip()
+    if not act_label:
+        act_label = f"Click to Proceed with Step {tutorial_step}"
+
+    font_xs = _load_font(18, bold=False)
+    font_sm = _load_font(22, bold=True)
+    font_med = _load_font(28, bold=True)
+    font_lg = _load_font(34, bold=True)
+
+    if not is_vertical:
+        # =========================================================================
+        # 16:9 Widescreen Broadcast Layout
+        # =========================================================================
+        bx, by = 60, 48
+        bw, bh = 1320, 864
+
+        # Browser Chrome Outer Card
+        draw.rounded_rectangle([bx, by, bx + bw, by + bh], radius=14, fill=(248, 250, 252, 255), outline=(71, 85, 105, 220), width=2)
+        # Browser Header Bar
+        draw.rounded_rectangle([bx, by, bx + bw, by + 52], radius=14, fill=(30, 41, 59, 255))
+        draw.rectangle([bx, by + 36, bx + bw, by + 52], fill=(30, 41, 59, 255))
+
+        # Traffic light dots
+        draw.ellipse([bx + 18, by + 20, bx + 30, by + 32], fill=(239, 68, 68, 255))
+        draw.ellipse([bx + 38, by + 20, bx + 50, by + 32], fill=(245, 158, 11, 255))
+        draw.ellipse([bx + 58, by + 20, bx + 70, by + 32], fill=(16, 185, 129, 255))
+
+        # Active Tab
+        draw.rounded_rectangle([bx + 90, by + 10, bx + 360, by + 48], radius=8, fill=(15, 23, 42, 255))
+        draw.text((bx + 106, by + 16), f"🌐 {domain_str[:22]}", font=font_xs, fill=(226, 232, 240, 255))
+
+        # URL Address Bar
+        url_bx1 = bx + 380
+        url_bx2 = bx + bw - 24
+        draw.rounded_rectangle([url_bx1, by + 10, url_bx2, by + 44], radius=8, fill=(15, 23, 42, 255), outline=(51, 65, 85, 255), width=1)
+        draw.text((url_bx1 + 14, by + 16), f"🔒 {clean_url[:64]}", font=font_xs, fill=(56, 189, 248, 255))
+
+        # Webpage Top Navigation Bar
+        draw.rectangle([bx, by + 52, bx + bw, by + 112], fill=(255, 255, 255, 255), outline=(226, 232, 240, 255), width=1)
+        draw.text((bx + 28, by + 68), f"⚡ {domain_str.upper()[:24]} PORTAL", font=font_med, fill=(15, 23, 42, 255))
+        draw.text((bx + 380, by + 74), "Overview   •   Documentation   •   Interactive Setup", font=font_xs, fill=(100, 116, 139, 255))
+
+        # User status pill on right
+        draw.rounded_rectangle([bx + bw - 210, by + 66, bx + bw - 24, by + 98], radius=6, fill=(241, 245, 249, 255), outline=(203, 213, 225, 255))
+        draw.text((bx + bw - 194, by + 72), "● Portal Connected", font=font_xs, fill=(16, 185, 129, 255))
+
+        # Webpage Content Card
+        cw = bw - 72
+        cx1 = bx + 36
+        cy1 = by + 130
+        draw.rounded_rectangle([cx1, cy1, cx1 + cw, by + bh - 24], radius=12, fill=(255, 255, 255, 255), outline=(226, 232, 240, 255), width=1)
+
+        # Step Badge
+        draw.rounded_rectangle([cx1 + 32, cy1 + 24, cx1 + 330, cy1 + 64], radius=8, fill=accent + (255,))
+        draw.text((cx1 + 46, cy1 + 32), f"STEP {tutorial_step} • VIDEO WALKTHROUGH", font=font_sm, fill=(255, 255, 255, 255))
+
+        # Heading & Slide Notes
+        draw.text((cx1 + 32, cy1 + 84), str(slide_title or f"Step {tutorial_step}: Perform Action")[:52], font=font_lg, fill=(15, 23, 42, 255))
+        
+        notes_arr = [str(n).strip() for n in (slide_notes or []) if str(n).strip()]
+        if not notes_arr:
+            notes_arr = [act_label, f"Follow on-screen instructions on {domain_str}", "Confirm changes to complete step"]
+
+        ny = cy1 + 144
+        for n_idx, note_item in enumerate(notes_arr[:3]):
+            draw.rounded_rectangle([cx1 + 32, ny - 2, cx1 + 60, ny + 26], radius=6, fill=(240, 253, 244, 255))
+            draw.text((cx1 + 38, ny + 2), "✓", font=font_sm, fill=(22, 163, 74, 255))
+            draw.text((cx1 + 72, ny + 2), note_item[:72], font=font_sm, fill=(51, 65, 85, 255))
+            ny += 46
+
+        # Interactive Target Element / Button
+        tx = cx1 + 44
+        ty = cy1 + 300
+        tw = min(620, cw - 88)
+        th = 74
+
+        click_frame = max(18, int(num_frames * 0.42))
+        is_click_moment = (f_idx >= click_frame and f_idx <= click_frame + 18)
+        is_after_click = (f_idx > click_frame + 18)
+
+        if is_click_moment or is_after_click:
+            btn_fill = (22, 163, 74, 255)  # Success green when clicked
+            btn_border = (187, 247, 208, 255)
+            btn_text = f"✓ CLICKED: {act_label[:40]}"
+        else:
+            btn_fill = (2, 132, 199, 255)  # Studio primary blue
+            btn_border = (125, 211, 252, 255)
+            btn_text = f"👉 CLICK HERE: {act_label[:40]} →"
+
+        draw.rounded_rectangle([tx, ty, tx + tw, ty + th], radius=10, fill=btn_fill, outline=btn_border, width=2)
+        draw.text((tx + 24, ty + 20), btn_text, font=font_med, fill=(255, 255, 255, 255))
+
+        # Secondary info box below button
+        draw.rounded_rectangle([tx, ty + 96, tx + tw, ty + 160], radius=8, fill=(248, 250, 252, 255), outline=(226, 232, 240, 255))
+        draw.text((tx + 18, ty + 108), f"Web Address: {clean_url[:56]}", font=font_xs, fill=(100, 116, 139, 255))
+        draw.text((tx + 18, ty + 132), "Action verified • Continue following the instructor's guide", font=font_xs, fill=(71, 85, 105, 255))
+
+        # Mouse Cursor Animation
+        start_cx, start_cy = bx + 160, by + bh - 90
+        target_cx, target_cy = tx + tw // 2, ty + th // 2
+
+        if f_idx < click_frame:
+            t_prog = f_idx / float(max(1, click_frame))
+            ease = math.sin(t_prog * math.pi / 2.0)
+            cur_x = start_cx + (target_cx - start_cx) * ease
+            cur_y = start_cy + (target_cy - start_cy) * ease
+            _draw_realistic_mouse_cursor(draw, int(cur_x), int(cur_y), is_clicking=False)
+        elif is_click_moment:
+            c_prog = (f_idx - click_frame) / 18.0
+            _draw_realistic_mouse_cursor(draw, target_cx, target_cy, is_clicking=True, click_progress=c_prog)
+        else:
+            drift_x = 10.0 * math.sin((f_idx - click_frame) * 0.08)
+            drift_y = 6.0 * math.cos((f_idx - click_frame) * 0.06)
+            _draw_realistic_mouse_cursor(draw, int(target_cx + drift_x), int(target_cy + drift_y), is_clicking=False)
+
+        # Convert PIL canvas back to BGR for presenter pasting
+        out_bgr = cv2.cvtColor(np.array(pil_canvas), cv2.COLOR_RGB2BGR)
+
+        # Teacher Avatar Studio Webcam Frame (Right side)
+        if pres_bgr is not None:
+            pw, ph = 470, 560
+            px = 1410
+            py = 70
+
+            # Resize presenter crop to fit webcam window
+            pres_resized = cv2.resize(pres_bgr, (pw, ph), interpolation=cv2.INTER_LANCZOS4)
+            # Create rounded mask for avatar
+            mask_r = _create_rounded_mask(pw, ph, radius=20)
+            alpha_3d = mask_r[:, :, None]
+
+            # Studio card background under avatar
+            card_bgr = np.full((ph, pw, 3), (15, 23, 42), dtype=np.uint8)
+            comp_pres = (pres_resized.astype(np.float32) * alpha_3d + card_bgr.astype(np.float32) * (1.0 - alpha_3d)).astype(np.uint8)
+
+            # Paste presenter
+            out_bgr[py:py + ph, px:px + pw] = comp_pres
+            # Draw glowing border ring around teacher webcam
+            cv2.rectangle(out_bgr, (px, py), (px + pw, py + ph), (accent[2], accent[1], accent[0]), 3, lineType=cv2.LINE_AA)
+
+            # Teacher Nameplate Banner below webcam
+            ny1 = py + ph + 14
+            cv2.rectangle(out_bgr, (px, ny1), (px + pw, ny1 + 68), (15, 23, 42), -1)
+            cv2.rectangle(out_bgr, (px, ny1), (px + pw, ny1 + 68), (71, 85, 105), 1)
+
+            pres_disp = presenter_name if presenter_name else "Course Instructor"
+            chan_disp = channel_name if channel_name else "Video Tutorial Studio"
+            cv2.putText(out_bgr, pres_disp[:32], (px + 16, ny1 + 28), cv2.FONT_HERSHEY_DUPLEX, 0.72, (255, 255, 255), 1, cv2.LINE_AA)
+            cv2.putText(out_bgr, f"LIVE WALKTHROUGH  •  {chan_disp[:24]}", (px + 16, ny1 + 54), cv2.FONT_HERSHEY_DUPLEX, 0.48, (accent[2], accent[1], accent[0]), 1, cv2.LINE_AA)
+
+        return out_bgr
+
+    else:
+        # =========================================================================
+        # 9:16 Vertical Shorts / TikTok Layout
+        # =========================================================================
+        # Top 42% shows Teacher Avatar speaking
+        if pres_bgr is not None:
+            pres_h = 760
+            pres_w = W
+            pres_resized = cv2.resize(pres_bgr, (pres_w, pres_h), interpolation=cv2.INTER_LANCZOS4)
+            base_bg[0:pres_h, 0:pres_w] = pres_resized
+
+        # Draw presenter lower-third in vertical layout
+        cv2.rectangle(base_bg, (0, 700), (W, 760), (15, 23, 42), -1)
+        pres_disp = presenter_name if presenter_name else "Course Instructor"
+        cv2.putText(base_bg, f"TUTORIAL: {slide_title[:38]}", (32, 742), cv2.FONT_HERSHEY_DUPLEX, 0.75, (255, 255, 255), 1, cv2.LINE_AA)
+
+        pil_vert = Image.fromarray(cv2.cvtColor(base_bg, cv2.COLOR_BGR2RGB))
+        draw_v = ImageDraw.Draw(pil_vert, "RGBA")
+
+        # Bottom 55% shows Browser Walkthrough with animated cursor
+        bx, by = 36, 790
+        bw, bh = W - 72, 920
+
+        draw_v.rounded_rectangle([bx, by, bx + bw, by + bh], radius=14, fill=(248, 250, 252, 255), outline=(71, 85, 105, 220), width=2)
+        draw_v.rounded_rectangle([bx, by, bx + bw, by + 50], radius=14, fill=(30, 41, 59, 255))
+        draw_v.rectangle([bx, by + 34, bx + bw, by + 50], fill=(30, 41, 59, 255))
+
+        draw_v.ellipse([bx + 18, by + 20, bx + 28, by + 30], fill=(239, 68, 68, 255))
+        draw_v.ellipse([bx + 36, by + 20, bx + 46, by + 30], fill=(245, 158, 11, 255))
+        draw_v.ellipse([bx + 54, by + 20, bx + 64, by + 30], fill=(16, 185, 129, 255))
+        draw_v.text((bx + 80, by + 16), f"🔒 {clean_url[:42]}", font=font_xs, fill=(56, 189, 248, 255))
+
+        # Main Step Card inside vertical browser
+        draw_v.rounded_rectangle([bx + 20, by + 74, bx + 260, by + 114], radius=6, fill=accent + (255,))
+        draw_v.text((bx + 32, by + 84), f"STEP {tutorial_step} OF {tutorial_step}", font=font_sm, fill=(255, 255, 255, 255))
+        draw_v.text((bx + 20, by + 130), str(slide_title or f"Step {tutorial_step}")[:40], font=font_lg, fill=(15, 23, 42, 255))
+
+        tx = bx + 24
+        ty = by + 240
+        tw = bw - 48
+        th = 84
+
+        click_frame = max(18, int(num_frames * 0.42))
+        is_click_moment = (f_idx >= click_frame and f_idx <= click_frame + 18)
+        if is_click_moment or (f_idx > click_frame + 18):
+            draw_v.rounded_rectangle([tx, ty, tx + tw, ty + th], radius=10, fill=(22, 163, 74, 255), outline=(187, 247, 208, 255), width=2)
+            draw_v.text((tx + 20, ty + 26), f"✓ CLICKED: {act_label[:34]}", font=font_med, fill=(255, 255, 255, 255))
+        else:
+            draw_v.rounded_rectangle([tx, ty, tx + tw, ty + th], radius=10, fill=(2, 132, 199, 255), outline=(125, 211, 252, 255), width=2)
+            draw_v.text((tx + 20, ty + 26), f"👉 CLICK: {act_label[:34]} →", font=font_med, fill=(255, 255, 255, 255))
+
+        # Cursor in vertical mode
+        start_cx, start_cy = bx + 100, by + bh - 80
+        target_cx, target_cy = tx + tw // 2, ty + th // 2
+        if f_idx < click_frame:
+            t_prog = f_idx / float(max(1, click_frame))
+            ease = math.sin(t_prog * math.pi / 2.0)
+            cur_x = start_cx + (target_cx - start_cx) * ease
+            cur_y = start_cy + (target_cy - start_cy) * ease
+            _draw_realistic_mouse_cursor(draw_v, int(cur_x), int(cur_y), is_clicking=False)
+        elif is_click_moment:
+            c_prog = (f_idx - click_frame) / 18.0
+            _draw_realistic_mouse_cursor(draw_v, target_cx, target_cy, is_clicking=True, click_progress=c_prog)
+        else:
+            _draw_realistic_mouse_cursor(draw_v, target_cx, target_cy, is_clicking=False)
+
+        return cv2.cvtColor(np.array(pil_vert), cv2.COLOR_RGB2BGR)
+
+
+# ==============================================================================
 # 6. RESCALED MULTI-SCENE DYNAMIC DIRECTOR (WORKS FOR ANY VIDEO DURATION!)
 # ==============================================================================
 
@@ -2676,7 +2997,11 @@ def render_dynamic_lesson_block(
     device="cuda",
     run_ffmpeg_fn=None,
     progress_cb=None,
-    ass_subtitle_path=None
+    ass_subtitle_path=None,
+    tutorial_url=None,
+    tutorial_step=None,
+    tutorial_action=None,
+    flag_type="auto"
 ):
     """
     Rescales the 10-Minute Video Blueprint proportionally to ANY video duration (60s, 90s, 180s, 600s),
@@ -2817,6 +3142,9 @@ def render_dynamic_lesson_block(
     cut_jitter = ((block_idx * 17) % 9 - 4) * 0.015
 
     def _get_mode_for_frame(f_idx):
+        if flag_type == "tutorial_walkthrough" or (tutorial_url and str(tutorial_url).strip()):
+            return "tutorial_walkthrough"
+
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
         frac_local = t_local / max(1.0, block_dur_sec)
@@ -2947,7 +3275,27 @@ def render_dynamic_lesson_block(
         W, H = 1920, 1080
         use_closeup_cam = ((f_idx // max(1, int(fps * 5.5))) % 2 == 1)
 
-        if mode_name == "studio_lipsync":
+        if mode_name == "tutorial_walkthrough":
+            pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False)
+            wide_out = render_tutorial_walkthrough_screen(
+                lesson_title=lesson_title,
+                slide_title=slide_title,
+                slide_notes=slide_notes,
+                tutorial_url=tutorial_url,
+                tutorial_step=tutorial_step if tutorial_step is not None else (block_idx + 1),
+                tutorial_action=tutorial_action,
+                f_idx=f_idx,
+                num_frames=num_frames,
+                fps=fps,
+                pres_bgr=pres_bgr,
+                visual_template=visual_template,
+                theme=theme,
+                aspect_ratio=aspect_ratio,
+                presenter_name=presenter_name,
+                channel_name=channel_name
+            )
+
+        elif mode_name == "studio_lipsync":
             pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
             full_frame = studio_bg_bgr.copy()
             comp_slot = (pres_bgr.astype(np.float32) * card_alpha + base_slot * (1.0 - card_alpha)).astype(np.uint8)
@@ -3036,6 +3384,8 @@ def render_dynamic_lesson_block(
             wide_out = comp
 
         if is_vertical:
+            if mode_name == "tutorial_walkthrough":
+                return wide_out
             pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
             return _compose_vertical_916_frame(wide_out, pres_bgr, lesson_title, slide_title, slide_notes, theme, block_idx, total_blocks)
         return wide_out
@@ -3073,21 +3423,22 @@ def render_dynamic_lesson_block(
 
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
-        frame_bgr = _draw_broadcast_branding_overlays(
-            frame_bgr=frame_bgr,
-            t_local=t_local,
-            t_global=t_global,
-            total_video_dur=D,
-            block_idx=block_idx,
-            total_blocks=total_blocks,
-            lesson_title=lesson_title,
-            slide_title=slide_title,
-            presenter_name=presenter_name,
-            channel_name=channel_name,
-            theme=theme,
-            curr_mode=curr_mode,
-            avatar_rect=avatar_rect_coords
-        )
+        if curr_mode != "tutorial_walkthrough":
+            frame_bgr = _draw_broadcast_branding_overlays(
+                frame_bgr=frame_bgr,
+                t_local=t_local,
+                t_global=t_global,
+                total_video_dur=D,
+                block_idx=block_idx,
+                total_blocks=total_blocks,
+                lesson_title=lesson_title,
+                slide_title=slide_title,
+                presenter_name=presenter_name,
+                channel_name=channel_name,
+                theme=theme,
+                curr_mode=curr_mode,
+                avatar_rect=avatar_rect_coords
+            )
 
         if logo_cache is not None:
             frame_bgr = _apply_brand_logo_to_frame_bgr(frame_bgr, logo_cache, pos=logo_position)
@@ -3414,6 +3765,8 @@ def _install_runtime_accelerators():
         orig_seo = getattr(mod, "build_youtube_seo_package", None)
         if callable(orig_seo) and not getattr(orig_seo, "_ailg_seo_wrapped", False):
             def _rich_seo_wrapper(lesson_title, synthesized_blocks, presenter_name="", channel_name="", _orig=orig_seo):
+                import re
+                import json
                 fmt_ts = getattr(mod, "_format_youtube_chapter_ts", None)
                 chapters = []
                 keywords_bag = []

@@ -33,6 +33,9 @@ builtins.math = math
 builtins.os = os
 builtins.shutil = shutil
 builtins.time = time
+builtins.re = re
+builtins.json = json
+builtins.subprocess = subprocess
 
 import lipsync_engine
 from lipsync_engine import (
@@ -55,8 +58,14 @@ def _hot_sync_lipsync_engine_from_github():
     try:
         builtins.gc = gc
         builtins.math = math
+        builtins.re = re
+        builtins.json = json
+        builtins.subprocess = subprocess
         lipsync_engine.gc = gc
         lipsync_engine.math = math
+        lipsync_engine.re = re
+        lipsync_engine.json = json
+        lipsync_engine.subprocess = subprocess
         url = f"https://raw.githubusercontent.com/akankwatsa1/ai-video-lesson-maker/main/lipsync_engine.py?t={int(time.time())}"
         resp = requests.get(url, timeout=4)
         if resp.status_code == 200 and "def render_dynamic_lesson_block" in resp.text:
@@ -71,6 +80,9 @@ def _hot_sync_lipsync_engine_from_github():
                 importlib.reload(lipsync_engine)
                 lipsync_engine.gc = gc
                 lipsync_engine.math = math
+                lipsync_engine.re = re
+                lipsync_engine.json = json
+                lipsync_engine.subprocess = subprocess
                 render_dynamic_lesson_block = lipsync_engine.render_dynamic_lesson_block
                 render_lipsync_teacher_block = lipsync_engine.render_lipsync_teacher_block
                 render_slides_block = lipsync_engine.render_slides_block
@@ -2787,6 +2799,11 @@ def handler(job):
                 caption_mode=caption_mode
             )
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
+            tutorial_url = block.get('tutorial_url') or ''
+            tutorial_step = block.get('tutorial_step') or (idx_counter + 1)
+            tutorial_action = block.get('tutorial_action') or ''
+            flag_type = block.get('flag_type') or 'auto'
+
             render_dynamic_lesson_block(
                 raw_avatar_path=raw_avatar_path,
                 audio_wav_path=output_wav,
@@ -2812,7 +2829,11 @@ def handler(job):
                 device=device,
                 run_ffmpeg_fn=run_ffmpeg,
                 progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk),
-                ass_subtitle_path=(lyrics_ass if has_ass_events else None)
+                ass_subtitle_path=(lyrics_ass if has_ass_events else None),
+                tutorial_url=tutorial_url,
+                tutorial_step=tutorial_step,
+                tutorial_action=tutorial_action,
+                flag_type=flag_type
             )
 
             # Immediately purge per-block temporary media files so /tmp never fills up on long 10-minute videos!
@@ -3024,6 +3045,11 @@ def handler(job):
                 youtube_oauth=youtube_oauth
             )
 
+        total_dur_round = round(float(total_video_duration_sec), 2)
+        dur_mins = int(total_dur_round // 60)
+        dur_secs = int(total_dur_round % 60)
+        duration_fmt = f"{dur_mins}m {dur_secs:02d}s"
+
         report_live_progress(
             job, s3_client, bucket_name, job_id,
             step="Completed! Media, YouTube Thumbnail, Captions (.srt) & Chapters ready.",
@@ -3038,6 +3064,9 @@ def handler(job):
                 "srt_filename": srt_filename,
                 "youtube_seo": youtube_seo,
                 "youtube_publish": youtube_publish_result,
+                "duration_sec": total_dur_round,
+                "duration_formatted": duration_fmt,
+                "total_blocks": len(synthesized_blocks),
                 "status": "COMPLETED"
             }
         )
@@ -3052,6 +3081,9 @@ def handler(job):
             "thumbnail_filename": thumbnail_filename,
             "srt_url": srt_url,
             "srt_filename": srt_filename,
+            "duration_sec": total_dur_round,
+            "duration_formatted": duration_fmt,
+            "total_blocks": len(synthesized_blocks),
             "youtube_seo": youtube_seo,
             "youtube_publish": youtube_publish_result
         }
