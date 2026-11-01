@@ -526,60 +526,170 @@ def _read_first_avatar_frame_bgr(raw_avatar_path):
     return None
 
 
-def _compute_chest_up_crop_coords(img_bgr, target_w=680, target_h=820, device="cuda"):
+def _polish_avatar_frame_bgr(frame_bgr):
     """
-    Computes a Chest-Up Broadcast Portrait crop window (x0, y0, crop_w, crop_h)
-    centered around the teacher's face and upper shoulders so static lower-waist/arms
-    are cleanly framed out like a real television news anchor shot.
+    Removes grainy/rice-like sensor noise and block compression artifacts from
+    uploaded video loop clips or portrait photos while keeping eyes, hair, and facial
+    contours crisp and broadcast-polished.
+    """
+    if frame_bgr is None or frame_bgr.size == 0:
+        return frame_bgr
+    try:
+        smoothed = cv2.bilateralFilter(frame_bgr, d=5, sigmaColor=22, sigmaSpace=22)
+        blended = cv2.addWeighted(frame_bgr, 0.35, smoothed, 0.65, 0.0)
+        blur_fine = cv2.GaussianBlur(blended, (0, 0), sigmaX=1.0)
+        polished = cv2.addWeighted(blended, 1.18, blur_fine, -0.18, 0.0)
+        return polished
+    except Exception:
+        return frame_bgr
+
+
+def _pad_frame_with_studio_backdrop(img_bgr, pad_top=0, pad_bot=0, pad_left=0, pad_right=0):
+    """
+    Smoothly extends an image/video frame when the speaker's head is too close to the top
+    edge or the clip is narrower than the target aspect ratio, using a softly blurred
+    extension of the frame's own ambient background so the head is never cut off.
+    """
+    if pad_top <= 0 and pad_bot <= 0 and pad_left <= 0 and pad_right <= 0:
+        return img_bgr
+    h, w = img_bgr.shape[:2]
+    new_h = h + pad_top + pad_bot
+    new_w = w + pad_left + pad_right
+    try:
+        small = cv2.resize(img_bgr, (max(16, new_w // 12), max(16, new_h // 12)), interpolation=cv2.INTER_LINEAR)
+        small = cv2.GaussianBlur(small, (15, 15), 0)
+        ambient = cv2.resize(small, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+        ambient = (ambient.astype(np.float32) * 0.78).astype(np.uint8)
+        reflected = cv2.copyMakeBorder(
+            img_bgr, pad_top, pad_bot, pad_left, pad_right, borderType=cv2.BORDER_REFLECT_101
+        )
+        reflected_blur = cv2.GaussianBlur(reflected, (31, 31), 0)
+        canvas = cv2.addWeighted(reflected_blur, 0.65, ambient, 0.35, 0.0)
+        canvas[pad_top:pad_top + h, pad_left:pad_left + w] = img_bgr
+        # Feather 10px seam along padded edges if any
+        if pad_top > 0 and h > 12:
+            for py in range(min(10, h)):
+                a = py / 10.0
+                row_y = pad_top + py
+                canvas[row_y, pad_left:pad_left + w] = (
+                    img_bgr[py].astype(np.float32) * a
+                    + canvas[row_y, pad_left:pad_left + w].astype(np.float32) * (1.0 - a)
+                ).astype(np.uint8)
+        return canvas
+    except Exception:
+        return cv2.copyMakeBorder(img_bgr, pad_top, pad_bot, pad_left, pad_right, borderType=cv2.BORDER_REPLICATE)
+
+
+def _compute_balanced_crop_spec(img_bgr, target_w=680, target_h=820, device="cuda", bbox_override=None):
+    """
+    Computes a balanced Chest-Up Broadcast Portrait crop specification:
+      (pad_top, pad_bot, pad_left, pad_right, x0, y0, crop_w, crop_h)
+    Guarantees generous crown/hair headroom above the face (`0.60 * face_h` above `fy1`)
+    so the top of the avatar's head is NEVER cut off on either close-up or vertical clips.
     """
     h, w = img_bgr.shape[:2]
-    (fx1, fy1, fx2, fy2), found = detect_face_bbox(img_bgr, device=device)
+    if bbox_override is not None:
+        (fx1, fy1, fx2, fy2), found = bbox_override, True
+    else:
+        (fx1, fy1, fx2, fy2), found = detect_face_bbox(img_bgr, device=device)
+
     face_cx = (fx1 + fx2) // 2
-    face_cy = (fy1 + fy2) // 2
     face_h = max(48, fy2 - fy1)
     target_aspect = target_w / float(target_h)
 
-    # Ideal chest-up height is ~2.45x face height (head + neck + upper chest/shoulders)
-    if found and h > int(face_h * 2.65):
-        desired_h = max(int(face_h * 2.38), min(h, int(face_h * 2.55)))
-        desired_w = int(desired_h * target_aspect)
-        if desired_w <= w:
-            crop_h = desired_h
-            crop_w = desired_w
-            x0 = max(0, min(w - crop_w, face_cx - crop_w // 2))
-            desired_y0 = face_cy - int(crop_h * 0.38)
-            y0 = max(0, min(h - crop_h, desired_y0))
-            return x0, y0, crop_w, crop_h
+    if not found:
+        # Safe top-biased crop when no face detector hit
+        img_aspect = w / float(max(1, h))
+        if img_aspect > target_aspect:
+            crop_h = h
+            crop_w = max(1, int(h * target_aspect))
+            x0 = max(0, (w - crop_w) // 2)
+            y0 = 0
+        else:
+            crop_w = w
+            crop_h = max(1, int(w / target_aspect))
+            x0 = 0
+            y0 = max(0, min(h - crop_h, int(h * 0.04)))
+        return 0, 0, 0, 0, x0, y0, crop_w, crop_h
 
-    img_aspect = w / float(h)
-    if img_aspect > target_aspect:
-        crop_h = h
-        crop_w = int(h * target_aspect)
-        x0 = max(0, min(w - crop_w, face_cx - crop_w // 2))
-        y0 = 0
-    else:
-        crop_w = w
-        crop_h = int(w / target_aspect)
-        x0 = 0
-        desired_y0 = face_cy - int(crop_h * 0.37)
-        y0 = max(0, min(h - crop_h, desired_y0))
-    return x0, y0, max(1, crop_w), max(1, crop_h)
+    # Required top coordinate above face bbox so crown + hair + headroom are 100% visible
+    head_crown_margin = int(face_h * 0.62)
+    ideal_y0 = fy1 - head_crown_margin
+    # Ideal chest-up height is ~2.55x face height (crown + face + neck + upper chest)
+    ideal_crop_h = max(int(face_h * 2.55), int((fy2 - ideal_y0) * 1.52))
+    ideal_crop_w = int(round(ideal_crop_h * target_aspect))
+
+    pad_top = max(0, -ideal_y0)
+    pad_bot = max(0, (ideal_y0 + ideal_crop_h) - h)
+
+    ideal_x0 = face_cx - (ideal_crop_w // 2)
+    pad_left = max(0, -ideal_x0)
+    pad_right = max(0, (ideal_x0 + ideal_crop_w) - w)
+
+    # Cap padding to reasonable bounds while strictly preserving top headroom
+    max_pad_side = int(w * 0.38)
+    if pad_left + pad_right > max_pad_side * 2:
+        # Fit width to padded bounds and adjust crop_h proportionally while keeping top headroom
+        avail_w = w + max_pad_side * 2
+        pad_left = min(pad_left, max_pad_side)
+        pad_right = min(pad_right, max_pad_side)
+        ideal_crop_w = min(ideal_crop_w, w + pad_left + pad_right)
+        ideal_crop_h = max(1, int(round(ideal_crop_w / target_aspect)))
+        pad_bot = max(0, (ideal_y0 + ideal_crop_h) - h)
+
+    new_w = w + pad_left + pad_right
+    new_h = h + pad_top + pad_bot
+
+    crop_w = min(new_w, max(1, ideal_crop_w))
+    crop_h = min(new_h, max(1, int(round(crop_w / target_aspect))))
+    crop_w = min(new_w, max(1, int(round(crop_h * target_aspect))))
+
+    shifted_fx_center = face_cx + pad_left
+    shifted_ideal_y0 = ideal_y0 + pad_top
+
+    x0 = max(0, min(new_w - crop_w, shifted_fx_center - (crop_w // 2)))
+    y0 = max(0, min(new_h - crop_h, shifted_ideal_y0))
+
+    return pad_top, pad_bot, pad_left, pad_right, x0, y0, max(1, crop_w), max(1, crop_h)
+
+
+def _apply_crop_spec_to_frame(img_bgr, crop_spec, target_w=680, target_h=820):
+    pad_top, pad_bot, pad_left, pad_right, x0, y0, crop_w, crop_h = crop_spec
+    padded = _pad_frame_with_studio_backdrop(img_bgr, pad_top, pad_bot, pad_left, pad_right)
+    cropped = padded[y0:y0 + crop_h, x0:x0 + crop_w]
+    if cropped.size == 0:
+        cropped = padded
+    resized = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+    return _polish_avatar_frame_bgr(resized)
+
+
+def _compute_chest_up_crop_coords(img_bgr, target_w=680, target_h=820, device="cuda"):
+    """
+    Backward-compatible wrapper returning (x0, y0, crop_w, crop_h) inside img_bgr.
+    """
+    h, w = img_bgr.shape[:2]
+    _, _, _, _, x0, y0, cw, ch = _compute_balanced_crop_spec(img_bgr, target_w=target_w, target_h=target_h, device=device)
+    cw = min(w, cw)
+    ch = min(h, ch)
+    x0 = max(0, min(w - cw, x0))
+    y0 = max(0, min(h - ch, y0))
+    return x0, y0, max(1, cw), max(1, ch)
 
 
 def prepare_presenter_portrait(raw_avatar_path, target_w=680, target_h=820, device="cuda"):
     """
     Takes any phone photo (.jpg/.png/.webp) OR short teacher video clip (.mp4/.webm/.mov),
-    detects the teacher's face using S3FD, and smartly crops/scales it into a clean
-    Chest-Up Broadcast Portrait (680x820).
+    detects the teacher's face using S3FD, and smartly pads/crops/scales it into a clean,
+    well-balanced Chest-Up Broadcast Portrait (680x820) with guaranteed top headroom so
+    the head is never cut off.
     """
     img = _read_first_avatar_frame_bgr(raw_avatar_path)
     if img is None:
         canvas = np.full((target_h, target_w, 3), (45, 55, 75), dtype=np.uint8)
         return canvas, (target_w // 4, target_h // 4, 3 * target_w // 4, 3 * target_h // 4), False
 
-    x0, y0, crop_w, crop_h = _compute_chest_up_crop_coords(img, target_w=target_w, target_h=target_h, device=device)
-    cropped = img[y0:y0 + crop_h, x0:x0 + crop_w]
-    presenter_bgr = cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+    crop_spec = _compute_balanced_crop_spec(img, target_w=target_w, target_h=target_h, device=device)
+    presenter_bgr = _apply_crop_spec_to_frame(img, crop_spec, target_w=target_w, target_h=target_h)
 
     bbox, found_final = detect_face_bbox(presenter_bgr, device=device)
     return presenter_bgr, bbox, found_final
@@ -588,9 +698,9 @@ def prepare_presenter_portrait(raw_avatar_path, target_w=680, target_h=820, devi
 def _extract_video_avatar_loop(raw_avatar_path, target_w=680, target_h=820, max_frames=220, device="cuda"):
     """
     If `raw_avatar_path` is a short video clip (.mp4/.webm/.mov), decodes up to `max_frames`,
-    applies the uniform chest-up broadcast crop to every frame, and constructs a seamless
-    ping-pong loop (forward + reverse) so real human neck, shoulder, and clothing motion
-    plays continuously without any jump cuts. Returns None for static image avatars.
+    computes the multi-frame face bounding envelope across the clip so even upward head nods
+    never cut off the top of the head, applies uniform balanced framing + polish to every frame,
+    and constructs a seamless ping-pong loop (forward + reverse). Returns None for static images.
     """
     if not _is_video_file_path(raw_avatar_path) or not os.path.exists(raw_avatar_path):
         return None
@@ -598,26 +708,43 @@ def _extract_video_avatar_loop(raw_avatar_path, target_w=680, target_h=820, max_
         cap = cv2.VideoCapture(raw_avatar_path)
         if not cap.isOpened():
             return None
-        ret, first_frame = cap.read()
-        if not ret or first_frame is None:
-            cap.release()
-            return None
-
-        x0, y0, crop_w, crop_h = _compute_chest_up_crop_coords(first_frame, target_w=target_w, target_h=target_h, device=device)
-        frames = []
-        f0 = cv2.resize(first_frame[y0:y0 + crop_h, x0:x0 + crop_w], (target_w, target_h), interpolation=cv2.INTER_LINEAR)
-        frames.append(f0)
-
-        while len(frames) < max_frames:
+        raw_frames = []
+        while len(raw_frames) < max_frames:
             ret, frm = cap.read()
             if not ret or frm is None:
                 break
-            cropped = frm[y0:y0 + crop_h, x0:x0 + crop_w]
-            frames.append(cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LINEAR))
+            raw_frames.append(frm)
         cap.release()
 
-        if len(frames) <= 1:
+        if len(raw_frames) <= 1:
             return None
+
+        # Sample up to 8 frames across the video loop to find the highest head position (min_fy1)
+        # and full movement envelope so the head is never cut off at any point in the loop
+        sample_step = max(1, len(raw_frames) // 8)
+        detected_boxes = []
+        for s_idx in range(0, len(raw_frames), sample_step):
+            b, ok = detect_face_bbox(raw_frames[s_idx], device=device)
+            if ok:
+                detected_boxes.append(b)
+
+        bbox_env = None
+        if detected_boxes:
+            min_fx1 = int(np.percentile([b[0] for b in detected_boxes], 15))
+            min_fy1 = int(min(b[1] for b in detected_boxes))  # Highest head point in entire clip
+            max_fx2 = int(np.percentile([b[2] for b in detected_boxes], 85))
+            max_fy2 = int(np.percentile([b[3] for b in detected_boxes], 85))
+            bbox_env = (min_fx1, min_fy1, max_fx2, max_fy2)
+
+        crop_spec = _compute_balanced_crop_spec(
+            raw_frames[0], target_w=target_w, target_h=target_h, device=device, bbox_override=bbox_env
+        )
+        frames = [
+            _apply_crop_spec_to_frame(frm, crop_spec, target_w=target_w, target_h=target_h)
+            for frm in raw_frames
+        ]
+        del raw_frames
+
         # Ping-pong seamless loop avoids hard jump cuts at loop boundaries
         if len(frames) > 4:
             frames = frames + frames[-2:0:-1]
@@ -696,9 +823,9 @@ _JAW_HORIZ_CACHE = {}
 
 def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
     """
-    Reinforces visible mouth/jaw articulation on spoken syllables, adds
-    speech-synced eyebrow micro-lift, and performs natural single & occasional
-    double eye blinks so even tight-lipped portrait photos look genuinely alive.
+    Reinforces natural jaw articulation on spoken syllables, adds speech-synced
+    eyebrow micro-lift, and performs natural single & occasional double eye blinks
+    for static portrait photos (without any artificial white teeth/rice patch).
     """
     fh, fw = face_bgr.shape[:2]
     out = face_bgr.copy()
@@ -706,7 +833,7 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
 
     # 1. Eyebrow Micro-Lift on Emphasized Syllables (y: 16% -> 27%, x: 16% -> 84%)
     if energy > 0.14 and fh > 48 and fw > 48:
-        brow_lift_px = min(4.2, float(energy) * 3.6 + 0.8 * max(0.0, math.sin(t_sec * 6.2)))
+        brow_lift_px = min(3.8, float(energy) * 3.2 + 0.7 * max(0.0, math.sin(t_sec * 6.2)))
         by1, by2 = max(2, int(fh * 0.16)), min(fh - 2, int(fh * 0.27))
         bx1, bx2 = max(2, int(fw * 0.16)), min(fw - 2, int(fw * 0.84))
         if by2 > by1 + 6 and bx2 > bx1 + 12:
@@ -724,19 +851,14 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
             map_y = np.clip(grid_y + weight * brow_lift_px, 0, bh_r - 1)
             out[by1:by2, bx1:bx2] = cv2.remap(brow_roi, grid_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
 
-    # 2. Syllable-driven lower-jaw & lip opening reinforcement
-    if energy > 0.06 and fh > 40 and fw > 40:
-        mouth_cx = fw // 2
+    # 2. Smooth lower-jaw vertical articulation (no synthetic teeth/cavity overlay)
+    if energy > 0.08 and fh > 40 and fw > 40:
         mouth_cy = int(fh * 0.74)
-        rx = max(8, int(fw * 0.17 * (0.85 + 0.25 * energy)))
-        ry = max(2, int(fh * 0.055 * min(1.15, energy * 1.35)))
-
-        # Subtle downward shift of chin/lower lip below mouth_cy
         jaw_top = mouth_cy
         jaw_bot = int(fh * 0.96)
         jaw_h = jaw_bot - jaw_top
         if jaw_h > 8:
-            shift_px = max(1, int(fh * 0.045 * energy))
+            shift_px = max(1, int(fh * 0.036 * energy))
             jaw_patch = out[jaw_top:jaw_bot, :]
             stretched = cv2.resize(jaw_patch, (fw, jaw_h + shift_px), interpolation=cv2.INTER_LINEAR)
             if fw not in _JAW_HORIZ_CACHE:
@@ -749,26 +871,12 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
                 + jaw_patch.astype(np.float32) * inv_horiz_w
             ).astype(np.uint8)
 
-        # Subtle inner-mouth shading when syllable energy is strong
-        if energy > 0.18:
-            lip_mask = np.zeros((fh, fw), dtype=np.float32)
-            cv2.ellipse(lip_mask, (mouth_cx, mouth_cy + 1), (rx, ry), 0, 0, 360, 1.0, -1)
-            bk = max(3, (min(fw, fh) // 15) | 1)
-            lip_mask = cv2.GaussianBlur(lip_mask, (bk, bk), 0)[..., None]
-            cavity = np.full_like(out, (28, 22, 48), dtype=np.uint8)
-            teeth_y1 = max(0, mouth_cy - max(1, ry // 2))
-            teeth_y2 = min(fh, mouth_cy)
-            cavity[teeth_y1:teeth_y2, mouth_cx - rx // 2:mouth_cx + rx // 2] = (210, 215, 225)
-            alpha_lip = lip_mask * min(0.58, energy * 0.52)
-            out = (out.astype(np.float32) * (1.0 - alpha_lip) + cavity.astype(np.float32) * alpha_lip).astype(np.uint8)
-
     # 3. Natural Single & Occasional Double Eye-Blinking (every ~3.8 seconds)
     blink_cycle = (t_sec + 0.75) % 3.8
     blink_strength = 0.0
     if blink_cycle < 0.15:
         blink_strength = math.sin((blink_cycle / 0.15) * math.pi)
     elif (int((t_sec + 0.75) // 3.8) % 2 == 1) and (0.24 <= blink_cycle < 0.38):
-        # Occasional realistic double-blink
         blink_strength = 0.88 * math.sin(((blink_cycle - 0.24) / 0.14) * math.pi)
 
     if blink_strength > 0.05 and fh > 48:
@@ -779,7 +887,6 @@ def _apply_syllable_mouth_and_blink(face_bgr, energy, f_idx, fps=24):
             lid_stretched = cv2.resize(upper_lid, (fw, eh), interpolation=cv2.INTER_LINEAR)
             b_alpha = min(0.88, blink_strength * 0.88)
             blended_eyes = cv2.addWeighted(lid_stretched, b_alpha, out[ey1:ey2, :], 1.0 - b_alpha, 0.0)
-            # Subtle upper eyelash fold line when eyelid descends
             lash_y = min(eh - 1, max(1, int(eh * 0.68 * blink_strength)))
             blended_eyes[lash_y, int(fw * 0.18):int(fw * 0.82)] = (
                 blended_eyes[lash_y, int(fw * 0.18):int(fw * 0.82)].astype(np.float32) * 0.55
@@ -869,20 +976,24 @@ def _get_cached_avatar_base(raw_avatar_path, presenter_w=680, presenter_h=820, d
     torso articulation grids, and studio desk overlay across blocks so a 10-minute
     (20-block) video only runs S3FD and video avatar decoding ONCE per job.
     """
-    cache_key = f"{raw_avatar_path}|{presenter_w}x{presenter_h}"
+    cache_key = f"v763|{raw_avatar_path}|{presenter_w}x{presenter_h}"
     if cache_key in _AVATAR_BASE_CACHE:
         return _AVATAR_BASE_CACHE[cache_key]
 
-    presenter_bgr, (x1, y1, x2, y2), _ = prepare_presenter_portrait(
-        raw_avatar_path, presenter_w, presenter_h, device=device
-    )
     video_loop_frames = _extract_video_avatar_loop(
         raw_avatar_path, presenter_w, presenter_h, device=device
     )
+    if video_loop_frames and len(video_loop_frames) > 0:
+        presenter_bgr = video_loop_frames[0].copy()
+        (x1, y1, x2, y2), _ = detect_face_bbox(presenter_bgr, device=device)
+    else:
+        presenter_bgr, (x1, y1, x2, y2), _ = prepare_presenter_portrait(
+            raw_avatar_path, presenter_w, presenter_h, device=device
+        )
     face_crop_orig = presenter_bgr[y1:y2, x1:x2].copy()
     fh, fw = face_crop_orig.shape[:2]
     mouth_mask = _create_full_opacity_mouth_mask(fw, fh)
-    torso_grids = _precompute_torso_articulation_grids(presenter_w, presenter_h, y2)
+    torso_grids = None if video_loop_frames else _precompute_torso_articulation_grids(presenter_w, presenter_h, y2)
     desk_bgr, desk_alpha = _build_studio_desk_foreground(presenter_w, presenter_h)
 
     base_entry = {
@@ -895,7 +1006,6 @@ def _get_cached_avatar_base(raw_avatar_path, presenter_w=680, presenter_h=820, d
         "desk_bgr": desk_bgr,
         "desk_alpha": desk_alpha,
     }
-    # Keep at most 2 entries in cache to bound RAM usage
     if len(_AVATAR_BASE_CACHE) >= 2:
         _AVATAR_BASE_CACHE.clear()
     _AVATAR_BASE_CACHE[cache_key] = base_entry
@@ -904,10 +1014,12 @@ def _get_cached_avatar_base(raw_avatar_path, presenter_w=680, presenter_h=820, d
 
 def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24, device="cuda"):
     """
-    Pre-renders the lip-synced, blinking, head-swaying, shoulder-articulated teacher portrait
-    state (680x820) for a block. Supports both static photo avatars (.jpg/.png/.webp) AND
-    short real-human video avatar loops (.mp4/.webm/.mov)!
-    Uses cross-block avatar caching and stride-2 neural lip interpolation for fast long-video rendering.
+    Pre-renders the teacher portrait state (680x820) for a block.
+    - When `raw_avatar_path` is a video loop clip (.mp4/.webm/.mov), plays the full balanced
+      video loop naturally WITHOUT pasting a duplicate static mouth patch at fixed Frame-0
+      coordinates!
+    - When `raw_avatar_path` is a static photo (.jpg/.png/.webp), synthesizes Wav2Lip-GAN
+      mouth motion + natural jaw/eyebrow/blink articulation.
     """
     presenter_w, presenter_h = 680, 820
     base = _get_cached_avatar_base(raw_avatar_path, presenter_w, presenter_h, device=device)
@@ -954,57 +1066,58 @@ def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24,
         rms = float(np.sqrt(np.mean(seg ** 2))) if len(seg) > 0 else 0.0
         frame_energies.append(min(1.0, rms * 11.5))
 
-    # Smooth energies slightly over 3-frame window for natural jaw physics
     if len(frame_energies) >= 3:
         smoothed = np.convolve(frame_energies, [0.25, 0.50, 0.25], mode="same")
         frame_energies = [float(x) for x in smoothed]
 
-    wav2lip_model = get_wav2lip_model(device=device)
     predicted_faces = []
+    is_video_loop = bool(video_loop_frames and len(video_loop_frames) > 1)
 
-    if wav2lip_model is not None and fw > 16 and fh > 16:
-        face_96 = cv2.resize(face_crop_orig, (96, 96), interpolation=cv2.INTER_AREA)
-        face_masked = face_96.copy()
-        face_masked[48:, :] = 0
-        face_concat = np.concatenate((face_masked, face_96), axis=2) / 255.0
-        face_tensor_single = torch.from_numpy(np.transpose(face_concat, (2, 0, 1))).float().unsqueeze(0).to(device)
+    # Only synthesize fixed-coordinate Wav2Lip mouth patches for static portrait photos;
+    # for uploaded video loop clips, let the full video loop run naturally without a second floating mouth!
+    if not is_video_loop:
+        wav2lip_model = get_wav2lip_model(device=device)
+        if wav2lip_model is not None and fw > 16 and fh > 16:
+            face_96 = cv2.resize(face_crop_orig, (96, 96), interpolation=cv2.INTER_AREA)
+            face_masked = face_96.copy()
+            face_masked[48:, :] = 0
+            face_concat = np.concatenate((face_masked, face_96), axis=2) / 255.0
+            face_tensor_single = torch.from_numpy(np.transpose(face_concat, (2, 0, 1))).float().unsqueeze(0).to(device)
 
-        # For blocks >= 8 seconds (192+ frames), evaluate Wav2Lip at 12Hz (stride=2) and
-        # linearly blend intermediate frames—cutting Wav2Lip GPU compute by 50% with smooth 24fps lips!
-        stride = 2 if num_frames >= 192 else 1
-        key_indices = list(range(0, num_frames, stride))
-        key_mels = [mel_chunks[k] for k in key_indices]
-        key_preds = []
+            stride = 2 if num_frames >= 192 else 1
+            key_indices = list(range(0, num_frames, stride))
+            key_mels = [mel_chunks[k] for k in key_indices]
+            key_preds = []
 
-        batch_size = 64
-        use_cuda_amp = str(device).startswith("cuda") and torch.cuda.is_available()
-        with torch.no_grad():
-            for b_start in range(0, len(key_mels), batch_size):
-                b_mels = np.array(key_mels[b_start:b_start + batch_size])
-                b_len = len(b_mels)
-                b_mels = np.reshape(b_mels, (b_len, b_mels.shape[1], b_mels.shape[2], 1))
-                mel_tensor = torch.from_numpy(np.transpose(b_mels, (0, 3, 1, 2))).float().to(device)
-                img_tensor = face_tensor_single.repeat(b_len, 1, 1, 1)
-                if use_cuda_amp:
-                    with torch.cuda.amp.autocast():
+            batch_size = 64
+            use_cuda_amp = str(device).startswith("cuda") and torch.cuda.is_available()
+            with torch.no_grad():
+                for b_start in range(0, len(key_mels), batch_size):
+                    b_mels = np.array(key_mels[b_start:b_start + batch_size])
+                    b_len = len(b_mels)
+                    b_mels = np.reshape(b_mels, (b_len, b_mels.shape[1], b_mels.shape[2], 1))
+                    mel_tensor = torch.from_numpy(np.transpose(b_mels, (0, 3, 1, 2))).float().to(device)
+                    img_tensor = face_tensor_single.repeat(b_len, 1, 1, 1)
+                    if use_cuda_amp:
+                        with torch.cuda.amp.autocast():
+                            preds = wav2lip_model(mel_tensor, img_tensor)
+                    else:
                         preds = wav2lip_model(mel_tensor, img_tensor)
-                else:
-                    preds = wav2lip_model(mel_tensor, img_tensor)
-                preds_np = (preds.detach().cpu().float().numpy().transpose(0, 2, 3, 1) * 255.0).clip(0, 255).astype(np.uint8)
-                for p in preds_np:
-                    key_preds.append(p)
+                    preds_np = (preds.detach().cpu().float().numpy().transpose(0, 2, 3, 1) * 255.0).clip(0, 255).astype(np.uint8)
+                    for p in preds_np:
+                        key_preds.append(p)
 
-        if stride == 1:
-            predicted_faces = key_preds
-        else:
-            n_keys = len(key_preds)
-            for f_idx in range(num_frames):
-                k0 = min(n_keys - 1, f_idx // stride)
-                if f_idx % stride == 0 or k0 + 1 >= n_keys:
-                    predicted_faces.append(key_preds[k0])
-                else:
-                    blended = cv2.addWeighted(key_preds[k0], 0.5, key_preds[k0 + 1], 0.5, 0)
-                    predicted_faces.append(blended)
+            if stride == 1:
+                predicted_faces = key_preds
+            else:
+                n_keys = len(key_preds)
+                for f_idx in range(num_frames):
+                    k0 = min(n_keys - 1, f_idx // stride)
+                    if f_idx % stride == 0 or k0 + 1 >= n_keys:
+                        predicted_faces.append(key_preds[k0])
+                    else:
+                        blended = cv2.addWeighted(key_preds[k0], 0.5, key_preds[k0 + 1], 0.5, 0)
+                        predicted_faces.append(blended)
 
     return {
         "presenter_bgr": presenter_bgr,
@@ -1026,13 +1139,13 @@ def synthesize_talking_presenter_frames(raw_avatar_path, audio_wav_path, fps=24,
 
 def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
     """
-    Returns the single 680x820 animated presenter frame for frame index `f_idx`
-    with:
-      1. Video Avatar Loop support (.mp4/.webm real human body movement) OR
-      2. Multi-Zone Below-the-Neck Shoulder/Neck/Torso Mesh Articulation for static photos
-      3. Wav2Lip-GAN mouth synthesis + syllable jaw + eyebrow lift + single/double eye-blinks
-      4. Sleek Broadcast Studio Desk foreground masking the lower torso cutoff
-      5. Optional 2-Camera Multi-Cam Close-Up Punch-In (`camera_closeup=True`)
+    Returns the single 680x820 animated presenter frame for frame index `f_idx`:
+      1. If `video_loop_frames` is present (user uploaded a video clip avatar), plays the
+         balanced, full-headroom video loop directly without any duplicate static mouth
+         patch or head-clipping zoom!
+      2. If static photo avatar, applies Wav2Lip-GAN mouth synthesis + syllable jaw/brow/blink
+         + below-the-neck torso articulation + top-anchored posture sway (never cutting off head).
+      3. Overlays the Broadcast Studio Desk foreground at the bottom 74px.
     """
     cached_f, cached_cu, cached_out = talk_state.get("_frame_cache", (-1, False, None))
     if cached_f == f_idx and cached_cu == camera_closeup and cached_out is not None:
@@ -1055,17 +1168,26 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
     energy = frame_energies[min(f_idx, len(frame_energies) - 1)]
     t_sec = f_idx / float(max(1, fps))
 
-    # During low-energy speech pauses, reuse the immediately preceding frame on odd indices
+    # Case A: Video Loop Avatar — play the full balanced video loop clip naturally
+    # with ZERO static mouth overlay and ZERO head-chopping affine zoom!
+    if video_loop_frames and len(video_loop_frames) > 1:
+        animated_presenter = video_loop_frames[f_idx % len(video_loop_frames)].copy()
+        if desk_bgr is not None and desk_alpha is not None:
+            dh = desk_bgr.shape[0]
+            bot_slice = animated_presenter[presenter_h - dh:, :].astype(np.float32)
+            animated_presenter[presenter_h - dh:, :] = (
+                bot_slice * (1.0 - desk_alpha) + desk_bgr * desk_alpha
+            ).astype(np.uint8)
+        talk_state["_frame_cache"] = (f_idx, camera_closeup, animated_presenter)
+        return animated_presenter
+
+    # Case B: Static Photo Avatar
     if energy < 0.03 and (f_idx % 2 == 1) and cached_f == (f_idx - 1) and cached_cu == camera_closeup and cached_out is not None:
         talk_state["_frame_cache"] = (f_idx, camera_closeup, cached_out)
         return cached_out
 
-    if video_loop_frames and len(video_loop_frames) > 1:
-        frame_presenter = video_loop_frames[f_idx % len(video_loop_frames)].copy()
-        base_face_for_frame = frame_presenter[y1:y2, x1:x2].copy()
-    else:
-        frame_presenter = presenter_bgr.copy()
-        base_face_for_frame = face_crop_orig
+    frame_presenter = presenter_bgr.copy()
+    base_face_for_frame = face_crop_orig
 
     if f_idx < len(predicted_faces) and fw > 16 and fh > 16:
         pred_resized = cv2.resize(predicted_faces[f_idx], (fw, fh), interpolation=cv2.INTER_LINEAR)
@@ -1076,13 +1198,10 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
     else:
         blended_face = base_face_for_frame.copy()
 
-    # Apply syllable lip/jaw reinforcement, eyebrow micro-lift & natural eye blinking
     blended_face = _apply_syllable_mouth_and_blink(blended_face, energy, f_idx, fps=fps)
     frame_presenter[y1:y2, x1:x2] = blended_face
 
-    # Multi-Zone Below-the-Neck Articulation (Shoulder shrugs, Neck follow & Chest breathing)
-    # Evaluated at 12Hz (every 2nd frame) since shoulder/breathing motion is < 1.6Hz
-    if torso_grids is not None and not video_loop_frames:
+    if torso_grids is not None:
         ty_top = torso_grids["y_top"]
         torso_step = f_idx // 2
         prev_t_step, prev_torso_img = talk_state.get("_torso_step_cache", (-1, None))
@@ -1098,14 +1217,14 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
             neck_zone = torso_grids["neck_zone"]
             edge_taper = torso_grids["edge_taper"]
 
-            shrug_l = (-4.8 * energy * (0.65 + 0.35 * math.sin(t_sec * 3.4)) - 2.2 * math.sin(t_sec * 1.65))
-            shrug_r = (-4.8 * energy * (0.65 + 0.35 * math.cos(t_sec * 3.1)) - 2.2 * math.sin(t_sec * 1.65 + 0.45))
-            breath_y = -3.2 * math.sin(2.0 * math.pi * 0.32 * t_sec) - 1.8 * energy
-            sway_x = 4.2 * math.sin(2.0 * math.pi * 0.24 * t_sec) + 2.4 * math.cos(t_sec * 2.7) * energy
-            neck_x = 3.0 * math.sin(2.0 * math.pi * 0.27 * t_sec)
+            shrug_l = (-4.2 * energy * (0.65 + 0.35 * math.sin(t_sec * 3.4)) - 1.8 * math.sin(t_sec * 1.65))
+            shrug_r = (-4.2 * energy * (0.65 + 0.35 * math.cos(t_sec * 3.1)) - 1.8 * math.sin(t_sec * 1.65 + 0.45))
+            breath_y = -2.6 * math.sin(2.0 * math.pi * 0.32 * t_sec) - 1.4 * energy
+            sway_x = 3.4 * math.sin(2.0 * math.pi * 0.24 * t_sec) + 2.0 * math.cos(t_sec * 2.7) * energy
+            neck_x = 2.4 * math.sin(2.0 * math.pi * 0.27 * t_sec)
 
             dy = (left_sh * shrug_l + right_sh * shrug_r + chest_zone * breath_y) * edge_taper
-            dx = (chest_zone * sway_x + neck_zone * neck_x + (left_sh - right_sh) * (1.8 * energy)) * edge_taper
+            dx = (chest_zone * sway_x + neck_zone * neck_x + (left_sh - right_sh) * (1.5 * energy)) * edge_taper
 
             map_x = np.clip(gx - dx, 0, presenter_w - 1).astype(np.float32)
             map_y = np.clip(gy - dy, 0, torso_roi.shape[0] - 1).astype(np.float32)
@@ -1116,18 +1235,19 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
             frame_presenter[ty_top:, :] = remapped_torso
             talk_state["_torso_step_cache"] = (torso_step, remapped_torso)
 
-    # Upper-body natural head/posture sway
-    scale = 1.016 + 0.008 * math.sin(2.0 * math.pi * 0.38 * t_sec) + 0.007 * energy
-    angle_deg = 1.10 * math.sin(2.0 * math.pi * 0.27 * t_sec) + 0.55 * math.cos(2.0 * math.pi * 0.65 * t_sec) * energy
-    tx = 3.6 * math.sin(2.0 * math.pi * 0.24 * t_sec)
-    ty = 2.2 * math.cos(2.0 * math.pi * 0.42 * t_sec) - 3.0 * energy
+    # Anchor rotation/scale pivot near top of head (y = max(24, y1 - 0.45*fh)) and clamp ty >= 0
+    # so zooming or swaying can NEVER push the top of the head above y = 0!
+    scale = 1.008 + 0.005 * math.sin(2.0 * math.pi * 0.38 * t_sec) + 0.004 * energy
+    angle_deg = 0.75 * math.sin(2.0 * math.pi * 0.27 * t_sec)
+    tx = 2.5 * math.sin(2.0 * math.pi * 0.24 * t_sec)
+    ty = max(0.0, 1.5 * math.cos(2.0 * math.pi * 0.42 * t_sec))
 
-    # 2-Camera Multi-Cam Close-Up Punch-In (alternating tight camera shot on emphatic segments)
     if camera_closeup:
-        scale *= 1.13
-        ty += 18.0
+        scale *= 1.045
+        ty += 6.0
 
-    M = cv2.getRotationMatrix2D((presenter_w * 0.5, presenter_h * 0.42), angle_deg, scale)
+    pivot_y = float(max(20, int(y1 - fh * 0.45)))
+    M = cv2.getRotationMatrix2D((presenter_w * 0.5, pivot_y), angle_deg, scale)
     M[0, 2] += tx
     M[1, 2] += ty
 
@@ -1136,7 +1256,6 @@ def get_animated_presenter_frame(talk_state, f_idx, camera_closeup=False):
         flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101
     )
 
-    # Overlay Broadcast Studio Desk / Lectern Rim across bottom 74px to mask lower torso cutoff
     if desk_bgr is not None and desk_alpha is not None:
         dh = desk_bgr.shape[0]
         bot_slice = animated_presenter[presenter_h - dh:, :].astype(np.float32)
@@ -1304,52 +1423,58 @@ def build_studio_Composite_background(
     draw = ImageDraw.Draw(bg_pil, "RGBA")
 
     # Top studio header bar (enlarged accessibility fonts)
-    draw.rounded_rectangle([64, 18, 1856, 76], radius=16, fill=theme["header_bg"], outline=accent + (210,), width=3)
+    draw.rounded_rectangle([64, 18, 1856, 74], radius=16, fill=theme["header_bg"], outline=accent + (210,), width=3)
     font_header = _load_font(27, bold=True)
     font_badge = _load_font(22, bold=True)
-    draw.text((88, 30), f"  {lesson_title.upper()[:54]}", font=font_header, fill=(255, 255, 255, 255))
-    draw.text((1580, 33), f"MODULE {block_idx + 1} OF {total_blocks}", font=font_badge, fill=accent_alt + (255,))
+    draw.text((88, 29), f"  {lesson_title.upper()[:52]}", font=font_header, fill=(255, 255, 255, 255))
+    draw.text((1580, 32), f"MODULE {block_idx + 1} OF {total_blocks}", font=font_badge, fill=accent_alt + (255,))
 
     # Determine coordinates based on presenter_side ("left" vs "right")
+    # Strict 40px safety moat between Presenter Slot (680x820 at y=84..904) and Concept Card (1072x820 at y=84..904)
     if presenter_side == "right":
-        pres_x, pres_y = 1176, 88
+        pres_x, pres_y = 1176, 84
         card_x1, card_x2 = 64, 1136
     else:
-        pres_x, pres_y = 64, 88
+        pres_x, pres_y = 64, 84
         card_x1, card_x2 = 784, 1856
 
-    # Concept Card (width = 1072, y = 88..912)
-    draw.rounded_rectangle([card_x1, 88, card_x2, 912], radius=26, fill=theme["card_bg"], outline=accent + (230,), width=3)
-    draw.rounded_rectangle([card_x1, 88, card_x2, 190], radius=26, fill=theme["card_header_bg"])
-    draw.rectangle([card_x1, 158, card_x2, 190], fill=theme["card_header_bg"])
-    draw.rectangle([card_x1, 182, card_x2, 190], fill=accent + (255,))
+    card_w = card_x2 - card_x1
+    card_h = 820
+    # Render Concept Card onto its own isolated RGBA sub-canvas so long titles/notes
+    # are 100% clipped inside the card and can NEVER bleed into the Avatar area!
+    card_pil = Image.new("RGBA", (card_w, card_h), (0, 0, 0, 0))
+    c_draw = ImageDraw.Draw(card_pil, "RGBA")
 
-    # Enlarged accessibility heading (40px bold)
-    font_slide_title = _load_font(40, bold=True)
+    c_draw.rounded_rectangle([0, 0, card_w - 1, card_h - 1], radius=26, fill=theme["card_bg"], outline=accent + (230,), width=3)
+    c_draw.rounded_rectangle([0, 0, card_w - 1, 102], radius=26, fill=theme["card_header_bg"])
+    c_draw.rectangle([0, 70, card_w - 1, 102], fill=theme["card_header_bg"])
+    c_draw.rectangle([0, 94, card_w - 1, 102], fill=accent + (255,))
+
+    font_slide_title = _load_font(38, bold=True)
     heading = (slide_title or lesson_title or f"Key Concept #{block_idx + 1}").strip()
-    draw.text((card_x1 + 36, 114), heading[:40], font=font_slide_title, fill=(255, 255, 255, 255))
+    h_lines = _wrap_text(c_draw, heading, font_slide_title, card_w - 72)
+    c_draw.text((36, 26), (h_lines[0] if h_lines else heading)[:42], font=font_slide_title, fill=(255, 255, 255, 255))
 
-    notes_max_w = 990
-    notes_start_y = 214
+    notes_max_w = card_w - 82
+    notes_start_y = 126
     if cf_image_path and os.path.exists(cf_image_path):
         try:
             cf_img = Image.open(cf_image_path).convert("RGB")
-            tw, th = 992, 336
+            tw, th = card_w - 80, 326
             iw, ih = cf_img.size
-            sc = max(tw / float(iw), th / float(ih))
+            sc = max(tw / float(max(1, iw)), th / float(max(1, ih)))
             cf_img = cf_img.resize((int(iw * sc), int(ih * sc)), Image.Resampling.LANCZOS)
             lx = (cf_img.size[0] - tw) // 2
             ly = (cf_img.size[1] - th) // 2
             cf_img = cf_img.crop((lx, ly, lx + tw, ly + th))
             mask = Image.new("L", (tw, th), 0)
             ImageDraw.Draw(mask).rounded_rectangle([0, 0, tw, th], radius=18, fill=255)
-            bg_pil.paste(cf_img, (card_x1 + 40, 204), mask)
-            notes_start_y = 560
+            card_pil.paste(cf_img, (40, 118), mask)
+            notes_start_y = 464
         except Exception as e:
             print(f"Studio CF image embed note: {e}")
 
-    # Enlarged accessibility bullet font (35px bold with high contrast)
-    font_bullet = _load_font(35, bold=True)
+    font_bullet = _load_font(34, bold=True)
     curr_y = notes_start_y
     bullet_colors = [accent, accent_alt, (16, 185, 129), (59, 130, 246)]
 
@@ -1357,17 +1482,19 @@ def build_studio_Composite_background(
         clean_note = str(note).strip()
         if not clean_note:
             continue
-        lines = _wrap_text(draw, clean_note, font_bullet, notes_max_w - 72)
+        lines = _wrap_text(c_draw, clean_note, font_bullet, notes_max_w - 72)
         b_col = bullet_colors[idx % len(bullet_colors)]
-        draw.rounded_rectangle([card_x1 + 40, curr_y + 5, card_x1 + 78, curr_y + 43], radius=10, fill=b_col + (255,))
+        c_draw.rounded_rectangle([40, curr_y + 5, 78, curr_y + 43], radius=10, fill=b_col + (255,))
         for line in lines[:2]:
-            draw.text((card_x1 + 94, curr_y), line, font=font_bullet, fill=theme["card_text"])
-            curr_y += 45
+            c_draw.text((94, curr_y), line, font=font_bullet, fill=theme["card_text"])
+            curr_y += 44
         curr_y += 14
-        if curr_y > 872:
+        if curr_y > card_h - 48:
             break
 
-    # Presenter Frame glowing border
+    bg_pil.paste(card_pil, (card_x1, 84), card_pil)
+
+    # Presenter Frame glowing border (y=84..904)
     draw.rounded_rectangle(
         [pres_x - 6, pres_y - 6, pres_x + 680 + 6, pres_y + 820 + 6],
         radius=26,
@@ -1428,22 +1555,21 @@ def generate_fallback_illustration(prompt_text, title_text, output_png, variant=
     return output_png
 
 
-def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_title=""):
+def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_title="", anim_progress=1.0):
     """
     Renders a crisp, broadcast-grade Data Chart, Comparison Table, Process Flowchart,
     or Scientific Formula Board onto a PIL RGB Image of size (width, height).
-    Supported chart_data['type'] values:
-      - 'bar'        : Horizontal/Vertical comparative metric bars with value badges
-      - 'comparison' : Two-column or multi-row structured comparison matrix
-      - 'formula'    : Highlighted mathematical / scientific equation board with variable legend
-      - 'process'    : Step-by-step connected flowchart nodes
+    Supports progressive animation via `anim_progress` (0.0 .. 1.0):
+      - 'bar'     : Metric bars grow smoothly from 0% -> target% with animated value counters
+      - 'process' : Step-by-step connected flowchart nodes light up sequentially
+      - 'formula' : Equation types in with staggered variable legend reveal
     """
+    anim_p = max(0.05, min(1.0, float(anim_progress)))
     accent = theme["accent"]
     accent_alt = theme["accent_alt"]
     card = Image.new("RGB", (width, height), (13, 20, 38))
     draw = ImageDraw.Draw(card, "RGBA")
 
-    # Subtle grid lines for technical broadcast look
     for gx in range(40, width, 60):
         draw.line([(gx, 0), (gx, height)], fill=(255, 255, 255, 13), width=1)
     for gy in range(40, height, 60):
@@ -1453,7 +1579,6 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
     ctitle = str(chart_data.get("title") or slide_title or "Key Data & Metrics").strip()
     unit = str(chart_data.get("unit") or "").strip()
 
-    # Header bar inside chart card
     draw.rounded_rectangle([18, 18, width - 18, 92], radius=16, fill=(22, 33, 62, 240), outline=accent + (180,), width=2)
     font_ctitle = _load_font(27, bold=True)
     draw.text((38, 38), ctitle[:38], font=font_ctitle, fill=accent_alt + (255,))
@@ -1473,7 +1598,9 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
         font_eq_tag = _load_font(20, bold=True)
         draw.text((54, 134), "CORE EQUATION / PRINCIPLE", font=font_eq_tag, fill=accent + (255,))
         font_eq = _load_font(44, bold=True)
-        eq_lines = _wrap_text(draw, formula_str, font_eq, width - 110)
+        vis_chars = max(1, int(round(len(formula_str) * min(1.0, anim_p * 1.4))))
+        shown_eq = formula_str[:vis_chars] + (" ▍" if vis_chars < len(formula_str) else "")
+        eq_lines = _wrap_text(draw, shown_eq, font_eq, width - 110)
         ey = 176
         for el in eq_lines[:2]:
             draw.text((54, ey), el, font=font_eq, fill=(255, 255, 255, 255))
@@ -1481,12 +1608,17 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
 
         font_leg = _load_font(25, bold=True)
         ly = 338
+        n_leg = max(1, len(labels[:5]))
         for idx, lbl in enumerate(labels[:5]):
+            item_p = max(0.0, min(1.0, (anim_p * (n_leg + 0.5)) - idx * 0.7))
+            if item_p <= 0.05:
+                continue
+            alpha_l = int(255 * item_p)
             b_col = accent if idx % 2 == 0 else accent_alt
-            draw.ellipse([40, ly + 6, 58, ly + 24], fill=b_col + (255,))
+            draw.ellipse([40, ly + 6, 58, ly + 24], fill=b_col + (alpha_l,))
             w_lines = _wrap_text(draw, lbl, font_leg, width - 110)
             for wl in w_lines[:2]:
-                draw.text((74, ly), wl, font=font_leg, fill=(235, 242, 255, 255))
+                draw.text((74, ly), wl, font=font_leg, fill=(235, 242, 255, alpha_l))
                 ly += 33
             ly += 12
             if ly > height - 45:
@@ -1501,23 +1633,29 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
         font_step = _load_font(26, bold=True)
         font_num = _load_font(24, bold=True)
         palette = [accent, (16, 185, 129), accent_alt, (139, 92, 246), (244, 63, 94)]
+        active_step = min(n_steps - 1, int(anim_p * n_steps))
         for i, st in enumerate(steps):
+            step_p = max(0.0, min(1.0, (anim_p * (n_steps + 0.4)) - i * 0.75))
+            if step_p <= 0.02:
+                break
             col = palette[i % len(palette)]
-            draw.rounded_rectangle([36, curr_y, width - 36, curr_y + box_h], radius=16, fill=(24, 36, 68, 245), outline=col + (235,), width=3)
-            draw.ellipse([54, curr_y + (box_h - 44) // 2, 98, curr_y + (box_h + 44) // 2], fill=col + (255,))
-            draw.text((69, curr_y + (box_h - 30) // 2), str(i + 1), font=font_num, fill=(15, 23, 42, 255))
+            is_curr = (i == active_step and anim_p < 0.96)
+            a_box = int(245 * step_p)
+            outline_col = (255, 255, 255, 255) if is_curr else (col + (int(235 * step_p),))
+            draw.rounded_rectangle([36, curr_y, width - 36, curr_y + box_h], radius=16, fill=(24, 36, 68, a_box), outline=outline_col, width=4 if is_curr else 3)
+            draw.ellipse([54, curr_y + (box_h - 44) // 2, 98, curr_y + (box_h + 44) // 2], fill=col + (int(255 * step_p),))
+            draw.text((69, curr_y + (box_h - 30) // 2), str(i + 1), font=font_num, fill=(15, 23, 42, int(255 * step_p)))
             s_lines = _wrap_text(draw, st, font_step, width - 170)
             ty = curr_y + (box_h - len(s_lines[:2]) * 30) // 2
             for sl in s_lines[:2]:
-                draw.text((116, ty), sl, font=font_step, fill=(255, 255, 255, 255))
+                draw.text((116, ty), sl, font=font_step, fill=(255, 255, 255, int(255 * step_p)))
                 ty += 30
-            if i < n_steps - 1:
+            if i < n_steps - 1 and step_p > 0.6:
                 cx = width // 2
-                draw.line([(cx, curr_y + box_h), (cx, curr_y + box_h + 16)], fill=accent_alt + (255,), width=4)
+                draw.line([(cx, curr_y + box_h), (cx, curr_y + box_h + 16)], fill=accent_alt + (int(255 * step_p),), width=4)
             curr_y += box_h + 18
         return card
 
-    # Default: Horizontal Animated-Style Data Bar Chart
     if not labels:
         labels = ["Core Efficiency", "Retention Rate", "Accuracy Benchmark", "Practical Impact"]
         vals = [92.0, 84.0, 96.0, 78.0]
@@ -1533,15 +1671,17 @@ def render_data_chart_or_formula_card(chart_data, width, height, theme, slide_ti
 
     for idx, lbl in enumerate(labels[:5]):
         v = vals[idx]
-        ratio = max(0.12, min(1.0, abs(v) / max_v))
+        bar_ease = max(0.08, min(1.0, (anim_p * 1.35) - idx * 0.14))
+        bar_ease = math.sin(bar_ease * math.pi * 0.5)
+        ratio = max(0.10, min(1.0, abs(v) / max_v)) * bar_ease
         b_col = bar_colors[idx % len(bar_colors)]
-        val_str = f"{v:g}{unit}" if unit else f"{v:g}"
+        shown_v = v * bar_ease
+        val_str = f"{shown_v:.0f}{unit}" if unit else f"{shown_v:.0f}"
 
         draw.text((40, curr_y), lbl[:34], font=font_lbl, fill=(241, 245, 249, 255))
         draw.text((width - 145, curr_y), val_str[:10], font=font_val, fill=accent_alt + (255,))
         curr_y += 36
 
-        # Track background + filled metric bar
         draw.rounded_rectangle([40, curr_y, 40 + max_bar_w, curr_y + 34], radius=12, fill=(30, 41, 59, 255))
         fill_w = max(28, int(max_bar_w * ratio))
         draw.rounded_rectangle([40, curr_y, 40 + fill_w, curr_y + 34], radius=12, fill=b_col + (255,))
@@ -1866,27 +2006,46 @@ def _draw_broadcast_branding_overlays(
     slide_title,
     presenter_name="",
     channel_name="",
-    theme=None
+    theme=None,
+    curr_mode="studio_lipsync",
+    avatar_rect=None
 ):
     """
-    Renders four high-retention broadcast television graphics onto `frame_bgr`:
+    Renders four high-retention broadcast television graphics onto `frame_bgr` while
+    strictly respecting `avatar_rect` when `curr_mode == 'studio_lipsync'` so text
+    or banners NEVER cover the presenter's face or body:
       1. Sleek Intro Title Badge during the first 2.6 seconds of Block 1
       2. Animated Slide-Out Lower-Third Teacher Nameplate (t = 1.2s .. 7.8s in Block 1)
       3. Periodic Big-Font Lesson Title / Topic Reminder Banner shown 3 TIMES across the
-         video (~18%, ~52%, and ~84% of total video duration, for ~4.5s each) to remind
-         viewers of the overarching subject being discussed!
-      4. Branded YouTube Outro End-Screen Call-To-Action Banner during the final 3.6s of the last block
+         video (~18%, ~52%, and ~84% of total video duration) placed strictly inside the
+         Concept Card column when the avatar is on screen!
+      4. Dynamic Multi-Variant Animated YouTube Call-To-Action Banner (LIKE • COMMENT • SHARE • SUBSCRIBE)
+         during the final 4.2s of the last block
     """
     H, W = frame_bgr.shape[:2]
     accent = (theme or {}).get("accent", (56, 189, 248))
     accent_alt = (theme or {}).get("accent_alt", (250, 204, 21))
+    presenter_side = (theme or {}).get("presenter_side", "left")
+    avatar_showing = (curr_mode == "studio_lipsync") and (W >= H)
+
+    # Safe horizontal zone away from avatar when avatar is showing in 16:9 Studio mode
+    if avatar_showing:
+        if presenter_side == "right":
+            # Avatar is at x=1176..1856 -> keep banners in left Concept Card zone x=64..1136
+            safe_x1, safe_x2 = 68, 1132
+        else:
+            # Avatar is at x=64..744 -> keep banners in right Concept Card zone x=784..1856
+            safe_x1, safe_x2 = 788, 1852
+    else:
+        safe_x1, safe_x2 = 64, W - 64
+
+    safe_w = max(320, safe_x2 - safe_x1)
 
     show_intro = (block_idx == 0 and t_local < 2.4)
     show_lower_third = (block_idx == 0 and 1.2 <= t_local <= 7.8 and (presenter_name or channel_name))
     time_remaining = max(0.0, total_video_dur - t_global)
-    show_outro = (block_idx == total_blocks - 1 and time_remaining <= 3.6)
+    show_outro = (block_idx == total_blocks - 1 and time_remaining <= 4.2)
 
-    # Check if current global timestamp falls inside one of the 3 Big-Font Topic Reminder windows (~18%, ~52%, ~84%)
     dur_safe = max(12.0, float(total_video_dur))
     half_win = min(2.25, max(1.1, dur_safe * 0.06))
     reminder_centers = [dur_safe * 0.18, dur_safe * 0.52, dur_safe * 0.84]
@@ -1897,7 +2056,6 @@ def _draw_broadcast_branding_overlays(
             dist = abs(t_global - c_sec)
             if dist <= half_win:
                 active_reminder_idx = r_idx
-                # Smooth ease-in / ease-out envelope at edges of the 4.5s window
                 edge_dist = half_win - dist
                 reminder_prog = min(1.0, max(0.0, edge_dist / min(0.55, half_win * 0.35)))
                 break
@@ -1911,6 +2069,7 @@ def _draw_broadcast_branding_overlays(
     draw = ImageDraw.Draw(pil_img, "RGBA")
 
     # 1. Animated Lower-Third Presenter Nameplate (t = 1.2s .. 7.8s)
+    # Placed inside the safe Concept Card zone (or bottom desk strip) so it never covers the avatar face
     if show_lower_third:
         if t_local < 1.8:
             prog = (t_local - 1.2) / 0.6
@@ -1919,87 +2078,330 @@ def _draw_broadcast_branding_overlays(
         else:
             prog = 1.0
         ease = math.sin(prog * math.pi * 0.5)
-        box_w = min(W - 80, 620)
-        x_left = int(-box_w + (box_w + 68) * ease)
-        y_bot = H - 148 if W >= H else H - 280
-        y_top = y_bot - 108
+        box_w = min(safe_w - 24, 580)
+        x_left = safe_x1 + int((1.0 - ease) * 40)
+        y_bot = 898 if W >= H else H - 280
+        y_top = y_bot - 96
 
-        draw.rounded_rectangle([x_left, y_top, x_left + box_w, y_bot], radius=18, fill=(10, 16, 34, 238), outline=accent + (240,), width=3)
-        draw.rounded_rectangle([x_left, y_top, x_left + 18, y_bot], radius=8, fill=accent_alt + (255,))
-        font_name = _load_font(31, bold=True)
-        font_role = _load_font(22, bold=True)
+        draw.rounded_rectangle([x_left, y_top, x_left + box_w, y_bot], radius=18, fill=(10, 16, 34, int(238 * ease)), outline=accent + (int(240 * ease),), width=3)
+        draw.rounded_rectangle([x_left, y_top, x_left + 16, y_bot], radius=8, fill=accent_alt + (int(255 * ease),))
+        font_name = _load_font(29, bold=True)
+        font_role = _load_font(20, bold=True)
         main_lbl = (presenter_name or channel_name or "Course Instructor").strip()
         sub_lbl = (channel_name if presenter_name and channel_name else (lesson_title or "Featured Masterclass")).strip()
-        draw.text((x_left + 34, y_top + 18), main_lbl[:34], font=font_name, fill=(255, 255, 255, 255))
-        draw.text((x_left + 34, y_top + 60), sub_lbl.upper()[:42], font=font_role, fill=accent_alt + (255,))
+        draw.text((x_left + 30, y_top + 14), main_lbl[:32], font=font_name, fill=(255, 255, 255, int(255 * ease)))
+        draw.text((x_left + 30, y_top + 54), sub_lbl.upper()[:38], font=font_role, fill=accent_alt + (int(255 * ease),))
 
-    # 2. Branded Intro Module Pill (first 2.4s of Block 1)
+    # 2. Branded Intro Module Pill (first 2.4s of Block 1) — strictly in safe_x1..safe_x2
     if show_intro:
         alpha_i = int(235 * min(1.0, (2.4 - t_local) / 0.6))
-        bw = min(W - 80, 740)
-        bx1 = (W - bw) // 2
+        bw = min(safe_w - 20, 720)
+        bx1 = safe_x1 + (safe_w - bw) // 2
         by1 = 92 if W >= H else 160
-        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + 64], radius=32, fill=(15, 23, 42, alpha_i), outline=accent_alt + (alpha_i,), width=3)
-        font_ib = _load_font(25, bold=True)
+        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + 60], radius=30, fill=(15, 23, 42, alpha_i), outline=accent_alt + (alpha_i,), width=3)
+        font_ib = _load_font(24, bold=True)
         ch_prefix = f"{channel_name.upper()}  •  " if channel_name else "OFFICIAL LESSON  •  "
-        draw.text((bx1 + 32, by1 + 17), f"{ch_prefix}{lesson_title[:36].upper()}", font=font_ib, fill=(255, 255, 255, alpha_i))
+        draw.text((bx1 + 28, by1 + 16), f"{ch_prefix}{lesson_title[:34].upper()}", font=font_ib, fill=(255, 255, 255, alpha_i))
 
-    # 3. Periodic Big-Font Lesson Title / Topic Reminder Banner (Shown 3 Times Across Video!)
+    # 3. Periodic Lesson Title / Topic Reminder Banner — strictly in safe_x1..safe_x2 when avatar is showing!
     if show_topic_reminder:
         ease_r = math.sin(reminder_prog * math.pi * 0.5)
         alpha_r = int(246 * ease_r)
-        bw = min(W - 88, 1380)
-        bh = 132 if W >= H else 156
-        bx1 = (W - bw) // 2
-        target_y = 92 if W >= H else 172
-        by1 = int(target_y - (1.0 - ease_r) * 36)
+        bw = min(safe_w - 16, 1040 if avatar_showing else 1340)
+        bh = 118 if W >= H else 148
+        bx1 = safe_x1 + (safe_w - bw) // 2
+        target_y = 780 if avatar_showing else (92 if W >= H else 172)
+        by1 = int(target_y + (1.0 - ease_r) * (24 if avatar_showing else -28))
 
-        # Deep broadcast glass banner with dual gold/cyan accent bars
         draw.rounded_rectangle(
             [bx1, by1, bx1 + bw, by1 + bh],
-            radius=24,
+            radius=22,
             fill=(8, 14, 30, alpha_r),
             outline=accent_alt + (alpha_r,),
-            width=4
+            width=3
         )
         draw.rounded_rectangle(
-            [bx1, by1, bx1 + 22, by1 + bh],
-            radius=10,
+            [bx1, by1, bx1 + 18, by1 + bh],
+            radius=9,
             fill=accent + (alpha_r,)
         )
 
-        # Top pill tag inside reminder card
-        font_tag_r = _load_font(22, bold=True)
-        tag_label = f"CURRENT TOPIC REMINDER ({active_reminder_idx + 1}/3)"
+        font_tag_r = _load_font(20, bold=True)
+        tag_label = f"TOPIC REMINDER ({active_reminder_idx + 1}/3)"
         if slide_title and slide_title.lower() != lesson_title.lower():
-            tag_label += f"   •   {slide_title.upper()[:38]}"
-        draw.text((bx1 + 42, by1 + 16), tag_label, font=font_tag_r, fill=accent_alt + (alpha_r,))
+            tag_label += f"  •  {slide_title.upper()[:32]}"
+        draw.text((bx1 + 34, by1 + 14), tag_label, font=font_tag_r, fill=accent_alt + (alpha_r,))
 
-        # Big-Font Overarching Video Title (46px bold)
-        font_big_title = _load_font(46 if W >= H else 38, bold=True)
+        font_big_title = _load_font(36 if avatar_showing else (42 if W >= H else 34), bold=True)
         clean_big_topic = (lesson_title or "Interactive Video Lesson").strip().upper()
-        wrapped_topic = _wrap_text(draw, clean_big_topic, font_big_title, bw - 76)
-        headline_str = wrapped_topic[0] if wrapped_topic else clean_big_topic[:42]
-        # Subtle drop shadow for maximum legibility
-        draw.text((bx1 + 45, by1 + 55), headline_str, font=font_big_title, fill=(0, 0, 0, alpha_r))
-        draw.text((bx1 + 42, by1 + 52), headline_str, font=font_big_title, fill=(255, 255, 255, alpha_r))
+        wrapped_topic = _wrap_text(draw, clean_big_topic, font_big_title, bw - 60)
+        headline_str = wrapped_topic[0] if wrapped_topic else clean_big_topic[:38]
+        draw.text((bx1 + 37, by1 + 49), headline_str, font=font_big_title, fill=(0, 0, 0, alpha_r))
+        draw.text((bx1 + 34, by1 + 46), headline_str, font=font_big_title, fill=(255, 255, 255, alpha_r))
 
-    # 4. YouTube Outro End-Screen Call-To-Action Banner (final 3.6s of last block)
+    # 4. Dynamic Multi-Variant Animated YouTube Call-To-Action Banner (final 4.2s of last block)
+    # Placed strictly inside safe_x1..safe_x2 when avatar is visible so it never touches the avatar!
     if show_outro:
-        prog_o = min(1.0, (3.6 - time_remaining) / 0.5)
-        alpha_o = int(242 * prog_o)
-        bw = min(W - 80, 920)
-        bx1 = (W - bw) // 2
-        by1 = H - 134 if W >= H else H - 240
-        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + 88], radius=22, fill=(12, 18, 38, alpha_o), outline=accent_alt + (alpha_o,), width=3)
-        draw.rounded_rectangle([bx1 + 20, by1 + 18, bx1 + 230, by1 + 70], radius=14, fill=(239, 68, 68, alpha_o))
-        font_sub = _load_font(25, bold=True)
-        font_cta = _load_font(27, bold=True)
-        draw.text((bx1 + 44, by1 + 30), "SUBSCRIBE", font=font_sub, fill=(255, 255, 255, alpha_o))
-        cta_msg = f"Thanks for watching {channel_name or 'this lesson'}! Like & Share for more."
-        draw.text((bx1 + 254, by1 + 28), cta_msg[:46], font=font_cta, fill=(255, 255, 255, alpha_o))
+        prog_o = min(1.0, (4.2 - time_remaining) / 0.55)
+        ease_o = math.sin(prog_o * math.pi * 0.5)
+        alpha_o = int(248 * ease_o)
+        bw = min(safe_w - 16, 1020)
+        bh = 104
+        bx1 = safe_x1 + (safe_w - bw) // 2
+        by1 = 796 if W >= H else H - 250
+
+        cta_seed = int(hashlib.md5(f"{lesson_title}|{channel_name}".encode("utf-8", errors="ignore")).hexdigest()[:6], 16)
+        cta_headlines = [
+            f"ENJOYED THIS LESSON ON {lesson_title[:24].upper()}? JOIN {channel_name.upper() or 'OUR COMMUNITY'}!",
+            f"FOUND THIS HELPFUL? SHARE WITH A COLLEAGUE & SUBSCRIBE FOR MORE!",
+            f"HAVE A QUESTION ON {lesson_title[:26].upper()}? DROP A COMMENT BELOW!",
+            f"DON'T MISS THE NEXT MASTERCLASS — LIKE, SHARE & SUBSCRIBE TODAY!",
+        ]
+        cta_top_txt = cta_headlines[cta_seed % len(cta_headlines)]
+
+        draw.rounded_rectangle([bx1, by1, bx1 + bw, by1 + bh], radius=22, fill=(10, 16, 34, alpha_o), outline=accent_alt + (alpha_o,), width=3)
+        font_cta_top = _load_font(21, bold=True)
+        draw.text((bx1 + 26, by1 + 12), cta_top_txt[:64], font=font_cta_top, fill=accent_alt + (alpha_o,))
+
+        # 4 Animated Action Pill Badges: LIKE, COMMENT, SHARE, SUBSCRIBE
+        pills = [
+            ("👍 LIKE", (37, 99, 235)),
+            ("💬 COMMENT", (16, 185, 129)),
+            ("↗ SHARE", (139, 92, 246)),
+            ("🔔 SUBSCRIBE", (239, 68, 68)),
+        ]
+        active_pill = int((4.2 - time_remaining) * 2.2) % len(pills)
+        px_curr = bx1 + 24
+        py_pill = by1 + 44
+        pill_w = (bw - 48 - 36) // 4
+        font_pill = _load_font(22, bold=True)
+        for p_idx, (p_lbl, p_col) in enumerate(pills):
+            is_act = (p_idx == active_pill)
+            p_y_off = -3 if is_act else 0
+            out_c = (255, 255, 255, alpha_o) if is_act else (accent + (alpha_o,))
+            draw.rounded_rectangle(
+                [px_curr, py_pill + p_y_off, px_curr + pill_w, py_pill + 46 + p_y_off],
+                radius=12,
+                fill=p_col + (alpha_o,),
+                outline=out_c,
+                width=3 if is_act else 1
+            )
+            draw.text((px_curr + 22, py_pill + 10 + p_y_off), p_lbl, font=font_pill, fill=(255, 255, 255, alpha_o))
+            px_curr += pill_w + 12
 
     return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+
+
+def _render_animated_powerpoint_slide_step(
+    lesson_title,
+    slide_title,
+    slide_notes,
+    cf_pil_img,
+    block_idx=0,
+    total_blocks=1,
+    slide_num=1,
+    anim_progress=1.0,
+    anim_style="typewriter",
+    visual_template="broadcast_studio",
+    chart_data=None
+):
+    """
+    Renders an animated, broadcast-grade 1920x1080 PowerPoint Presentation Slide frame
+    for `anim_progress` in [0.0 .. 1.0].
+    Supported `anim_style` modes (automatically rotated across blocks & slides):
+      - 'typewriter'      : Live typing effect with glowing cursor `▍` on heading & bullet notes
+      - 'staggered_cards' : Numbered summary cards slide & fade in sequentially with active highlight
+      - 'focus_sweep'     : Clean executive deck where an active spotlight sweeps across each takeaway
+      - 'kinetic_chart'   : Animated growing bar/process/formula chart alongside staggered notes
+    All cards stay strictly within y=164..904 so bottom captions (y=930..1060) never overlap!
+    """
+    W, H = 1920, 1080
+    prog = max(0.0, min(1.0, float(anim_progress)))
+    theme = resolve_studio_template(visual_template, block_idx=block_idx)
+    accent = theme["accent"]
+    accent_alt = theme["accent_alt"]
+
+    theme_variant = block_idx + (0 if slide_num == 1 else 1)
+    use_dark = (theme_variant % 2 == 1) or (visual_template in ("ted_keynote", "academic_chalkboard", "cyber_stem_lab"))
+    bg_col = theme["slide_bg_dark"] if use_dark else theme["slide_bg_light"]
+    is_bg_dark = (int(bg_col[0]) + int(bg_col[1]) + int(bg_col[2])) < 380
+
+    card_col = (theme["card_bg"][0], theme["card_bg"][1], theme["card_bg"][2], 255) if is_bg_dark else (255, 255, 255, 255)
+    text_col = (255, 255, 255, 255) if is_bg_dark else (15, 23, 42, 255)
+    border_col = accent + (220,)
+
+    slide = Image.new("RGB", (W, H), bg_col)
+    draw = ImageDraw.Draw(slide, "RGBA")
+
+    # Top PowerPoint Header Banner (y=0..146) with animated progress bar
+    draw.rectangle([0, 0, W, 146], fill=theme["card_header_bg"])
+    draw.rectangle([0, 138, W, 146], fill=(30, 41, 59, 255))
+    prog_bar_w = int(W * max(0.06, min(1.0, prog)))
+    draw.rectangle([0, 138, prog_bar_w, 146], fill=accent + (255,))
+
+    font_course = _load_font(24, bold=True)
+    font_heading = _load_font(44, bold=True)
+    style_badge_map = {
+        "typewriter": "LIVE NOTES",
+        "staggered_cards": "KEY TAKEAWAYS",
+        "focus_sweep": "CONCEPT BREAKDOWN",
+        "kinetic_chart": "DATA & ANALYTICS",
+    }
+    mode_tag = style_badge_map.get(anim_style, "KEY SUMMARY")
+    draw.text(
+        (72, 18),
+        f"{lesson_title.upper()[:54]}   •   SLIDE {block_idx + 1}.{slide_num} ({mode_tag})",
+        font=font_course,
+        fill=accent_alt + (255,)
+    )
+
+    full_heading = (slide_title or lesson_title or f"Module {block_idx + 1}").strip()
+    if anim_style == "typewriter" and prog < 0.22:
+        h_frac = max(0.15, prog / 0.22)
+        h_chars = max(1, int(round(len(full_heading) * h_frac)))
+        shown_heading = full_heading[:h_chars] + " ▍"
+    else:
+        shown_heading = full_heading
+    draw.text((72, 56), shown_heading[:46], font=font_heading, fill=(255, 255, 255, 255))
+
+    img_on_left = (theme["slide_img_side"] == "left") if (slide_num == 1) else (theme["slide_img_side"] != "left")
+    if img_on_left:
+        img_card_x1, img_card_x2 = 64, 856
+        img_paste_x = 80
+        notes_card_x1, notes_card_x2 = 884, 1856
+    else:
+        notes_card_x1, notes_card_x2 = 64, 1036
+        img_card_x1, img_card_x2 = 1064, 1856
+        img_paste_x = 1080
+
+    notes_w = notes_card_x2 - notes_card_x1
+    card_top_y, card_bot_y = 166, 902  # Strictly above y=904 caption safe zone!
+
+    draw.rounded_rectangle([notes_card_x1, card_top_y, notes_card_x2, card_bot_y], radius=26, fill=card_col, outline=border_col, width=3)
+    font_sub = _load_font(26, bold=True)
+    draw.text(
+        (notes_card_x1 + 38, card_top_y + 24),
+        "KEY SUMMARY NOTES & TAKEAWAYS",
+        font=font_sub,
+        fill=accent_alt + (255,) if is_bg_dark else accent + (255,)
+    )
+    draw.line([notes_card_x1 + 38, card_top_y + 66, notes_card_x2 - 38, card_top_y + 66], fill=border_col, width=2)
+
+    notes_list = [str(n).strip() for n in (slide_notes or []) if str(n).strip()][:4]
+    if not notes_list:
+        notes_list = [full_heading]
+    n_items = len(notes_list)
+
+    font_bullet = _load_font(36, bold=True)
+    font_num = _load_font(27, bold=True)
+    curr_y = card_top_y + 88
+    badge_colors = [accent, (16, 185, 129), (245, 158, 11), (139, 92, 246)]
+
+    active_idx = min(n_items - 1, int(prog * n_items))
+
+    for i, clean in enumerate(notes_list):
+        b_col = badge_colors[i % len(badge_colors)]
+
+        # Compute per-bullet animation state based on anim_style
+        if anim_style == "typewriter":
+            # Distribute typing window across [0.12 .. 0.88]
+            t_start = 0.10 + (i / float(max(1, n_items))) * 0.72
+            t_span = 0.72 / float(max(1, n_items))
+            if prog < t_start:
+                continue
+            char_frac = min(1.0, (prog - t_start) / max(0.08, t_span))
+            vis_chars = max(1, int(round(len(clean) * char_frac)))
+            is_typing_now = (char_frac < 0.99)
+            display_text = clean[:vis_chars] + (" ▍" if is_typing_now else "")
+            item_alpha = 255
+            x_offset = 0
+            highlight_box = is_typing_now
+        elif anim_style == "staggered_cards":
+            t_start = 0.06 + (i / float(max(1, n_items))) * 0.64
+            if prog < t_start:
+                continue
+            local_p = min(1.0, (prog - t_start) / 0.22)
+            ease_p = math.sin(local_p * math.pi * 0.5)
+            display_text = clean
+            item_alpha = int(255 * ease_p)
+            x_offset = int((1.0 - ease_p) * 42)
+            highlight_box = (i == active_idx)
+        else:
+            # focus_sweep or kinetic_chart
+            local_p = min(1.0, max(0.0, (prog * (n_items + 0.5)) - i * 0.45))
+            if local_p <= 0.02:
+                continue
+            display_text = clean
+            item_alpha = int(255 * min(1.0, local_p * 1.5))
+            x_offset = 0
+            highlight_box = (i == active_idx)
+
+        wrapped = _wrap_text(draw, display_text, font_bullet, notes_w - 165)
+        wrapped = wrapped[:3]
+        row_h = max(72, len(wrapped) * 46 + 22)
+        if curr_y + row_h > card_bot_y - 18:
+            break
+
+        # Draw subtle card row background & active spotlight border
+        row_x1 = notes_card_x1 + 26 + x_offset
+        row_x2 = notes_card_x2 - 26
+        if highlight_box:
+            row_bg = (30, 48, 86, min(230, item_alpha)) if is_bg_dark else (239, 246, 255, min(240, item_alpha))
+            draw.rounded_rectangle(
+                [row_x1, curr_y - 6, row_x2, curr_y + row_h - 8],
+                radius=16,
+                fill=row_bg,
+                outline=accent_alt + (item_alpha,),
+                width=3
+            )
+        else:
+            row_bg = (20, 30, 56, min(145, item_alpha)) if is_bg_dark else (248, 250, 252, min(200, item_alpha))
+            draw.rounded_rectangle(
+                [row_x1, curr_y - 6, row_x2, curr_y + row_h - 8],
+                radius=14,
+                fill=row_bg
+            )
+
+        # Numbered badge
+        draw.rounded_rectangle(
+            [row_x1 + 14, curr_y + 4, row_x1 + 66, curr_y + 54],
+            radius=13,
+            fill=b_col + (item_alpha,)
+        )
+        draw.text((row_x1 + 31, curr_y + 11), str(i + 1), font=font_num, fill=(255, 255, 255, item_alpha))
+
+        t_col_alpha = (text_col[0], text_col[1], text_col[2], item_alpha)
+        ty = curr_y + 2
+        for line in wrapped:
+            draw.text((row_x1 + 84, ty), line, font=font_bullet, fill=t_col_alpha)
+            ty += 45
+
+        curr_y += row_h + 10
+
+    # High-Res Visual Illustration OR Animated Data Chart / Formula Card (760x704 at y=166..902)
+    draw.rounded_rectangle([img_card_x1, card_top_y, img_card_x2, card_bot_y], radius=26, fill=(15, 23, 42, 255), outline=accent + (225,), width=3)
+    target_w, target_h = 760, 704
+
+    if isinstance(chart_data, dict) and (chart_data.get("labels") or chart_data.get("formula")):
+        try:
+            chart_pil = render_data_chart_or_formula_card(
+                chart_data, target_w, target_h, theme, slide_title=slide_title, anim_progress=prog
+            )
+            mask = Image.new("L", (target_w, target_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, target_w, target_h], radius=20, fill=255)
+            slide.paste(chart_pil, (img_paste_x, card_top_y + 16), mask)
+        except Exception as e:
+            print(f"Animated chart card render note: {e}")
+    elif cf_pil_img is not None:
+        try:
+            mask = Image.new("L", (target_w, target_h), 0)
+            ImageDraw.Draw(mask).rounded_rectangle([0, 0, target_w, target_h], radius=20, fill=255)
+            slide.paste(cf_pil_img, (img_paste_x, card_top_y + 16), mask)
+        except Exception as e:
+            print(f"Slide image paste note: {e}")
+
+    img_box = (img_paste_x, card_top_y + 16, img_paste_x + target_w, card_top_y + 16 + target_h)
+    return cv2.cvtColor(np.array(slide), cv2.COLOR_RGB2BGR), img_box
 
 
 def render_powerpoint_slide_frame(
@@ -2017,107 +2419,39 @@ def render_powerpoint_slide_frame(
     chart_data=None
 ):
     """
-    Renders a dynamic, high-contrast 1920x1080 PowerPoint Presentation Slide with:
-      - Enlarged accessibility typography (40px bold bullets, 50px bold headers) for visually impaired learners
-      - Real Data Chart / Formula / Process Diagram rendering when `chart_data` is provided on Slide 2
-      - Template-specific color palette & left/right column swapping
-      - Returns (output_png, img_box_coords) so Ken-Burns zoom targets the exact illustration box
+    Renders a static 1920x1080 PowerPoint Presentation Slide PNG (backward compatible)
+    and returns (output_png, img_box_coords).
     """
-    W, H = 1920, 1080
-    theme = resolve_studio_template(visual_template, block_idx=block_idx)
-    accent = theme["accent"]
-    accent_alt = theme["accent_alt"]
-
-    use_dark = (theme_variant % 2 == 1) or (visual_template in ("ted_keynote", "academic_chalkboard", "cyber_stem_lab"))
-    bg_col = theme["slide_bg_dark"] if use_dark else theme["slide_bg_light"]
-    is_bg_dark = (int(bg_col[0]) + int(bg_col[1]) + int(bg_col[2])) < 380
-
-    card_col = (theme["card_bg"][0], theme["card_bg"][1], theme["card_bg"][2], 255) if is_bg_dark else (255, 255, 255, 255)
-    text_col = (255, 255, 255, 255) if is_bg_dark else (15, 23, 42, 255)
-    border_col = accent + (220,)
-
-    slide = Image.new("RGB", (W, H), bg_col)
-    draw = ImageDraw.Draw(slide, "RGBA")
-
-    # Top PowerPoint Header Banner (y=0..154) with enlarged accessibility text
-    draw.rectangle([0, 0, W, 154], fill=theme["card_header_bg"])
-    draw.rectangle([0, 145, W, 154], fill=accent + (255,))
-
-    font_course = _load_font(25, bold=True)
-    font_heading = _load_font(48, bold=True)
-    draw.text((72, 20), f"{lesson_title.upper()[:60]}   •   SLIDE {block_idx + 1} OF {total_blocks}", font=font_course, fill=accent_alt + (255,))
-    draw.text((72, 60), (slide_title or lesson_title)[:44], font=font_heading, fill=(255, 255, 255, 255))
-
-    img_on_left = (theme["slide_img_side"] == "left")
-    if img_on_left:
-        img_card_x1, img_card_x2 = 64, 856
-        img_paste_x = 80
-        notes_card_x1, notes_card_x2 = 884, 1856
-    else:
-        notes_card_x1, notes_card_x2 = 64, 1036
-        img_card_x1, img_card_x2 = 1064, 1856
-        img_paste_x = 1080
-
-    # Summarized Bullet Points Card (y=176..924)
-    draw.rounded_rectangle([notes_card_x1, 176, notes_card_x2, 924], radius=26, fill=card_col, outline=border_col, width=3)
-    font_sub = _load_font(28, bold=True)
-    draw.text((notes_card_x1 + 40, 204), "KEY SUMMARY NOTES & TAKEAWAYS", font=font_sub, fill=accent_alt + (255,) if is_bg_dark else accent + (255,))
-    draw.line([notes_card_x1 + 40, 248, notes_card_x2 - 40, 248], fill=border_col, width=2)
-
-    notes_list = [str(n).strip() for n in (slide_notes or []) if str(n).strip()]
-    if not reveal_all and len(notes_list) > 1:
-        notes_list = notes_list[:max(1, (len(notes_list) + 1) // 2)]
-
-    # Enlarged 40px bold bullet font for visually impaired learners
-    font_bullet = _load_font(39, bold=True)
-    font_num = _load_font(29, bold=True)
-    curr_y = 274
-    badge_colors = [accent, (16, 185, 129), (245, 158, 11), (139, 92, 246)]
-
-    for i, clean in enumerate(notes_list[:4]):
-        b_col = badge_colors[i % len(badge_colors)]
-        draw.rounded_rectangle([notes_card_x1 + 40, curr_y + 4, notes_card_x1 + 94, curr_y + 56], radius=14, fill=b_col + (255,))
-        draw.text((notes_card_x1 + 57, curr_y + 11), str(i + 1), font=font_num, fill=(255, 255, 255, 255))
-
-        wrapped = _wrap_text(draw, clean, font_bullet, 790)
-        for line in wrapped[:3]:
-            draw.text((notes_card_x1 + 114, curr_y + 2), line, font=font_bullet, fill=text_col)
-            curr_y += 50
-        curr_y += 26
-        if curr_y > 872:
-            break
-
-    # High-Res Visual Illustration OR Data Chart / Formula Card (760x716)
-    draw.rounded_rectangle([img_card_x1, 176, img_card_x2, 924], radius=26, fill=(15, 23, 42, 255), outline=accent + (225,), width=3)
-    target_w, target_h = 760, 716
-
-    if isinstance(chart_data, dict) and (chart_data.get("labels") or chart_data.get("formula")):
-        try:
-            chart_pil = render_data_chart_or_formula_card(chart_data, target_w, target_h, theme, slide_title=slide_title)
-            mask = Image.new("L", (target_w, target_h), 0)
-            ImageDraw.Draw(mask).rounded_rectangle([0, 0, target_w, target_h], radius=20, fill=255)
-            slide.paste(chart_pil, (img_paste_x, 192), mask)
-        except Exception as e:
-            print(f"Chart card render note: {e}")
-    elif cf_image_path and os.path.exists(cf_image_path):
+    cf_pil = None
+    if cf_image_path and os.path.exists(cf_image_path):
         try:
             ill = Image.open(cf_image_path).convert("RGB")
             iw, ih = ill.size
-            scale = max(target_w / float(iw), target_h / float(ih))
+            target_w, target_h = 760, 704
+            scale = max(target_w / float(max(1, iw)), target_h / float(max(1, ih)))
             nw, nh = int(iw * scale), int(ih * scale)
             ill = ill.resize((nw, nh), Image.Resampling.LANCZOS)
             left = (nw - target_w) // 2
             top = (nh - target_h) // 2
-            ill = ill.crop((left, top, left + target_w, top + target_h))
+            cf_pil = ill.crop((left, top, left + target_w, top + target_h))
+        except Exception:
+            cf_pil = None
 
-            mask = Image.new("L", (target_w, target_h), 0)
-            ImageDraw.Draw(mask).rounded_rectangle([0, 0, target_w, target_h], radius=20, fill=255)
-            slide.paste(ill, (img_paste_x, 192), mask)
-        except Exception as e:
-            print(f"Slide image paste note: {e}")
-
-    slide.save(output_png, "PNG")
-    return output_png, (img_paste_x, 192, img_paste_x + 760, 192 + 716)
+    slide_bgr, img_box = _render_animated_powerpoint_slide_step(
+        lesson_title=lesson_title,
+        slide_title=slide_title,
+        slide_notes=slide_notes,
+        cf_pil_img=cf_pil,
+        block_idx=block_idx,
+        total_blocks=total_blocks,
+        slide_num=2 if reveal_all else 1,
+        anim_progress=1.0 if reveal_all else 0.65,
+        anim_style="staggered_cards",
+        visual_template=visual_template,
+        chart_data=chart_data
+    )
+    cv2.imwrite(output_png, slide_bgr)
+    return output_png, img_box
 
 
 # ==============================================================================
@@ -2154,19 +2488,17 @@ def _build_broll_overlay_rgba(lesson_title, slide_title, note_text, block_idx, t
     draw.text((96, 33), f"LIVE VISUAL CLIP   •   SECTION {block_idx + 1} OF {total_blocks}", font=font_tag, fill=accent_alt + (255,))
     draw.text((96, 63), (slide_title or lesson_title)[:48], font=font_head, fill=(255, 255, 255, 255))
 
-    # Floating Key Note Callout Card with enlarged 38px bold font for visually impaired learners
+    # Floating Key Note Callout Card kept above y=900 so bottom captions never collide
     if note_text:
-        pip_pos = theme.get("pip_broll_pos", "bottom_right")
-        c_x1 = 410 if pip_pos == "bottom_left" else 64
-        c_x2 = 1650 if pip_pos == "bottom_left" else 1300
-        draw.rounded_rectangle([c_x1, 718, c_x2, 916], radius=22, fill=(10, 15, 30, 236), outline=accent + (230,), width=3)
-        draw.rounded_rectangle([c_x1, 718, c_x1 + 22, 916], radius=8, fill=accent_alt + (255,))
-        font_note = _load_font(37, bold=True)
+        c_x1, c_x2 = 64, 1380
+        draw.rounded_rectangle([c_x1, 718, c_x2, 898], radius=22, fill=(10, 15, 30, 236), outline=accent + (230,), width=3)
+        draw.rounded_rectangle([c_x1, 718, c_x1 + 22, 898], radius=8, fill=accent_alt + (255,))
+        font_note = _load_font(36, bold=True)
         lines = _wrap_text(draw, note_text, font_note, (c_x2 - c_x1) - 76)
-        y = 744
+        y = 740
         for line in lines[:3]:
             draw.text((c_x1 + 44, y), line, font=font_note, fill=(255, 255, 255, 255))
-            y += 49
+            y += 47
 
     ov_np = np.array(ov)
     rgb = ov_np[:, :, :3]
@@ -2177,24 +2509,9 @@ def _build_broll_overlay_rgba(lesson_title, slide_title, note_text, block_idx, t
 
 def _overlay_pip_presenter(canvas_bgr, presenter_frame_bgr, pos="bottom_right", border_rgb=(56, 189, 248)):
     """
-    Overlays a live Lip-Synced Teacher Picture-in-Picture (PiP) rounded card
-    onto PowerPoint Slides and B-Roll Clips at top_right, bottom_right, top_left, or bottom_left.
+    Disabled small bottom Picture-in-Picture presenter box so the lip-sync / avatar
+    never appears twice or as a small floating mouth at the bottom of the video.
     """
-    pip_w, pip_h = 250, 302
-    pip_img = cv2.resize(presenter_frame_bgr, (pip_w, pip_h), interpolation=cv2.INTER_AREA)
-
-    if pos == "top_right":
-        x0, y0 = 1920 - pip_w - 48, 162
-    elif pos == "top_left":
-        x0, y0 = 48, 162
-    elif pos == "bottom_left":
-        x0, y0 = 48, 1080 - pip_h - 148
-    else:
-        x0, y0 = 1920 - pip_w - 48, 1080 - pip_h - 148
-
-    border_bgr = (int(border_rgb[2]), int(border_rgb[1]), int(border_rgb[0]))
-    cv2.rectangle(canvas_bgr, (x0 - 4, y0 - 4), (x0 + pip_w + 4, y0 + pip_h + 4), border_bgr, 4, cv2.LINE_AA)
-    canvas_bgr[y0:y0 + pip_h, x0:x0 + pip_w] = pip_img
     return canvas_bgr
 
 
@@ -2218,24 +2535,9 @@ def _apply_organic_camera_breathing(frame_bgr, f_idx, fps=24):
 
 def _render_bokeh_particles(canvas_bgr, f_idx, fps=24):
     """
-    Adds subtle moving cinema bokeh light particles to B-roll video clips so they
-    look like dynamic motion footage rather than static images.
+    Returns clean, unblemished B-roll footage without artificial particle dots/specks.
     """
-    t = f_idx / float(fps)
-    overlay = canvas_bgr.copy()
-    H, W = canvas_bgr.shape[:2]
-    particles = [
-        (320, 280, 42, 0.35, 0.25, (248, 210, 120)),
-        (860, 480, 58, -0.28, 0.30, (255, 230, 160)),
-        (1420, 340, 36, 0.40, -0.22, (248, 189, 56)),
-        (1620, 620, 52, -0.32, -0.28, (200, 240, 255)),
-        (580, 680, 46, 0.25, -0.35, (255, 220, 140)),
-    ]
-    for idx, (bx, by, rad, vx, vy, col) in enumerate(particles):
-        px = int((bx + math.sin(t * vx * 2.0 + idx) * 140) % max(1, W))
-        py = int((by + math.cos(t * vy * 2.0 + idx) * 90) % max(1, H))
-        cv2.circle(overlay, (px, py), rad, col, -1, cv2.LINE_AA)
-    return cv2.addWeighted(overlay, 0.12, canvas_bgr, 0.88, 0.0)
+    return canvas_bgr
 
 
 def _compose_vertical_916_frame(widescreen_bgr, pres_bgr, lesson_title, slide_title, slide_notes, theme, block_idx, total_blocks):
@@ -2344,7 +2646,7 @@ def _compute_block_ckpt_r2_key(lesson_title, slide_title, block_idx, total_block
             wav_sz = os.path.getsize(audio_wav_path)
         except Exception:
             wav_sz = 0
-    sig = f"v762|{lesson_title}|{slide_title}|{block_idx}|{total_blocks}|{aspect_ratio}|{visual_template}|{wav_sz}|{suffix}"
+    sig = f"v763|{lesson_title}|{slide_title}|{block_idx}|{total_blocks}|{aspect_ratio}|{visual_template}|{wav_sz}|{suffix}"
     sig_hash = hashlib.md5(sig.encode("utf-8", errors="ignore")).hexdigest()[:16]
     return f"checkpoints/{sig_hash}/block_{block_idx}_{suffix}.mp4"
 
@@ -2446,7 +2748,7 @@ def render_dynamic_lesson_block(
         except Exception:
             pass
 
-    # 2. Build Studio Composite Background, PowerPoint Slide 1 & 2 (with optional Chart/Formula), and B-Roll Canvases
+    # 2. Build Studio Composite Background, Animated PowerPoint Slide Assets, and B-Roll Canvases
     presenter_w, presenter_h = 680, 820
     studio_bg_bgr, pres_slot_x, pres_slot_y = build_studio_Composite_background(
         raw_avatar_path=raw_avatar_path,
@@ -2462,38 +2764,29 @@ def render_dynamic_lesson_block(
     card_alpha = (rounded_card_mask.astype(np.float32) / 255.0)[..., None]
     base_slot = studio_bg_bgr[pres_slot_y:pres_slot_y + presenter_h, pres_slot_x:pres_slot_x + presenter_w].astype(np.float32)
 
-    p1_png = f"{output_mp4_path}.s1.png"
-    p2_png = f"{output_mp4_path}.s2.png"
-    _, slide_img_box = render_powerpoint_slide_frame(
-        lesson_title=lesson_title,
-        slide_title=slide_title,
-        slide_notes=slide_notes,
-        cf_image_path=img1,
-        raw_avatar_path=raw_avatar_path,
-        output_png=p1_png,
-        block_idx=block_idx,
-        total_blocks=total_blocks,
-        reveal_all=False,
-        theme_variant=block_idx,
-        visual_template=visual_template,
-        chart_data=None
-    )
-    render_powerpoint_slide_frame(
-        lesson_title=lesson_title,
-        slide_title=slide_title,
-        slide_notes=slide_notes,
-        cf_image_path=img3,
-        raw_avatar_path=raw_avatar_path,
-        output_png=p2_png,
-        block_idx=block_idx,
-        total_blocks=total_blocks,
-        reveal_all=True,
-        theme_variant=block_idx + 1,
-        visual_template=visual_template,
-        chart_data=chart_data
-    )
-    slide1_bgr = cv2.imread(p1_png)
-    slide2_bgr = cv2.imread(p2_png)
+    def _load_cropped_slide_pil(img_p):
+        if img_p and os.path.exists(img_p):
+            try:
+                ill = Image.open(img_p).convert("RGB")
+                iw, ih = ill.size
+                tw, th = 760, 704
+                sc = max(tw / float(max(1, iw)), th / float(max(1, ih)))
+                nw, nh = int(iw * sc), int(ih * sc)
+                ill = ill.resize((nw, nh), Image.Resampling.LANCZOS)
+                lx = (nw - tw) // 2
+                ly = (nh - th) // 2
+                return ill.crop((lx, ly, lx + tw, ly + th))
+            except Exception:
+                return None
+        return None
+
+    cf_slide_pil_1 = _load_cropped_slide_pil(img1)
+    cf_slide_pil_2 = _load_cropped_slide_pil(img3 or img1)
+
+    slide_anim_styles = ["typewriter", "staggered_cards", "focus_sweep"]
+    slide1_anim_style = slide_anim_styles[block_idx % len(slide_anim_styles)]
+    has_chart_dict = isinstance(chart_data, dict) and bool(chart_data.get("labels") or chart_data.get("formula"))
+    slide2_anim_style = "kinetic_chart" if has_chart_dict else slide_anim_styles[(block_idx + 1) % len(slide_anim_styles)]
 
     broll_canvas_1 = _prepare_broll_canvas(img2, 1920, 1080)
     broll_canvas_2 = _prepare_broll_canvas(img3, 1920, 1080)
@@ -2503,9 +2796,7 @@ def render_dynamic_lesson_block(
     broll_ov1_bgr, broll_ov1_a = _build_broll_overlay_rgba(lesson_title, slide_title, broll_note_1, block_idx, total_blocks, visual_template=visual_template)
     broll_ov2_bgr, broll_ov2_a = _build_broll_overlay_rgba(lesson_title, slide_title, broll_note_2, block_idx, total_blocks, visual_template=visual_template)
 
-    # Pre-multiply B-Roll overlay strips on active Y bands only (y=18..122 and y=714..920)
-    # so per-frame B-Roll compositing avoids allocating 100MB of full-screen float32 arrays!
-    broll_bands = [(18, 122), (714, 920)]
+    broll_bands = [(18, 122), (714, 902)]
     broll_ov1_strips = [
         (y1, y2, (broll_ov1_bgr[y1:y2] * broll_ov1_a[y1:y2]), (1.0 - broll_ov1_a[y1:y2]))
         for (y1, y2) in broll_bands
@@ -2522,17 +2813,14 @@ def render_dynamic_lesson_block(
     t_outro_window = min(26.0, max(7.0, D * 0.12))
     is_doc_mode = (visual_blueprint == "documentary_cinema" or visual_template == "documentary_split")
 
-    # Block-seeded choreography variation so multi-block videos are dynamic and never predictable
     pattern_id = (block_idx * 5 + total_blocks * 3) % 6
-    cut_jitter = ((block_idx * 17) % 9 - 4) * 0.015  # -0.06 .. +0.06 organic cut variation
+    cut_jitter = ((block_idx * 17) % 9 - 4) * 0.015
 
     def _get_mode_for_frame(f_idx):
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
         frac_local = t_local / max(1.0, block_dur_sec)
 
-        # Documentary Cinema Blueprint: prioritizes immersive full-screen B-roll & AI motion footage (~72%)
-        # interwoven with documentary data/archival cards and concise narrator anchor appearances
         if is_doc_mode:
             if block_idx == 0 and frac_local < 0.34:
                 return "studio_lipsync"
@@ -2600,47 +2888,55 @@ def render_dynamic_lesson_block(
             else:
                 return "studio_lipsync"
 
-        # 6 Distinct Non-Predictable Choreography Patterns for Standard & Long-Form Lessons
         c1 = max(0.18, min(0.34, 0.26 + cut_jitter))
         c2 = max(0.44, min(0.62, 0.53 - cut_jitter * 0.5))
         c3 = max(0.72, min(0.86, 0.79 + cut_jitter * 0.5))
 
         if pattern_id == 0:
-            # Visual Hook B-Roll -> Concept Slide -> Deep-Dive B-Roll -> Summary Slide
             if frac_local < c1: return "broll_1"
             elif frac_local < c2: return "slide_1"
             elif frac_local < c3: return "broll_2"
             else: return "slide_2"
         elif pattern_id == 1:
-            # Concept Slide -> Live B-Roll -> Studio Instructor -> Summary Slide
             if frac_local < c1: return "slide_1"
             elif frac_local < c2: return "broll_1"
             elif frac_local < c3: return "studio_lipsync"
             else: return "slide_2"
         elif pattern_id == 2:
-            # Studio Instructor Hook -> B-Roll 1 -> Slide 2 (with Chart/Notes) -> B-Roll 2
             if frac_local < 0.22: return "studio_lipsync"
             elif frac_local < 0.52: return "broll_1"
             elif frac_local < 0.78: return "slide_2"
             else: return "broll_2"
         elif pattern_id == 3:
-            # Dual Visual Immersion: B-Roll 1 -> Slide 1 -> B-Roll 2 -> Studio Anchor
             if frac_local < 0.30: return "broll_1"
             elif frac_local < 0.56: return "slide_1"
             elif frac_local < 0.82: return "broll_2"
             else: return "studio_lipsync"
         elif pattern_id == 4:
-            # Structured Breakdown: Slide 1 -> B-Roll 2 -> Slide 2 -> B-Roll 1
             if frac_local < c1: return "slide_1"
             elif frac_local < c2: return "broll_2"
             elif frac_local < c3: return "slide_2"
             else: return "broll_1"
         else:
-            # Documentary-Academic Hybrid: B-Roll 1 -> Studio Anchor -> B-Roll 2 -> Slide 2
             if frac_local < 0.28: return "broll_1"
             elif frac_local < 0.48: return "studio_lipsync"
             elif frac_local < 0.76: return "broll_2"
             else: return "slide_2"
+
+    modes = [_get_mode_for_frame(i) for i in range(num_frames)]
+
+    # Pre-compute segment start & length for each slide appearance so slide animations
+    # (typing effect, staggered card reveal, growing bar charts) progress from 0.0 -> 1.0
+    # across the exact duration of that slide scene!
+    slide_run_bounds = {}
+    run_start = 0
+    for idx_m in range(1, num_frames + 1):
+        if idx_m == num_frames or modes[idx_m] != modes[run_start]:
+            m_val = modes[run_start]
+            if m_val in ("slide_1", "slide_2"):
+                for k_f in range(run_start, idx_m):
+                    slide_run_bounds[k_f] = (run_start, max(1, idx_m - run_start))
+            run_start = idx_m
 
     last_broll_frame = {"broll_1": (-1, None), "broll_2": (-1, None)}
     last_slide_step = {"slide_1": (-1, None), "slide_2": (-1, None)}
@@ -2649,12 +2945,7 @@ def render_dynamic_lesson_block(
     def _render_single_mode_frame(mode_name, f_idx):
         prog = (f_idx % max(1, num_frames // 3)) / float(max(1, num_frames // 3))
         W, H = 1920, 1080
-        # 2-Camera Multi-Cam Close-Up Punch-In every alternating 5.5s window during speaking
         use_closeup_cam = ((f_idx // max(1, int(fps * 5.5))) % 2 == 1)
-        # In Documentary mode, keep 75% of cutaway frames 100% full-screen (PiP only on final 25%);
-        # in Standard mode, keep 55% of cutaway frames 100% full-screen (skipping avatar compute on those frames!)
-        pip_threshold = 0.75 if is_doc_mode else 0.55
-        show_pip_on_cutaway = is_vertical or (prog >= pip_threshold)
 
         if mode_name == "studio_lipsync":
             pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
@@ -2664,28 +2955,42 @@ def render_dynamic_lesson_block(
             wide_out = full_frame
 
         elif mode_name in ("slide_1", "slide_2"):
-            slide_step_idx = f_idx // 3
+            s_start, s_len = slide_run_bounds.get(f_idx, (0, max(1, num_frames // 3)))
+            scene_prog = max(0.0, min(1.0, (f_idx - s_start) / float(max(1, s_len - 1))))
+            # Quantize to 16 smooth animation steps per slide scene so typing & chart growth
+            # are fluid while caching rendered PIL slides across neighboring frames
+            anim_q = int(round(scene_prog * 16.0))
             s_cached_step, s_cached_img = last_slide_step.get(mode_name, (-1, None))
-            if s_cached_step == slide_step_idx and s_cached_img is not None:
-                base = s_cached_img.copy() if show_pip_on_cutaway else s_cached_img.copy()
+            if s_cached_step == anim_q and s_cached_img is not None:
+                base = s_cached_img.copy()
             else:
-                base = (slide1_bgr if mode_name == "slide_1" else slide2_bgr).copy()
-                ix1, iy1, ix2, iy2 = slide_img_box
-                iw, ih = ix2 - ix1, iy2 - iy1
-                zoom = (1.07 - 0.06 * prog) if (cam_dir % 2 == 1 and mode_name == "slide_2") else (1.0 + 0.07 * prog)
-                pan_x = (1.0 - zoom) * (iw * (0.45 + 0.10 * prog if cam_dir < 2 else 0.55 - 0.10 * prog))
-                pan_y = (1.0 - zoom) * (ih * 0.5)
-                sub_img = base[iy1:iy2, ix1:ix2]
-                M = np.float32([
-                    [zoom, 0.0, pan_x],
-                    [0.0, zoom, pan_y]
-                ])
-                base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-                last_slide_step[mode_name] = (slide_step_idx, base.copy())
-            pres_bgr = None
-            if show_pip_on_cutaway:
-                pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
-                base = _overlay_pip_presenter(base, pres_bgr, pos=pip_slide_pos, border_rgb=accent_rgb)
+                is_s2 = (mode_name == "slide_2")
+                base, slide_img_box = _render_animated_powerpoint_slide_step(
+                    lesson_title=lesson_title,
+                    slide_title=slide_title,
+                    slide_notes=slide_notes,
+                    cf_pil_img=cf_slide_pil_2 if is_s2 else cf_slide_pil_1,
+                    block_idx=block_idx,
+                    total_blocks=total_blocks,
+                    slide_num=2 if is_s2 else 1,
+                    anim_progress=anim_q / 16.0,
+                    anim_style=slide2_anim_style if is_s2 else slide1_anim_style,
+                    visual_template=visual_template,
+                    chart_data=chart_data if is_s2 else None
+                )
+                if not (is_s2 and has_chart_dict):
+                    ix1, iy1, ix2, iy2 = slide_img_box
+                    iw, ih = ix2 - ix1, iy2 - iy1
+                    zoom = (1.06 - 0.05 * scene_prog) if (cam_dir % 2 == 1 and is_s2) else (1.0 + 0.06 * scene_prog)
+                    pan_x = (1.0 - zoom) * (iw * (0.46 + 0.08 * scene_prog if cam_dir < 2 else 0.54 - 0.08 * scene_prog))
+                    pan_y = (1.0 - zoom) * (ih * 0.5)
+                    sub_img = base[iy1:iy2, ix1:ix2]
+                    M = np.float32([
+                        [zoom, 0.0, pan_x],
+                        [0.0, zoom, pan_y]
+                    ])
+                    base[iy1:iy2, ix1:ix2] = cv2.warpAffine(sub_img, M, (iw, ih), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
+                last_slide_step[mode_name] = (anim_q, base.copy())
             wide_out = base
 
         else:
@@ -2697,48 +3002,41 @@ def render_dynamic_lesson_block(
             cache_token = f_idx if has_vid_stream else (f_idx // 2)
             cached_idx, cached_img = last_broll_frame.get(mode_name, (-1, None))
             if cached_idx == cache_token and cached_img is not None:
-                comp = cached_img.copy() if show_pip_on_cutaway else cached_img.copy()
+                comp = cached_img.copy()
             else:
                 pexels_bgr = p_stream.read_frame() if has_vid_stream else None
                 if pexels_bgr is not None:
                     moved = pexels_bgr
                 else:
                     canvas = broll_canvas_2 if is_second else broll_canvas_1
-                    # Vary Ken-Burns camera trajectory by block & scene so motion is never repetitive
                     traj = (block_idx + (1 if is_second else 0)) % 4
                     if traj == 0:
-                        zoom = 1.02 + 0.12 * prog
-                        tx, ty = -24.0 * prog, -14.0 * prog
+                        zoom = 1.02 + 0.10 * prog
+                        tx, ty = -20.0 * prog, -12.0 * prog
                     elif traj == 1:
-                        zoom = 1.14 - 0.10 * prog
-                        tx, ty = 22.0 * (1.0 - prog), 12.0 * (1.0 - prog)
+                        zoom = 1.12 - 0.09 * prog
+                        tx, ty = 18.0 * (1.0 - prog), 10.0 * (1.0 - prog)
                     elif traj == 2:
-                        zoom = 1.05 + 0.09 * prog
-                        tx, ty = 26.0 * (prog - 0.5), -16.0 * prog
+                        zoom = 1.04 + 0.08 * prog
+                        tx, ty = 22.0 * (prog - 0.5), -14.0 * prog
                     else:
-                        zoom = 1.12 - 0.08 * prog
-                        tx, ty = -20.0 * (1.0 - prog), 15.0 * (prog - 0.5)
+                        zoom = 1.10 - 0.07 * prog
+                        tx, ty = -18.0 * (1.0 - prog), 12.0 * (prog - 0.5)
                     M = np.float32([
                         [zoom, 0.0, (1.0 - zoom) * (W * 0.5) + tx],
                         [0.0, zoom, (1.0 - zoom) * (H * 0.5) + ty]
                     ])
                     moved = cv2.warpAffine(canvas, M, (W, H), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT_101)
-                    moved = _render_bokeh_particles(moved, f_idx, fps=fps)
 
                 comp = moved.copy()
                 for (sy1, sy2, premul_bgr, inv_a) in ov_strips:
                     comp[sy1:sy2] = (comp[sy1:sy2].astype(np.float32) * inv_a + premul_bgr).astype(np.uint8)
                 last_broll_frame[mode_name] = (cache_token, comp.copy())
 
-            pres_bgr = None
-            if show_pip_on_cutaway:
-                pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
-                comp = _overlay_pip_presenter(comp, pres_bgr, pos=pip_broll_pos, border_rgb=accent_rgb)
             wide_out = comp
 
         if is_vertical:
-            if pres_bgr is None:
-                pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
+            pres_bgr = get_animated_presenter_frame(talk_state, f_idx, camera_closeup=use_closeup_cam)
             return _compose_vertical_916_frame(wide_out, pres_bgr, lesson_title, slide_title, slide_notes, theme, block_idx, total_blocks)
         return wide_out
 
@@ -2746,10 +3044,10 @@ def render_dynamic_lesson_block(
     fourcc = cv2.VideoWriter_fourcc(*"mp4v")
     writer = cv2.VideoWriter(silent_mp4, fourcc, float(fps), (out_w, out_h))
 
-    modes = [_get_mode_for_frame(i) for i in range(num_frames)]
     transition_len = 7
     tick_33 = max(1, num_frames // 3)
     tick_66 = max(2, (num_frames * 2) // 3)
+    avatar_rect_coords = (pres_slot_x, pres_slot_y, pres_slot_x + presenter_w, pres_slot_y + presenter_h)
 
     for f_idx in range(num_frames):
         curr_mode = modes[f_idx]
@@ -2768,13 +3066,11 @@ def render_dynamic_lesson_block(
                     prev_bgr = _render_single_mode_frame(prev_mode, f_idx)
                     frame_bgr = cv2.addWeighted(frame_bgr, alpha, prev_bgr, 1.0 - alpha, 0.0)
 
-        # Smooth 0.30s soft entrance fade at the start of every block (>0) for broadcast polish
         if block_idx > 0 and f_idx < 7:
             fade_a = (f_idx + 1) / 7.0
             dark_bg = np.full_like(frame_bgr, (15, 20, 34), dtype=np.uint8)
             frame_bgr = cv2.addWeighted(frame_bgr, fade_a, dark_bg, 1.0 - fade_a, 0.0)
 
-        # Apply Intro Title Badge, Animated Lower-Third Teacher Nameplate & YouTube Outro End-Screen
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
         frame_bgr = _draw_broadcast_branding_overlays(
@@ -2788,10 +3084,11 @@ def render_dynamic_lesson_block(
             slide_title=slide_title,
             presenter_name=presenter_name,
             channel_name=channel_name,
-            theme=theme
+            theme=theme,
+            curr_mode=curr_mode,
+            avatar_rect=avatar_rect_coords
         )
 
-        # Apply optional Brand Logo Watermark
         if logo_cache is not None:
             frame_bgr = _apply_brand_logo_to_frame_bgr(frame_bgr, logo_cache, pos=logo_position)
 
@@ -2813,14 +3110,13 @@ def render_dynamic_lesson_block(
     pexels_stream_1.close()
     pexels_stream_2.close()
 
-    # Release large per-block numpy buffers before running FFmpeg mux
     import gc
-    del talk_state, slide1_bgr, slide2_bgr, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame, last_slide_step
+    del talk_state, cf_slide_pil_1, cf_slide_pil_2, broll_canvas_1, broll_canvas_2, studio_bg_bgr, last_broll_frame, last_slide_step
     gc.collect()
 
     if callable(progress_cb):
         try:
-            progress_cb(0.92, "Encoding H.264 video stream & burning active karaoke captions...")
+            progress_cb(0.92, "Encoding H.264 broadcast video stream & burning captions...")
         except Exception:
             pass
 
@@ -2833,7 +3129,7 @@ def render_dynamic_lesson_block(
         ass_escaped = ass_subtitle_path.replace("\\", "/").replace(":", "\\:")
         mux_cmd += ["-vf", f"ass='{ass_escaped}'"]
     mux_cmd += [
-        "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23", "-pix_fmt", "yuv420p",
+        "-c:v", "libx264", "-preset", "veryfast", "-crf", "19", "-pix_fmt", "yuv420p",
         "-c:a", "aac", "-b:a", "192k", "-ac", "2", "-ar", "44100",
         "-shortest",
         output_mp4_path
@@ -2844,14 +3140,12 @@ def render_dynamic_lesson_block(
         import subprocess
         subprocess.run(mux_cmd, check=True)
 
-    for tmp in (silent_mp4, p1_png, p2_png):
-        if os.path.exists(tmp):
-            try:
-                os.remove(tmp)
-            except Exception:
-                pass
+    if os.path.exists(silent_mp4):
+        try:
+            os.remove(silent_mp4)
+        except Exception:
+            pass
 
-    # Upload completed block checkpoint to Cloudflare R2 in background so future resumes skip this block
     if caller_s3 and caller_bucket and ckpt_r2_key and os.path.exists(output_mp4_path):
         ckpt_copy_path = f"{output_mp4_path}.r2ckpt"
         try:
@@ -3006,13 +3300,12 @@ def _install_runtime_accelerators():
             _fast_tts_wrapper._ailg_r2_wrapped = True
             setattr(mod, "synthesize_block_audio_with_pauses", _fast_tts_wrapper)
 
-        # 2. Wrap synthesize_ai_subject_video_clip to skip redundant 2nd clip & skip when block is cached on R2
+        # 2. Replace synthesize_ai_subject_video_clip with clean, particle-free HD Ken-Burns motion
         orig_ai_clip = getattr(mod, "synthesize_ai_subject_video_clip", None)
         if callable(orig_ai_clip) and not getattr(orig_ai_clip, "_ailg_fast_wrapped", False):
-            def _fast_ai_clip_wrapper(*args, _orig=orig_ai_clip, **kwargs):
+            def _fast_ai_clip_wrapper(cf_images, output_mp4, subject_text="", duration_sec=8.0, fps=24, reverse_motion=False, block_seed=0, _orig=orig_ai_clip):
                 if _ACTIVE_BLOCK_CTX.get("block_cached"):
                     return None
-                reverse_motion = kwargs.get("reverse_motion", False)
                 try:
                     c_locals = sys._getframe(1).f_locals
                     total_blocks = int(c_locals.get("total_blocks", 1) or 1)
@@ -3022,14 +3315,195 @@ def _install_runtime_accelerators():
                             return existing_c1
                 except Exception:
                     pass
-                if "duration_sec" in kwargs:
-                    kwargs["duration_sec"] = min(float(kwargs["duration_sec"] or 5.0), 5.0)
-                return _orig(*args, **kwargs)
+
+                valid_imgs = []
+                for p in (cf_images or []):
+                    if p and os.path.exists(p):
+                        im = cv2.imread(p, cv2.IMREAD_COLOR)
+                        if im is not None and im.size > 0:
+                            valid_imgs.append(cv2.resize(im, (1280, 720), interpolation=cv2.INTER_LANCZOS4))
+                if not valid_imgs:
+                    return None
+                if reverse_motion and len(valid_imgs) > 1:
+                    valid_imgs = list(reversed(valid_imgs))
+
+                target_w, target_h = 1280, 720
+                dur_clean = min(float(duration_sec or 5.0), 5.0)
+                total_frames = max(48, int(round(dur_clean * fps)))
+                n_scenes = len(valid_imgs)
+
+                temp_raw_mp4 = output_mp4 + ".raw.mp4"
+                writer = cv2.VideoWriter(temp_raw_mp4, cv2.VideoWriter_fourcc(*"mp4v"), float(fps), (target_w, target_h))
+                if not writer.isOpened():
+                    return None
+
+                def _render_clean_cam(base_img, scene_idx, local_u):
+                    ease_u = 0.5 - 0.5 * math.cos(math.pi * max(0.0, min(1.0, local_u)))
+                    mode = (scene_idx + int(block_seed) + (2 if reverse_motion else 0)) % 6
+                    if mode == 0:
+                        zoom, cx, cy = 1.03 + 0.11 * ease_u, 0.48 + 0.04 * ease_u, 0.47 - 0.03 * ease_u
+                    elif mode == 1:
+                        zoom, cx, cy = 1.15 - 0.10 * ease_u, 0.52 - 0.05 * ease_u, 0.48 + 0.03 * ease_u
+                    elif mode == 2:
+                        zoom, cx, cy = 1.10, 0.44 + 0.12 * ease_u, 0.49 + 0.015 * math.sin(ease_u * math.pi)
+                    elif mode == 3:
+                        zoom, cx, cy = 1.06 + 0.06 * ease_u, 0.50 + 0.02 * math.cos(ease_u * math.pi), 0.54 - 0.09 * ease_u
+                    elif mode == 4:
+                        zoom, cx, cy = 1.04 + 0.09 * ease_u, 0.46 + 0.08 * ease_u, 0.45 + 0.07 * ease_u
+                    else:
+                        zoom, cx, cy = 1.06 + 0.07 * math.sin(ease_u * math.pi), 0.50 + 0.05 * math.sin(ease_u * math.pi), 0.50 - 0.04 * math.cos(ease_u * math.pi)
+                    crop_w = int(round(target_w / zoom))
+                    crop_h = int(round(target_h / zoom))
+                    x0 = max(0, min(target_w - crop_w, int(round(cx * target_w - crop_w * 0.5))))
+                    y0 = max(0, min(target_h - crop_h, int(round(cy * target_h - crop_h * 0.5))))
+                    cropped = base_img[y0:y0 + crop_h, x0:x0 + crop_w]
+                    return cv2.resize(cropped, (target_w, target_h), interpolation=cv2.INTER_LANCZOS4)
+
+                for f_idx in range(total_frames):
+                    pos = (f_idx / float(max(1, total_frames - 1))) * n_scenes
+                    s_idx = min(n_scenes - 1, int(pos))
+                    local_u = pos - s_idx
+                    frame = _render_clean_cam(valid_imgs[s_idx], s_idx, local_u)
+                    if s_idx < n_scenes - 1 and local_u > 0.78:
+                        alpha = (local_u - 0.78) / 0.22
+                        next_frame = _render_clean_cam(valid_imgs[s_idx + 1], s_idx + 1, 0.0)
+                        frame = cv2.addWeighted(frame, 1.0 - alpha, next_frame, alpha, 0)
+                    writer.write(frame)
+                writer.release()
+
+                run_ff = getattr(mod, "run_ffmpeg", None)
+                try:
+                    if callable(run_ff):
+                        run_ff(
+                            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset veryfast -crf 19 -pix_fmt yuv420p {output_mp4}",
+                            desc="Encode clean HD AI Subject Motion Video Clip"
+                        )
+                    if os.path.exists(temp_raw_mp4):
+                        os.remove(temp_raw_mp4)
+                except Exception:
+                    if os.path.exists(temp_raw_mp4):
+                        import shutil
+                        shutil.move(temp_raw_mp4, output_mp4)
+                return output_mp4 if (os.path.exists(output_mp4) and os.path.getsize(output_mp4) > 5000) else None
 
             _fast_ai_clip_wrapper._ailg_fast_wrapped = True
             setattr(mod, "synthesize_ai_subject_video_clip", _fast_ai_clip_wrapper)
 
-        # 3. Wrap burn_presentation_slides to use -preset ultrafast -crf 23 (3x faster encode)
+        # 3. Wrap create_synced_lyrics_ass to keep subtitles compact in bottom safe strip (Fontsize=44, MarginV=24)
+        orig_ass = getattr(mod, "create_synced_lyrics_ass", None)
+        if callable(orig_ass) and not getattr(orig_ass, "_ailg_safe_wrapped", False):
+            def _safe_ass_wrapper(*args, _orig=orig_ass, **kwargs):
+                res_tuple = _orig(*args, **kwargs)
+                try:
+                    sub_path = res_tuple[0] if isinstance(res_tuple, tuple) else res_tuple
+                    if sub_path and os.path.exists(sub_path):
+                        with open(sub_path, "r", encoding="utf-8") as f:
+                            content = f.read()
+                        content = content.replace("Liberation Sans,54,", "Liberation Sans,44,")
+                        content = content.replace(",72,72,44,1", ",120,120,24,1")
+                        with open(sub_path, "w", encoding="utf-8") as f:
+                            f.write(content)
+                except Exception:
+                    pass
+                return res_tuple
+
+            _safe_ass_wrapper._ailg_safe_wrapped = True
+            setattr(mod, "create_synced_lyrics_ass", _safe_ass_wrapper)
+
+        # 4. Wrap build_youtube_seo_package to generate comprehensive SEO-friendly YouTube Description, Chapters & Tags
+        orig_seo = getattr(mod, "build_youtube_seo_package", None)
+        if callable(orig_seo) and not getattr(orig_seo, "_ailg_seo_wrapped", False):
+            def _rich_seo_wrapper(lesson_title, synthesized_blocks, presenter_name="", channel_name="", _orig=orig_seo):
+                fmt_ts = getattr(mod, "_format_youtube_chapter_ts", None)
+                chapters = []
+                keywords_bag = []
+                module_summaries = []
+                summary_bullets = []
+                for idx, item in enumerate(synthesized_blocks or []):
+                    st_sec = float(item.get("start_sec", 0.0) or 0.0)
+                    if idx == 0:
+                        ts_str = "00:00"
+                    elif callable(fmt_ts):
+                        ts_str = fmt_ts(st_sec)
+                    else:
+                        m_i, s_i = int(st_sec // 60), int(st_sec % 60)
+                        ts_str = f"{m_i:02d}:{s_i:02d}"
+                    stitle = str(item.get("slide_title") or f"Section {idx + 1}").strip()
+                    chapters.append(f"{ts_str} - {stitle}")
+                    notes = [str(n).strip() for n in (item.get("notes") or []) if str(n).strip()]
+                    if notes:
+                        summary_bullets.append(f"✅ {stitle}: {notes[0]}")
+                        module_summaries.append(f"• Module {idx + 1} ({stitle}): " + "; ".join(notes[:3]))
+                    for w in re.findall(r'[A-Za-z]{4,}', stitle + " " + " ".join(notes[:2])):
+                        wl = w.lower()
+                        if wl not in keywords_bag and wl not in ("section", "module", "slide", "lesson", "introduction", "conclusion", "with", "from", "that", "this", "your", "have", "will", "what", "when", "where", "into", "about"):
+                            keywords_bag.append(wl)
+
+                chapters_text = "\n".join(chapters) if chapters else "00:00 - Introduction & Overview"
+                clean_title = str(lesson_title or "Complete Educational Masterclass").strip()
+                seo_title = clean_title if len(clean_title) >= 42 else f"{clean_title} | Complete Step-by-Step Video Lesson & Guide"
+                seo_title = seo_title[:98]
+
+                ch_line = f"Presented by {presenter_name}" if presenter_name else (f"Published by {channel_name}" if channel_name else "Remedial Corner Educational Studio")
+                top_kws = [k.title() for k in keywords_bag[:6]]
+                kw_phrase = ", ".join(top_kws) if top_kws else clean_title
+
+                hashtags = ["#" + re.sub(r'[^A-Za-z0-9]', '', w.title()) for w in ([clean_title] + top_kws[:5]) if re.sub(r'[^A-Za-z0-9]', '', w)]
+                hashtags = list(dict.fromkeys(hashtags + ["#Education", "#OnlineLearning", "#VideoLesson", "#Masterclass"]))[:8]
+                hashtags_line = " ".join(hashtags)
+
+                tags_list = [
+                    clean_title,
+                    f"{clean_title} Explained",
+                    f"{clean_title} Tutorial",
+                    f"{clean_title} Guide",
+                    "Video Lesson",
+                    "Online Course",
+                    "Educational Masterclass",
+                    "Step by Step Guide",
+                ]
+                if channel_name:
+                    tags_list.append(channel_name)
+                if presenter_name:
+                    tags_list.append(presenter_name)
+                for kw in keywords_bag[:14]:
+                    if kw.title() not in tags_list:
+                        tags_list.append(kw.title())
+                tags_list = tags_list[:20]
+                tags_csv = ", ".join(tags_list)
+
+                full_description = (
+                    f"🎓 {seo_title}\n"
+                    f"In this comprehensive, step-by-step video lesson on {clean_title}, we break down the essential principles, real-world applications, and key exam & practical takeaways covering {kw_phrase}. ({ch_line})\n\n"
+                    f"📖 WHAT YOU WILL LEARN IN THIS VIDEO:\n"
+                    + ("\n".join(summary_bullets[:8]) if summary_bullets else f"✅ Core concepts, practical examples, and complete breakdown of {clean_title}")
+                    + "\n\n⏱️ YOUTUBE CHAPTER TIMESTAMPS (Click to Jump to Any Topic):\n"
+                    + chapters_text
+                    + "\n\n📚 DETAILED LESSON MODULE BREAKDOWN:\n"
+                    + ("\n".join(module_summaries[:8]) if module_summaries else f"• Complete walkthrough of {clean_title}")
+                    + f"\n\n💬 JOIN THE DISCUSSION:\n"
+                    f"Which concept from today's lesson on {clean_title} stood out to you the most, or what topic would you like us to cover next? Drop your thoughts and questions in the comments below—we read and reply to every comment!\n\n"
+                    f"🔔 SUPPORT THE CHANNEL:\n"
+                    f"If this lesson helped clarify {clean_title}, please hit the 👍 LIKE button, ↗ SHARE this video with a classmate or colleague, and 🔔 SUBSCRIBE (with notifications turned on) so you never miss our upcoming educational masterclasses!\n\n"
+                    f"🔖 TAGS & KEYWORDS:\n{tags_csv}\n\n"
+                    f"{hashtags_line}\n"
+                )
+
+                return {
+                    "title": seo_title,
+                    "primary_title": seo_title,
+                    "chapters_text": chapters_text,
+                    "full_description": full_description,
+                    "description": full_description,
+                    "tags": tags_csv,
+                    "tags_list": tags_list,
+                    "hashtags": hashtags,
+                }
+
+            _rich_seo_wrapper._ailg_seo_wrapped = True
+            setattr(mod, "build_youtube_seo_package", _rich_seo_wrapper)
+
+        # 5. Wrap burn_presentation_slides to use -preset veryfast -crf 19 (crisp HD broadcast quality)
         orig_burn = getattr(mod, "burn_presentation_slides", None)
         if callable(orig_burn) and not getattr(orig_burn, "_ailg_fast_wrapped", False):
             def _fast_burn_wrapper(video_path, ass_path, output_path, duration_sec=10, aspect_ratio="16:9", _orig=orig_burn):
@@ -3037,12 +3511,12 @@ def _install_runtime_accelerators():
                 cmd = [
                     "ffmpeg", "-y", "-i", video_path,
                     "-vf", f"ass='{ass_escaped}'",
-                    "-c:v", "libx264", "-preset", "ultrafast", "-crf", "23",
+                    "-c:v", "libx264", "-preset", "veryfast", "-crf", "19",
                     "-c:a", "copy", output_path
                 ]
                 run_ff = getattr(mod, "run_ffmpeg", None)
                 if callable(run_ff):
-                    run_ff(cmd, desc="Fast burn captions")
+                    run_ff(cmd, desc="Crisp HD burn captions")
                     return output_path
                 return _orig(video_path, ass_path, output_path, duration_sec=duration_sec, aspect_ratio=aspect_ratio)
 

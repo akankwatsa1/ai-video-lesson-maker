@@ -1469,38 +1469,6 @@ def synthesize_ai_subject_video_clip(
             map_y = np.clip(sub_gy + dy, water_top, target_h - 1).astype(np.float32)
             frame[water_top:, :] = cv2.remap(frame, map_x, map_y, interpolation=cv2.INTER_LINEAR, borderMode=cv2.BORDER_REFLECT)
 
-        # Sphere Motion Layer 2: Drifting High-Altitude Mountain Mist / Clouds (for Mountains/Geography)
-        overlay = frame.copy()
-        if is_mountain_geo:
-            for m_i in range(4):
-                cloud_x = int(((0.22 * m_i + t_sec * (0.035 + 0.01 * m_i)) % 1.25 - 0.12) * target_w)
-                cloud_y = int((0.24 + 0.11 * m_i + 0.02 * math.sin(t_sec + m_i)) * target_h)
-                cv2.ellipse(overlay, (cloud_x, cloud_y), (220, 48), 0, 0, 360, (245, 248, 255), -1, cv2.LINE_AA)
-            frame = cv2.addWeighted(frame, 0.90, overlay, 0.10, 0)
-            overlay = frame.copy()
-
-        # Sphere Motion Layer 3: Particles (Chem vapor / Agri golden sunlight motes / Atmospheric dust)
-        for p_i in range(num_particles):
-            if is_mountain_geo or is_agri_scene:
-                # Gently drifting horizontal/diagonal organic breeze particles
-                cur_x = (p_x[p_i] + t_sec * p_speed[p_i] * 0.45) % 0.92 + 0.04
-                cur_y = p_y[p_i] + 0.02 * math.sin(t_sec * 1.8 + p_i)
-            else:
-                cur_y = (p_y[p_i] - t_sec * p_speed[p_i]) % 0.85 + 0.08
-                cur_x = p_x[p_i] + 0.015 * math.sin(t_sec * 2.4 + p_i)
-            px = int(cur_x * target_w)
-            py = int(cur_y * target_h)
-            rad = int(p_radius[p_i])
-            if is_chem_scene:
-                cv2.circle(overlay, (px, py), rad, (245, 235, 210), -1, cv2.LINE_AA)
-                cv2.circle(overlay, (px, py), rad + 2, (255, 255, 255), 1, cv2.LINE_AA)
-            elif is_agri_scene:
-                # Warm golden harvest sun-motes (BGR: 130, 215, 255)
-                cv2.circle(overlay, (px, py), max(2, rad - 1), (130, 215, 255), -1, cv2.LINE_AA)
-            else:
-                cv2.circle(overlay, (px, py), max(2, rad - 2), (180, 235, 255), -1, cv2.LINE_AA)
-        frame = cv2.addWeighted(frame, 0.86, overlay, 0.14, 0)
-
         if vignette_mask is not None:
             frame = (frame.astype(np.float32) * vignette_mask).astype(np.uint8)
 
@@ -1509,7 +1477,7 @@ def synthesize_ai_subject_video_clip(
     writer.release()
     try:
         run_ffmpeg(
-            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset ultrafast -crf 23 -pix_fmt yuv420p {output_mp4}",
+            f"ffmpeg -y -i {temp_raw_mp4} -c:v libx264 -preset veryfast -crf 19 -pix_fmt yuv420p {output_mp4}",
             desc="Encode synthesized AI Subject Motion Video Clip"
         )
         if os.path.exists(temp_raw_mp4):
@@ -1798,51 +1766,87 @@ def _format_youtube_chapter_ts(seconds):
 def build_youtube_seo_package(lesson_title, synthesized_blocks, presenter_name="", channel_name=""):
     """
     Computes exact MM:SS YouTube Chapter Timestamps from the actual rendered block
-    audio durations, plus a ready-to-paste YouTube SEO Description & Comma-Separated Tags.
+    audio durations, plus a rich, automated SEO-Friendly YouTube Description,
+    Module Breakdown, Hashtags, and Comma-Separated Tags for hands-free publishing.
     Always begins with 00:00 as required by YouTube automatic chapters.
     """
     chapters = []
     keywords_bag = []
+    summary_bullets = []
+    module_summaries = []
 
-    for idx, item in enumerate(synthesized_blocks):
+    for idx, item in enumerate(synthesized_blocks or []):
         ts_str = "00:00" if idx == 0 else _format_youtube_chapter_ts(item.get("start_sec", 0.0))
         stitle = str(item.get("slide_title") or f"Section {idx + 1}").strip()
         chapters.append(f"{ts_str} - {stitle}")
-        for w in re.findall(r'[A-Za-z]{4,}', stitle):
+        notes = [str(n).strip() for n in (item.get("notes") or []) if str(n).strip()]
+        if notes:
+            summary_bullets.append(f"✅ {stitle}: {notes[0]}")
+            module_summaries.append(f"• Module {idx + 1} ({stitle}): " + "; ".join(notes[:3]))
+        for w in re.findall(r'[A-Za-z]{4,}', stitle + " " + " ".join(notes[:2])):
             wl = w.lower()
-            if wl not in keywords_bag and wl not in ("section", "module", "slide", "lesson", "introduction", "conclusion"):
+            if wl not in keywords_bag and wl not in ("section", "module", "slide", "lesson", "introduction", "conclusion", "with", "from", "that", "this", "your", "have", "will", "what", "when", "where", "into", "about"):
                 keywords_bag.append(wl)
 
-    chapters_text = "\n".join(chapters)
-    ch_line = f"Presented by {presenter_name}" if presenter_name else (f"Published by {channel_name}" if channel_name else "Complete Interactive Video Masterclass")
-    summary_bullets = []
-    for item in synthesized_blocks[:6]:
-        notes = item.get("notes") or []
-        if notes:
-            summary_bullets.append(f"• {notes[0]}")
+    chapters_text = "\n".join(chapters) if chapters else "00:00 - Introduction & Overview"
+    clean_title = str(lesson_title or "Complete Educational Masterclass").strip()
+    seo_title = clean_title if len(clean_title) >= 42 else f"{clean_title} | Complete Step-by-Step Video Lesson & Guide"
+    seo_title = seo_title[:98]
 
-    tags_list = [lesson_title, "Video Lesson", "Online Course", "Educational Masterclass"]
+    ch_line = f"Presented by {presenter_name}" if presenter_name else (f"Published by {channel_name}" if channel_name else "Remedial Corner Educational Studio")
+    top_kws = [k.title() for k in keywords_bag[:6]]
+    kw_phrase = ", ".join(top_kws) if top_kws else clean_title
+
+    hashtags = ["#" + re.sub(r'[^A-Za-z0-9]', '', w.title()) for w in ([clean_title] + top_kws[:5]) if re.sub(r'[^A-Za-z0-9]', '', w)]
+    hashtags = list(dict.fromkeys(hashtags + ["#Education", "#OnlineLearning", "#VideoLesson", "#Masterclass"]))[:8]
+    hashtags_line = " ".join(hashtags)
+
+    tags_list = [
+        clean_title,
+        f"{clean_title} Explained",
+        f"{clean_title} Tutorial",
+        f"{clean_title} Guide",
+        "Video Lesson",
+        "Online Course",
+        "Educational Masterclass",
+        "Step by Step Guide",
+    ]
     if channel_name:
         tags_list.append(channel_name)
-    for kw in keywords_bag[:12]:
-        tags_list.append(kw.title())
-    tags_csv = ", ".join(tags_list[:16])
+    if presenter_name:
+        tags_list.append(presenter_name)
+    for kw in keywords_bag[:14]:
+        if kw.title() not in tags_list:
+            tags_list.append(kw.title())
+    tags_list = tags_list[:20]
+    tags_csv = ", ".join(tags_list)
 
     full_description = (
-        f"🎓 {lesson_title.upper()}\n"
-        f"{ch_line}\n\n"
-        f"📌 KEY TAKEAWAYS IN THIS LESSON:\n"
-        + ("\n".join(summary_bullets) if summary_bullets else f"• Comprehensive walkthrough of {lesson_title}")
-        + "\n\n⏱️ YOUTUBE CHAPTER TIMESTAMPS:\n"
+        f"🎓 {seo_title}\n"
+        f"In this comprehensive, step-by-step video lesson on {clean_title}, we break down the essential principles, real-world applications, and key exam & practical takeaways covering {kw_phrase}. ({ch_line})\n\n"
+        f"📖 WHAT YOU WILL LEARN IN THIS VIDEO:\n"
+        + ("\n".join(summary_bullets[:8]) if summary_bullets else f"✅ Core concepts, practical examples, and complete breakdown of {clean_title}")
+        + "\n\n⏱️ YOUTUBE CHAPTER TIMESTAMPS (Click to Jump to Any Topic):\n"
         + chapters_text
-        + f"\n\n🔖 TAGS:\n{tags_csv}\n"
+        + "\n\n📚 DETAILED LESSON MODULE BREAKDOWN:\n"
+        + ("\n".join(module_summaries[:8]) if module_summaries else f"• Complete walkthrough of {clean_title}")
+        + f"\n\n💬 JOIN THE DISCUSSION:\n"
+        f"Which concept from today's lesson on {clean_title} stood out to you the most, or what topic would you like us to cover next? Drop your thoughts and questions in the comments below—we read and reply to every comment!\n\n"
+        f"🔔 SUPPORT THE CHANNEL:\n"
+        f"If this lesson helped clarify {clean_title}, please hit the 👍 LIKE button, ↗ SHARE this video with a classmate or colleague, and 🔔 SUBSCRIBE (with notifications turned on) so you never miss our upcoming educational masterclasses!\n\n"
+        f"🔖 TAGS & KEYWORDS:\n{tags_csv}\n\n"
+        f"{hashtags_line}\n"
     )
 
     return {
-        "title": lesson_title,
+        "title": seo_title,
+        "primary_title": seo_title,
         "chapters_text": chapters_text,
         "full_description": full_description,
+        "description": full_description,
         "tags": tags_csv,
+        "tags_list": tags_list,
+        "hashtags": hashtags,
     }
 
 
@@ -1961,9 +1965,11 @@ def create_synced_lyrics_ass(
     is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
     mode_clean = str(caption_mode or "full_karaoke").strip().lower()
     res_x, res_y = (1080, 1920) if is_vertical else (1920, 1080)
-    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=6 if is_vertical else 7)
+    phrases = _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=6)
 
-    margin_v = 115 if is_vertical else 44
+    margin_v = 115 if is_vertical else 24
+    font_sz = 52 if is_vertical else 44
+    margin_lr = 72 if is_vertical else 120
     ass_header = (
         "[Script Info]\n"
         "ScriptType: v4.00+\n"
@@ -1972,8 +1978,8 @@ def create_synced_lyrics_ass(
         "WrapStyle: 1\n\n"
         "[V4+ Styles]\n"
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, Alignment, MarginL, MarginR, MarginV, Encoding\n"
-        f"Style: LyricBottom,Liberation Sans,54,&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,72,72,{margin_v},1\n"
-        f"Style: LyricAlt,Liberation Sans,54,&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.8,2.6,2,72,72,{margin_v},1\n\n"
+        f"Style: LyricBottom,Liberation Sans,{font_sz},&H0015CCFA,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.2,2.2,2,{margin_lr},{margin_lr},{margin_v},1\n"
+        f"Style: LyricAlt,Liberation Sans,{font_sz},&H00F8BD38,&H00FFFFFF,&H00080C18,&HB4080E1A,-1,0,0,0,100,100,0.6,0,1,4.2,2.2,2,{margin_lr},{margin_lr},{margin_v},1\n\n"
         "[Events]\n"
         "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text\n"
     )
@@ -2027,7 +2033,7 @@ def burn_presentation_slides(input_video, subtitle_file, final_output):
         '-i', input_video,
         '-vf', f"subtitles={subtitle_file}",
         '-c:a', 'copy',
-        '-c:v', 'libx264', '-preset', 'veryfast', '-pix_fmt', 'yuv420p',
+        '-c:v', 'libx264', '-preset', 'veryfast', '-crf', '19', '-pix_fmt', 'yuv420p',
         final_output
     ]
     run_ffmpeg(cmd, desc="Burn synchronized active-karaoke captions")
@@ -2076,10 +2082,14 @@ def publish_video_to_youtube_cloud(
     if not access_token or not os.path.exists(video_path):
         return None
 
-    title_str = str((youtube_seo or {}).get("title") or "AI Video Lesson").strip()[:98]
-    desc_str = str((youtube_seo or {}).get("full_description") or "").strip()[:4900]
-    raw_tags = str((youtube_seo or {}).get("tags") or "").split(",")
-    tags_list = [t.strip() for t in raw_tags if t.strip()][:15]
+    seo_dict = youtube_seo if isinstance(youtube_seo, dict) else {}
+    title_str = str(seo_dict.get("title") or seo_dict.get("primary_title") or "AI Video Lesson").strip()[:98]
+    desc_str = str(seo_dict.get("full_description") or seo_dict.get("description") or "").strip()[:4900]
+    if isinstance(seo_dict.get("tags_list"), list):
+        tags_list = [str(t).strip() for t in seo_dict["tags_list"] if str(t).strip()][:20]
+    else:
+        raw_tags = str(seo_dict.get("tags") or "").split(",")
+        tags_list = [t.strip() for t in raw_tags if t.strip()][:20]
     priv = str(privacy_status or youtube_oauth.get("privacy_status") or "public").strip().lower()
     publish_at = str(youtube_oauth.get("publish_at") or "").strip()
 
