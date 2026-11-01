@@ -706,6 +706,86 @@ def boost_and_normalize_speech_wav(audio_path, volume_val=1.3):
         print(f"Speech loudness normalization note ({norm_err})")
 
 
+def synthesize_verbal_cue_wav(cue_type, out_path, sr=24000):
+    """
+    Acoustically synthesizes expressive, broadcast-grade human vocal gestures:
+      - 'laughter' / 'laugh': 4 melodic descending glottal vowel pulses with formant harmonics and breath aspiration
+      - 'chuckle': 2 intimate, warm chuckling pulses
+      - 'sigh': natural, falling chest resonance with warm breath exhalation
+      - 'gasp': sharp inward breath intake of surprise
+      - 'breath': subtle, gentle breath pause before speaking
+    """
+    cue = (cue_type or "laughter").strip().lower()
+    if cue in ("laughter", "laugh"):
+        dur = 0.85
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        audio = np.zeros_like(t)
+        pulse_starts = [0.03, 0.22, 0.42, 0.62]
+        pitches = [340, 310, 280, 250]
+        pulse_len = 0.14
+        p_samples = int(sr * pulse_len)
+        tp = np.linspace(0, pulse_len, p_samples, endpoint=False)
+        for p_idx, (p_start, f0) in enumerate(zip(pulse_starts, pitches)):
+            s_idx = int(p_start * sr)
+            e_idx = min(len(audio), s_idx + p_samples)
+            actual_len = e_idx - s_idx
+            if actual_len <= 0:
+                continue
+            cur_tp = tp[:actual_len]
+            tone = 0.5 * np.sin(2 * np.pi * f0 * cur_tp)
+            tone += 0.3 * np.sin(2 * np.pi * (f0 * 2.1) * cur_tp)
+            tone += 0.15 * np.sin(2 * np.pi * 850 * cur_tp)
+            noise = (np.random.rand(actual_len) * 2.0 - 1.0) * 0.20
+            env = np.sin(np.pi * np.linspace(0, 1, actual_len)) ** 1.6
+            pulse = (tone + noise) * env * (0.85 ** p_idx)
+            audio[s_idx:e_idx] += pulse
+    elif cue == "chuckle":
+        dur = 0.50
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        audio = np.zeros_like(t)
+        pulse_starts = [0.05, 0.25]
+        pitches = [230, 205]
+        pulse_len = 0.15
+        p_samples = int(sr * pulse_len)
+        tp = np.linspace(0, pulse_len, p_samples, endpoint=False)
+        for p_idx, (p_start, f0) in enumerate(zip(pulse_starts, pitches)):
+            s_idx = int(p_start * sr)
+            e_idx = min(len(audio), s_idx + p_samples)
+            actual_len = e_idx - s_idx
+            if actual_len <= 0:
+                continue
+            cur_tp = tp[:actual_len]
+            tone = 0.45 * np.sin(2 * np.pi * f0 * cur_tp) + 0.25 * np.sin(2 * np.pi * (f0 * 1.9) * cur_tp)
+            noise = (np.random.rand(actual_len) * 2.0 - 1.0) * 0.15
+            env = np.sin(np.pi * np.linspace(0, 1, actual_len)) ** 2.0
+            audio[s_idx:e_idx] += (tone + noise) * env * 0.7
+    elif cue == "sigh":
+        dur = 0.85
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        f0_curve = 150 * (1.0 - 0.4 * (t / dur))
+        murmur = 0.15 * np.sin(2 * np.pi * f0_curve * t) * (1.0 - t / dur)
+        noise = (np.random.rand(len(t)) * 2.0 - 1.0)
+        env = np.sin(np.pi * (t / dur)) ** 1.5
+        audio = (murmur + noise * 0.25) * env * 0.65
+    elif cue == "gasp":
+        dur = 0.38
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        noise = (np.random.rand(len(t)) * 2.0 - 1.0)
+        env = (t / dur) ** 2.2 * (1.0 - (t / dur) ** 16)
+        audio = noise * env * 0.75
+    else:  # breath
+        dur = 0.26
+        t = np.linspace(0, dur, int(sr * dur), endpoint=False)
+        noise = (np.random.rand(len(t)) * 2.0 - 1.0)
+        env = np.sin(np.pi * (t / dur)) ** 2.0
+        audio = noise * env * 0.35
+
+    max_amp = np.max(np.abs(audio)) if len(audio) > 0 else 0
+    if max_amp > 1e-4:
+        audio = (audio / max_amp) * 0.68
+    sf.write(out_path, audio.astype(np.float32), sr, subtype="PCM_16")
+
+
 def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style="normal"):
     filters = []
     style = (voice_style or "normal").strip().lower()
@@ -720,6 +800,18 @@ def apply_vocal_modulation(audio_path, whisper_mode, speed_val, pitch_val, volum
     elif style == "energetic":
         # Crisp, articulate broadcast punch
         filters.append("highpass=f=85,equalizer=f=2400:t=q:w=1.2:g=2.6,equalizer=f=4200:t=q:w=1.5:g=1.8")
+    elif style == "cheerful":
+        # Uplifting, bright, joyful presence with open upper midrange and presence sheen
+        filters.append("highpass=f=90,equalizer=f=450:t=q:w=1.2:g=1.5,equalizer=f=3500:t=q:w=1.4:g=3.0,equalizer=f=6000:t=q:w=1.5:g=1.8")
+    elif style in ("sad", "somber", "reflective"):
+        # Intimate, somber, lower-frequency weighted with gentle roll-off of high harshness
+        filters.append("lowpass=f=5000,highpass=f=70,equalizer=f=190:t=q:w=1.2:g=2.8,equalizer=f=3200:t=q:w=1.2:g=-3.2")
+    elif style in ("authoritative", "baritone"):
+        # Executive authority, powerful sub/chest fundamental
+        filters.append("highpass=f=55,equalizer=f=120:t=q:w=1.0:g=4.2,equalizer=f=2400:t=q:w=1.3:g=1.8")
+    elif style in ("enthusiastic", "vibrant"):
+        # Vibrant high projection
+        filters.append("highpass=f=110,equalizer=f=3800:t=q:w=1.5:g=3.5,equalizer=f=8000:t=q:w=1.2:g=2.0")
 
     if abs(pitch_val - 1.0) >= 0.01:
         new_rate = int(24000 * pitch_val)
@@ -764,11 +856,12 @@ def synthesize_block_audio_with_pauses(
     volume_val=1.3,
     voice_style="normal"
 ):
-    # For documentary or storyteller styles, if the script has multiple sentences without explicit [pause] tags,
-    # inject subtle natural dramatic micro-pauses (0.35s) after key transition sentences for authentic documentary cadence
     proc_text = str(text or "")
     style = (voice_style or "normal").strip().lower()
-    if style in ("documentary", "storyteller") and "[pause" not in proc_text.lower():
+
+    # For documentary or storyteller styles, if the script has multiple sentences without explicit tags,
+    # inject subtle natural dramatic micro-pauses (0.35s) after key transition sentences
+    if style in ("documentary", "storyteller") and not re.search(r'\[(?:pause|laughter|laugh|chuckle|sigh|gasp|breath)', proc_text, re.IGNORECASE):
         sents = re.split(r'(?<=[.!?])\s+', proc_text.strip())
         if len(sents) >= 3:
             merged = []
@@ -778,8 +871,15 @@ def synthesize_block_audio_with_pauses(
                     merged.append("[pause 0.35s]")
             proc_text = " ".join(merged)
 
-    parts = re.split(r'\[pause\s+([0-9\.]+)\s*s?\]', proc_text, flags=re.IGNORECASE)
-    if len(parts) <= 1:
+    # Tokenizer pattern matching verbal cues, pauses, and styled emotion spans
+    pattern = re.compile(
+        r'\[(whisper|sad|somber|reflective|cheerful|documentary|storyteller|energetic|authoritative|baritone|enthusiastic|vibrant|slow|fast)\](.*?)\[\/\1\]'
+        r'|\[pause\s+([0-9\.]+)\s*s?\]'
+        r'|\[(laughter|laugh|chuckle|sigh|gasp|breath)\]',
+        flags=re.IGNORECASE | re.DOTALL
+    )
+
+    if not pattern.search(proc_text):
         _synthesize_single_segment(
             proc_text.strip(), output_wav, tts_engine, target_lang, edge_voice,
             omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
@@ -787,28 +887,80 @@ def synthesize_block_audio_with_pauses(
         apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
         return
 
-    temp_clips = []
-    for idx, part in enumerate(parts):
-        if idx % 2 == 1:
+    segments = []
+    last_idx = 0
+    for match in pattern.finditer(proc_text):
+        start, end = match.span()
+        if start > last_idx:
+            before = proc_text[last_idx:start].strip()
+            if before:
+                segments.append(('text', before, style))
+        g_span_style, g_span_text, g_pause_sec, g_cue = match.groups()
+        if g_span_style:
+            segments.append(('text', g_span_text.strip(), g_span_style.lower()))
+        elif g_pause_sec:
             try:
-                duration = max(0.1, min(5.0, float(part)))
-            except ValueError:
-                duration = 0.5
-            silence_wav = f"{workspace}/silence_{idx}_{uuid.uuid4().hex[:6]}.wav"
+                p_dur = max(0.1, min(5.0, float(g_pause_sec)))
+            except Exception:
+                p_dur = 0.5
+            segments.append(('pause', p_dur, None))
+        elif g_cue:
+            segments.append(('cue', g_cue.lower(), None))
+        last_idx = end
+
+    if last_idx < len(proc_text):
+        remaining = proc_text[last_idx:].strip()
+        if remaining:
+            segments.append(('text', remaining, style))
+
+    if not segments:
+        _synthesize_single_segment(
+            ".", output_wav, tts_engine, target_lang, edge_voice,
+            omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
+        )
+        return
+
+    temp_clips = []
+    for s_idx, (stype, sval, sstyle) in enumerate(segments):
+        if stype == 'pause':
+            silence_wav = f"{workspace}/silence_{s_idx}_{uuid.uuid4().hex[:6]}.wav"
             run_ffmpeg(
-                f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono:d={duration} -c:a pcm_s16le {silence_wav}",
+                f"ffmpeg -y -f lavfi -i anullsrc=r=24000:cl=mono:d={sval} -c:a pcm_s16le {silence_wav}",
                 desc="Pause silence generation"
             )
             temp_clips.append(silence_wav)
-        else:
-            clean_text = part.strip()
-            if clean_text:
-                seg_wav = f"{workspace}/seg_{idx}_{uuid.uuid4().hex[:6]}.wav"
-                _synthesize_single_segment(
-                    clean_text, seg_wav, tts_engine, target_lang, edge_voice,
-                    omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
-                )
-                temp_clips.append(seg_wav)
+        elif stype == 'cue':
+            cue_wav = f"{workspace}/cue_{s_idx}_{uuid.uuid4().hex[:6]}.wav"
+            synthesize_verbal_cue_wav(sval, cue_wav, sr=24000)
+            temp_clips.append(cue_wav)
+        elif stype == 'text':
+            clean_s = sval.strip()
+            if not clean_s:
+                continue
+            seg_wav = f"{workspace}/seg_{s_idx}_{uuid.uuid4().hex[:6]}.wav"
+            _synthesize_single_segment(
+                clean_s, seg_wav, tts_engine, target_lang, edge_voice,
+                omnivoice_prompt, moss_ref_codes, ref_voice_path, voice_ref_text
+            )
+            eff_seg_style = sstyle or style
+            seg_whisper = (eff_seg_style == 'whisper') or whisper_mode
+            if eff_seg_style == 'slow':
+                seg_speed = speed_val * 0.84
+            elif eff_seg_style == 'fast':
+                seg_speed = speed_val * 1.18
+            else:
+                seg_speed = speed_val
+
+            apply_vocal_modulation(
+                seg_wav,
+                whisper_mode=seg_whisper,
+                speed_val=seg_speed,
+                pitch_val=pitch_val,
+                volume_val=volume_val,
+                workspace=workspace,
+                voice_style=eff_seg_style
+            )
+            temp_clips.append(seg_wav)
 
     if not temp_clips:
         _synthesize_single_segment(
@@ -822,7 +974,7 @@ def synthesize_block_audio_with_pauses(
             if os.path.exists(c):
                 try: os.remove(c)
                 except Exception: pass
-        apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
+        boost_and_normalize_speech_wav(output_wav, volume_val=volume_val)
         return
 
     seg_list = f"{workspace}/seg_concat_{uuid.uuid4().hex[:6]}.txt"
@@ -839,7 +991,7 @@ def synthesize_block_audio_with_pauses(
                 os.remove(c)
             except Exception:
                 pass
-    apply_vocal_modulation(output_wav, whisper_mode, speed_val, pitch_val, volume_val, workspace, voice_style=style)
+    boost_and_normalize_speech_wav(output_wav, volume_val=volume_val)
 
 
 def get_background_soundtrack(bg_preset, workspace):
@@ -1747,7 +1899,14 @@ def _format_ass_timestamp(seconds):
 
 
 def _split_script_into_lyric_phrases(spoken_text, max_words_per_phrase=8):
-    clean = re.sub(r'\[pause\s+[0-9\.]+\s*s?\]', ' ', str(spoken_text or ''), flags=re.IGNORECASE)
+    raw_str = str(spoken_text or '')
+    # Strip span emotion tags but keep inner words: e.g. [whisper]hello[/whisper] -> hello
+    clean = re.sub(r'\[\/?(?:whisper|sad|somber|reflective|cheerful|documentary|storyteller|energetic|authoritative|baritone|enthusiastic|vibrant|slow|fast)\]', ' ', raw_str, flags=re.IGNORECASE)
+    # Strip pause and verbal cue tags: e.g. [pause 1s], [laughter], [chuckle], [sigh], [gasp], [breath]
+    clean = re.sub(r'\[(?:pause|laughter|laugh|chuckle|sigh|gasp|breath)[^\]]*\]', ' ', clean, flags=re.IGNORECASE)
+    # Strip any remaining bracketed tags or URLs
+    clean = re.sub(r'\[[^\]]*\]', ' ', clean)
+    clean = re.sub(r'https?://\S+', ' ', clean)
     clean = re.sub(r'\s+', ' ', clean).strip()
     if not clean:
         return []
@@ -2557,6 +2716,24 @@ def handler(job):
                 else:
                     blk_speed = global_speed
 
+                blk_pitch_raw = block.get('pitch')
+                if blk_pitch_raw is not None and str(blk_pitch_raw).strip() not in ('', 'default', 'null', 'None'):
+                    try:
+                        eff_pitch = float(blk_pitch_raw)
+                    except Exception:
+                        eff_pitch = global_pitch
+                else:
+                    eff_pitch = global_pitch
+
+                blk_vol_raw = block.get('volume')
+                if blk_vol_raw is not None and str(blk_vol_raw).strip() not in ('', 'default', 'null', 'None'):
+                    try:
+                        eff_volume = float(blk_vol_raw)
+                    except Exception:
+                        eff_volume = global_volume
+                else:
+                    eff_volume = global_volume
+
                 synthesize_block_audio_with_pauses(
                     text=text,
                     output_wav=output_wav,
@@ -2570,8 +2747,8 @@ def handler(job):
                     workspace=workspace,
                     whisper_mode=blk_whisper,
                     speed_val=blk_speed,
-                    pitch_val=global_pitch,
-                    volume_val=global_volume,
+                    pitch_val=eff_pitch,
+                    volume_val=eff_volume,
                     voice_style=eff_style
                 )
 
