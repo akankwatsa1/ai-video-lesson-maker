@@ -2309,9 +2309,9 @@ def _render_animated_powerpoint_slide_step(
 
         # Compute per-bullet animation state based on anim_style
         if anim_style == "typewriter":
-            # Distribute typing window across [0.12 .. 0.88]
-            t_start = 0.10 + (i / float(max(1, n_items))) * 0.72
-            t_span = 0.72 / float(max(1, n_items))
+            # Distribute typing window across the full slide scene [0.05 .. 0.93]
+            t_start = 0.05 + (i / float(max(1, n_items))) * 0.88
+            t_span = 0.88 / float(max(1, n_items))
             if prog < t_start:
                 continue
             char_frac = min(1.0, (prog - t_start) / max(0.08, t_span))
@@ -2320,12 +2320,12 @@ def _render_animated_powerpoint_slide_step(
             display_text = clean[:vis_chars] + (" ▍" if is_typing_now else "")
             item_alpha = 255
             x_offset = 0
-            highlight_box = is_typing_now
+            highlight_box = (i == active_idx or is_typing_now)
         elif anim_style == "staggered_cards":
-            t_start = 0.06 + (i / float(max(1, n_items))) * 0.64
+            t_start = 0.04 + (i / float(max(1, n_items))) * 0.80
             if prog < t_start:
                 continue
-            local_p = min(1.0, (prog - t_start) / 0.22)
+            local_p = min(1.0, (prog - t_start) / 0.18)
             ease_p = math.sin(local_p * math.pi * 0.5)
             display_text = clean
             item_alpha = int(255 * ease_p)
@@ -3148,6 +3148,18 @@ def render_dynamic_lesson_block(
         t_local = f_idx / float(fps)
         t_global = block_start_sec + t_local
         frac_local = t_local / max(1.0, block_dur_sec)
+
+        # Explicit user-selected scene layouts from Step 2 Timeline Editor
+        if flag_type == "slides":
+            # PowerPoint presentation view:
+            # Transition from slide 1 to slide 2 at the midpoint if charts or multi-notes exist
+            if has_chart_dict or len(slide_notes or []) > 2:
+                return "slide_1" if frac_local < 0.50 else "slide_2"
+            return "slide_1"
+        elif flag_type == "teacher_lipsync":
+            return "studio_lipsync"
+        elif flag_type == "b_roll":
+            return "broll_1" if frac_local < 0.50 else "broll_2"
 
         if is_doc_mode:
             if block_idx == 0 and frac_local < 0.34:

@@ -21,6 +21,7 @@ import requests
 import subprocess
 import boto3
 from botocore.config import Config
+from boto3.s3.transfer import TransferConfig
 import time
 import soundfile as sf
 import edge_tts
@@ -233,8 +234,120 @@ def build_s3_client(access_key, secret_key, endpoint_url):
         aws_access_key_id=access_key.strip(),
         aws_secret_access_key=secret_key.strip(),
         region_name='auto',
-        config=Config(signature_version='s3v4', s3={'addressing_style': 'path'})
+        config=Config(
+            signature_version='s3v4',
+            s3={'addressing_style': 'path'},
+            connect_timeout=120,
+            read_timeout=600,
+            retries={'max_attempts': 10, 'mode': 'adaptive'}
+        )
     )
+
+def robust_s3_upload_file(
+    s3_client,
+    file_path,
+    bucket_name,
+    r2_key,
+    content_type='video/mp4',
+    content_disposition=None,
+    max_retries=4
+):
+    """
+    Robust Cloudflare R2 file uploader with TransferConfig chunk tuning,
+    adaptive timeouts, exponential backoff retries, and streaming fallback
+    so large 10-15 minute videos never fail with ReadTimeoutError.
+    """
+    if not os.path.exists(file_path):
+        raise FileNotFoundError(f"File not found for R2 upload: {file_path}")
+
+    f_size = os.path.getsize(file_path)
+    extra_args = {'ContentType': content_type}
+    if content_disposition:
+        extra_args['ContentDisposition'] = content_disposition
+
+    # 10MB chunk size avoids large single-request stalls on high-latency links
+    transfer_config = TransferConfig(
+        multipart_threshold=10 * 1024 * 1024,
+        max_concurrency=4,
+        multipart_chunksize=10 * 1024 * 1024,
+        use_threads=True
+    )
+
+    last_err = None
+    for attempt in range(1, max_retries + 1):
+        try:
+            print(f"Uploading {file_path} ({f_size:,} bytes) to R2 '{bucket_name}/{r2_key}' (attempt {attempt}/{max_retries})...")
+            s3_client.upload_file(
+                file_path,
+                bucket_name,
+                r2_key,
+                ExtraArgs=extra_args,
+                Config=transfer_config
+            )
+            s3_client.head_object(Bucket=bucket_name, Key=r2_key)
+            print(f"Successfully uploaded and verified {r2_key} on R2.")
+            return True
+        except Exception as e:
+            last_err = e
+            print(f"R2 upload attempt {attempt} warning ({type(e).__name__}: {e}).")
+            if attempt < max_retries:
+                sleep_sec = 2.0 * (2 ** (attempt - 1))
+                print(f"Retrying R2 upload in {sleep_sec:.1f}s...")
+                time.sleep(sleep_sec)
+
+    # Fallback to streaming put_object
+    try:
+        print(f"Attempting direct stream put_object fallback for {r2_key}...")
+        put_kwargs = {
+            'Bucket': bucket_name,
+            'Key': r2_key,
+            'ContentType': content_type
+        }
+        if content_disposition:
+            put_kwargs['ContentDisposition'] = content_disposition
+        with open(file_path, 'rb') as fp:
+            put_kwargs['Body'] = fp
+            s3_client.put_object(**put_kwargs)
+        s3_client.head_object(Bucket=bucket_name, Key=r2_key)
+        print(f"Fallback put_object succeeded for {r2_key}.")
+        return True
+    except Exception as fallback_err:
+        raise Exception(f"Failed to upload {file_path} to R2 after {max_retries} attempts and fallback: {last_err} | {fallback_err}")
+
+def check_r2_file_exists(s3_client, bucket_name, key):
+    if not s3_client or not bucket_name or not key:
+        return False
+    try:
+        res = s3_client.head_object(Bucket=bucket_name, Key=key)
+        return res.get('ContentLength', 0) > 1024
+    except Exception:
+        return False
+
+def compute_timeline_hash(blocks_list, tts_engine, voice_ref_url, avatar_url, visual_template, visual_blueprint, aspect_ratio):
+    import hashlib
+    payload = {
+        "blocks": [
+            {
+                "idx": b.get("block_index", i),
+                "script": str(b.get("spoken_script") or "").strip(),
+                "notes": [str(n).strip() for n in (b.get("slide_notes") or []) if str(n).strip()],
+                "title": str(b.get("slide_title") or "").strip(),
+                "flag": str(b.get("flag_type") or "").strip(),
+                "style": str(b.get("delivery_style") or b.get("voice_style") or "").strip(),
+                "pitch": str(b.get("pitch") or "").strip(),
+                "vol": str(b.get("volume") or "").strip()
+            }
+            for i, b in enumerate(blocks_list or [])
+        ],
+        "engine": str(tts_engine),
+        "voice": str(voice_ref_url or ""),
+        "avatar": str(avatar_url or ""),
+        "tpl": str(visual_template),
+        "bp": str(visual_blueprint),
+        "ar": str(aspect_ratio)
+    }
+    raw_json = json.dumps(payload, sort_keys=True, separators=(",", ":"))
+    return hashlib.sha256(raw_json.encode("utf-8")).hexdigest()[:16]
 
 def run_ffmpeg(cmd, desc="FFmpeg command"):
     use_shell = isinstance(cmd, str)
@@ -2024,20 +2137,28 @@ def build_youtube_seo_package(lesson_title, synthesized_blocks, presenter_name="
 def _build_active_karaoke_line_ass(safe_text, phrase_duration_sec):
     """
     Builds a word-by-word active-highlight ASS Karaoke line using `{\\kf<centiseconds>}` tags.
-    In ASS karaoke:
-      - `PrimaryColour` is the ACTIVE / SPOKEN highlight color (Vibrant Gold/Cyan)
-      - `SecondaryColour` is the UNSPOKEN upcoming word color (Crisp White)
-    Each word smoothly sweeps from Crisp White to Vibrant Gold/Cyan at the exact
-    centisecond the teacher speaks it!
+    Word duration is weighted by phonetic syllable structure (vowels, consonant clusters,
+    and trailing clause/sentence punctuation pauses) so words sweep in exact sync with spoken cadence.
     """
     words = [w for w in safe_text.split() if w.strip()]
     if not words:
         return safe_text
 
     total_cs = max(20, int(round(phrase_duration_sec * 100.0)))
-    char_weights = [max(2, len(re.sub(r'[^A-Za-z0-9]', '', w)) + (2 if w.endswith((',', '.', ';', '!', '?')) else 0)) for w in words]
-    sum_w = float(max(1, sum(char_weights)))
+    char_weights = []
+    for w in words:
+        wl = w.lower()
+        vowels = len(re.findall(r'[aeiouy]', wl))
+        letters = len(re.sub(r'[^A-Za-z0-9]', '', wl))
+        pause_bonus = 0.0
+        if w.endswith((',', ';', ':', '--')):
+            pause_bonus = 1.8
+        elif w.endswith(('.', '!', '?')):
+            pause_bonus = 3.2
+        w_score = max(1.5, vowels * 1.5 + letters * 0.4 + pause_bonus)
+        char_weights.append(w_score)
 
+    sum_w = float(max(1.0, sum(char_weights)))
     k_tokens = []
     allocated = 0
     for idx, w in enumerate(words):
@@ -2054,6 +2175,117 @@ def _build_active_karaoke_line_ass(safe_text, phrase_duration_sec):
     return " ".join(k_tokens)
 
 
+def _detect_acoustic_phrase_boundaries(wav_data, sr, phrases):
+    """
+    Precisely aligns N lyric phrases to the actual acoustic speech energy envelope
+    in `wav_data`. Detects leading silence (onset), pauses between clauses/sentences,
+    and trailing silence (offset) so subtitles light up and transition in exact realtime
+    with the teacher's voice.
+    """
+    total_dur = max(0.5, len(wav_data) / float(sr))
+    num_phrases = len(phrases)
+    if num_phrases == 0:
+        return []
+    if num_phrases == 1:
+        abs_w = np.abs(wav_data)
+        peak = float(np.max(abs_w)) if len(abs_w) > 0 else 0.0
+        if peak < 0.01:
+            return [(0.0, total_dur)]
+        thresh = peak * 0.08
+        active = np.where(abs_w > thresh)[0]
+        st = max(0.0, float(active[0]) / float(sr) - 0.06)
+        et = min(total_dur, float(active[-1]) / float(sr) + 0.12)
+        return [(round(st, 3), round(et, 3))]
+
+    frame_len = int(0.025 * sr)
+    hop_len = int(0.010 * sr)
+    n_frames = max(1, (len(wav_data) - frame_len) // hop_len + 1)
+
+    rms = np.zeros(n_frames, dtype=np.float32)
+    for i in range(n_frames):
+        s_idx = i * hop_len
+        rms[i] = np.sqrt(np.mean(wav_data[s_idx:s_idx + frame_len] ** 2))
+
+    kernel_size = 14
+    if len(rms) > kernel_size:
+        kernel = np.ones(kernel_size) / float(kernel_size)
+        smooth = np.convolve(rms, kernel, mode='same')
+    else:
+        smooth = rms
+
+    peak = float(np.max(smooth)) if len(smooth) > 0 else 1e-4
+    if peak < 0.01:
+        weights = [max(1, len(p)) for p in phrases]
+        total_w = float(sum(weights))
+        curr = 0.0
+        bounds = []
+        for w in weights:
+            d = total_dur * (w / total_w)
+            bounds.append((round(curr, 3), round(curr + d, 3)))
+            curr += d
+        return bounds
+
+    thresh = peak * 0.09
+    voiced = np.where(smooth > thresh)[0]
+    if len(voiced) == 0:
+        step = total_dur / float(num_phrases)
+        return [(round(i * step, 3), round((i + 1) * step, 3)) for i in range(num_phrases)]
+
+    g_start_f = int(voiced[0])
+    g_end_f = int(voiced[-1])
+    g_start = max(0.0, (g_start_f * hop_len) / float(sr) - 0.06)
+    g_end = min(total_dur, (g_end_f * hop_len) / float(sr) + 0.14)
+
+    weights = [max(1, len(p)) for p in phrases]
+    total_w = float(sum(weights))
+
+    minima = []
+    for f in range(g_start_f + 15, g_end_f - 15):
+        if smooth[f] < smooth[f - 1] and smooth[f] <= smooth[f + 1] and smooth[f] < (peak * 0.38):
+            minima.append((float(smooth[f]), f))
+
+    minima.sort(key=lambda x: x[0])
+
+    cum_w = np.cumsum([0.0] + weights) / total_w
+    expected_split_secs = [g_start + (g_end - g_start) * frac for frac in cum_w[1:-1]]
+
+    chosen_splits_sec = []
+    min_dist_sec = 0.85
+    for exp_s in expected_split_secs:
+        cands = [
+            (abs((f * hop_len) / float(sr) - exp_s) + val * 2.0, (f * hop_len) / float(sr))
+            for val, f in minima
+            if abs((f * hop_len) / float(sr) - exp_s) < 1.40
+        ]
+        cands.sort(key=lambda x: x[0])
+        if cands:
+            best_s = cands[0][1]
+        else:
+            best_s = exp_s
+
+        if chosen_splits_sec and (best_s - chosen_splits_sec[-1]) < min_dist_sec:
+            best_s = chosen_splits_sec[-1] + min_dist_sec
+        chosen_splits_sec.append(min(g_end - 0.3, max(g_start + 0.3, best_s)))
+
+    chosen_splits_sec.sort()
+    all_splits = [g_start] + chosen_splits_sec + [g_end]
+    windows = []
+    for i in range(num_phrases):
+        w_st = all_splits[i]
+        w_et = all_splits[i + 1]
+        st_frame = max(0, int(w_st * sr / hop_len))
+        et_frame = min(n_frames, int(w_et * sr / hop_len))
+        sub_voiced = np.where(smooth[st_frame:et_frame] > thresh)[0]
+        if len(sub_voiced) > 0:
+            actual_st = max(0.0, (st_frame + sub_voiced[0]) * hop_len / float(sr) - 0.05)
+            actual_et = min(total_dur, (st_frame + sub_voiced[-1]) * hop_len / float(sr) + 0.12)
+            if actual_et - actual_st >= 0.35:
+                windows.append((round(actual_st, 3), round(actual_et, 3)))
+                continue
+        windows.append((round(w_st, 3), round(w_et, 3)))
+    return windows
+
+
 def _format_srt_timestamp(seconds):
     seconds = max(0.0, float(seconds))
     h = int(seconds // 3600)
@@ -2068,8 +2300,8 @@ def _format_srt_timestamp(seconds):
 def create_synced_srt_subtitles(synthesized_blocks, output_srt_path):
     """
     Generates a standard YouTube-ready SubRip (.srt) Closed Caption file across
-    all blocks so viewers can toggle native YouTube [CC] captions on/off and
-    YouTube indexes 100% of the spoken lesson keywords for SEO.
+    all blocks with acoustic speech boundary alignment so captions track
+    spoken speech in exact realtime and never drift ahead during pauses.
     """
     srt_entries = []
     cue_idx = 1
@@ -2080,20 +2312,45 @@ def create_synced_srt_subtitles(synthesized_blocks, output_srt_path):
         phrases = _split_script_into_lyric_phrases(text, max_words_per_phrase=8)
         if not phrases:
             continue
-        weights = [max(1, len(p)) for p in phrases]
-        total_w = float(sum(weights))
-        curr_t = blk_start
-        for i, ph in enumerate(phrases):
-            dur = blk_dur * (weights[i] / total_w)
-            st = curr_t
-            et = (blk_start + blk_dur) if i == len(phrases) - 1 else (curr_t + dur)
-            curr_t = et
-            clean_ph = ph.replace("\n", " ").strip()
-            if clean_ph:
-                srt_entries.append(
-                    f"{cue_idx}\n{_format_srt_timestamp(st)} --> {_format_srt_timestamp(et)}\n{clean_ph}\n\n"
-                )
-                cue_idx += 1
+
+        audio_path = item.get("audio_wav")
+        windows = None
+        if audio_path and os.path.exists(audio_path):
+            try:
+                wdata, wsr = sf.read(audio_path, dtype='float32')
+                if wdata.ndim > 1:
+                    wdata = np.mean(wdata, axis=1)
+                windows = _detect_acoustic_phrase_boundaries(wdata, wsr, phrases)
+            except Exception as e:
+                print(f"SRT acoustic boundary note: {e}")
+                windows = None
+
+        if not windows or len(windows) != len(phrases):
+            weights = [max(1, len(p)) for p in phrases]
+            total_w = float(sum(weights))
+            curr_t = blk_start
+            for i, ph in enumerate(phrases):
+                dur = blk_dur * (weights[i] / total_w)
+                st = curr_t
+                et = (blk_start + blk_dur) if i == len(phrases) - 1 else (curr_t + dur)
+                curr_t = et
+                clean_ph = ph.replace("\n", " ").strip()
+                if clean_ph:
+                    srt_entries.append(
+                        f"{cue_idx}\n{_format_srt_timestamp(st)} --> {_format_srt_timestamp(et)}\n{clean_ph}\n\n"
+                    )
+                    cue_idx += 1
+        else:
+            for i, ph in enumerate(phrases):
+                w_st, w_et = windows[i]
+                st = blk_start + w_st
+                et = blk_start + w_et
+                clean_ph = ph.replace("\n", " ").strip()
+                if clean_ph:
+                    srt_entries.append(
+                        f"{cue_idx}\n{_format_srt_timestamp(st)} --> {_format_srt_timestamp(et)}\n{clean_ph}\n\n"
+                    )
+                    cue_idx += 1
 
     with open(output_srt_path, "w", encoding="utf-8") as f:
         f.write("".join(srt_entries))
@@ -2110,28 +2367,18 @@ def create_synced_lyrics_ass(
     caption_mode="full_karaoke"
 ):
     """
-    Generates word-by-word Active Karaoke Highlighted captions (.ass) according to `caption_mode`:
-      - 'full_karaoke' (Default): Displays active word-by-word karaoke captions throughout the entire
-        video, anchored cleanly in the bottom safe zone so they never collide with slide headers.
-      - 'smart_broadcast': Eliminates visual clutter by suppressing burned-in lyrics during PowerPoint
-        Slide / Chart views and only showing captions during Studio / B-Roll segments.
-      - 'slides_only': Suppresses all burned-in subtitles (relies on slides + .srt Closed Captions).
-    Returns (output_sub_path, has_dialogue_events).
+    Generates word-by-word Active Karaoke Highlighted captions (.ass) aligned
+    with the actual acoustic speech energy envelope of the teacher's voice.
     """
-    speech_onset_sec = 0.0
     try:
         wav_data, sr = sf.read(audio_wav_path, dtype='float32')
         if wav_data.ndim > 1:
             wav_data = np.mean(wav_data, axis=1)
         total_duration = max(1.0, len(wav_data) / float(max(1, sr)))
-        abs_w = np.abs(wav_data)
-        peak_w = float(np.max(abs_w)) if len(abs_w) > 0 else 0.0
-        if peak_w > 0.02:
-            active_idx = np.where(abs_w > (peak_w * 0.08))[0]
-            if len(active_idx) > 0:
-                speech_onset_sec = min(0.65, float(active_idx[0]) / float(sr))
     except Exception:
-        total_duration = 25.0
+        wav_data = np.zeros(24000 * 20, dtype=np.float32)
+        sr = 24000
+        total_duration = 20.0
 
     is_vertical = str(aspect_ratio or "16:9").strip() == "9:16"
     mode_clean = str(caption_mode or "full_karaoke").strip().lower()
@@ -2160,20 +2407,13 @@ def create_synced_lyrics_ass(
             f.write(ass_header)
         return output_sub_path, False
 
-    weights = [max(1, len(p)) for p in phrases]
-    total_weight = float(sum(weights))
-    usable_duration = max(0.5, total_duration - speech_onset_sec)
+    windows = _detect_acoustic_phrase_boundaries(wav_data, sr, phrases)
 
     events = []
-    curr_t = speech_onset_sec
     for idx, phrase in enumerate(phrases):
-        dur = usable_duration * (weights[idx] / total_weight)
-        start_t = curr_t
-        end_t = total_duration if idx == len(phrases) - 1 else (curr_t + dur)
-        curr_t = end_t
+        start_t, end_t = windows[idx] if idx < len(windows) else (0.0, total_duration)
 
         # In Smart Broadcast Mode on 16:9, suppress burned-in captions during PowerPoint Slide windows
-        # so the viewer reads the slide bullets/charts without competing bottom lyrics!
         if mode_clean == "smart_broadcast" and not is_vertical:
             mid_frac = ((start_t + end_t) * 0.5) / max(1.0, total_duration)
             if block_idx == 0:
@@ -2190,7 +2430,7 @@ def create_synced_lyrics_ass(
         karaoke_text = _build_active_karaoke_line_ass(safe_text, max(0.3, end_t - start_t))
 
         events.append(
-            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},{style_name},,0,0,0,,{{\\fad(120,110)}}{karaoke_text}\n"
+            f"Dialogue: 0,{_format_ass_timestamp(start_t)},{_format_ass_timestamp(end_t)},{style_name},,0,0,0,,{{\\fad(80,80)}}{karaoke_text}\n"
         )
 
     with open(output_sub_path, "w", encoding="utf-8") as f:
@@ -2522,6 +2762,10 @@ def handler(job):
         blocks_list = timeline_data.get('timeline') if timeline_data and 'timeline' in timeline_data else []
         total_blocks = max(1, len(blocks_list))
         start_time = time.time()
+        timeline_hash = compute_timeline_hash(
+            blocks_list, tts_engine, voice_ref_url, avatar_url, visual_template, visual_blueprint, aspect_ratio
+        )
+        print(f"Deterministic R2 Checkpoint Timeline Hash: {timeline_hash}")
 
         report_live_progress(
             job, s3_client, bucket_name, job_id,
@@ -2704,53 +2948,64 @@ def handler(job):
                 )
 
                 output_wav = f"{workspace}/audio_{idx}.wav"
-                delivery = (block.get('delivery_style') or 'normal').strip().lower()
-                eff_style = delivery if delivery != 'normal' else voice_style
-                blk_whisper = True if eff_style == 'whisper' else global_whisper
-                if eff_style == 'slow':
-                    blk_speed = global_speed * 0.84
-                elif eff_style == 'fast':
-                    blk_speed = global_speed * 1.18
-                elif eff_style == 'documentary':
-                    blk_speed = global_speed * 0.95 if abs(global_speed - 1.0) < 0.03 else global_speed
-                else:
-                    blk_speed = global_speed
+                cp_audio_key = f"checkpoints/{timeline_hash}/audio_{idx}.wav"
+                cached_audio_found = check_r2_file_exists(s3_client, bucket_name, cp_audio_key)
 
-                blk_pitch_raw = block.get('pitch')
-                if blk_pitch_raw is not None and str(blk_pitch_raw).strip() not in ('', 'default', 'null', 'None'):
-                    try:
-                        eff_pitch = float(blk_pitch_raw)
-                    except Exception:
+                if cached_audio_found:
+                    print(f"R2 Audio Checkpoint HIT: Reusing audio for block {idx_counter+1}/{total_blocks} ({cp_audio_key})")
+                    s3_client.download_file(bucket_name, cp_audio_key, output_wav)
+                else:
+                    delivery = (block.get('delivery_style') or 'normal').strip().lower()
+                    eff_style = delivery if delivery != 'normal' else voice_style
+                    blk_whisper = True if eff_style == 'whisper' else global_whisper
+                    if eff_style == 'slow':
+                        blk_speed = global_speed * 0.84
+                    elif eff_style == 'fast':
+                        blk_speed = global_speed * 1.18
+                    elif eff_style == 'documentary':
+                        blk_speed = global_speed * 0.95 if abs(global_speed - 1.0) < 0.03 else global_speed
+                    else:
+                        blk_speed = global_speed
+
+                    blk_pitch_raw = block.get('pitch')
+                    if blk_pitch_raw is not None and str(blk_pitch_raw).strip() not in ('', 'default', 'null', 'None'):
+                        try:
+                            eff_pitch = float(blk_pitch_raw)
+                        except Exception:
+                            eff_pitch = global_pitch
+                    else:
                         eff_pitch = global_pitch
-                else:
-                    eff_pitch = global_pitch
 
-                blk_vol_raw = block.get('volume')
-                if blk_vol_raw is not None and str(blk_vol_raw).strip() not in ('', 'default', 'null', 'None'):
-                    try:
-                        eff_volume = float(blk_vol_raw)
-                    except Exception:
+                    blk_vol_raw = block.get('volume')
+                    if blk_vol_raw is not None and str(blk_vol_raw).strip() not in ('', 'default', 'null', 'None'):
+                        try:
+                            eff_volume = float(blk_vol_raw)
+                        except Exception:
+                            eff_volume = global_volume
+                    else:
                         eff_volume = global_volume
-                else:
-                    eff_volume = global_volume
 
-                synthesize_block_audio_with_pauses(
-                    text=text,
-                    output_wav=output_wav,
-                    tts_engine=tts_engine,
-                    target_lang=target_lang,
-                    edge_voice=edge_voice,
-                    omnivoice_prompt=omnivoice_prompt,
-                    moss_ref_codes=moss_ref_codes,
-                    ref_voice_path=ref_voice_path,
-                    voice_ref_text=voice_ref_text,
-                    workspace=workspace,
-                    whisper_mode=blk_whisper,
-                    speed_val=blk_speed,
-                    pitch_val=eff_pitch,
-                    volume_val=eff_volume,
-                    voice_style=eff_style
-                )
+                    synthesize_block_audio_with_pauses(
+                        text=text,
+                        output_wav=output_wav,
+                        tts_engine=tts_engine,
+                        target_lang=target_lang,
+                        edge_voice=edge_voice,
+                        omnivoice_prompt=omnivoice_prompt,
+                        moss_ref_codes=moss_ref_codes,
+                        ref_voice_path=ref_voice_path,
+                        voice_ref_text=voice_ref_text,
+                        workspace=workspace,
+                        whisper_mode=blk_whisper,
+                        speed_val=blk_speed,
+                        pitch_val=eff_pitch,
+                        volume_val=eff_volume,
+                        voice_style=eff_style
+                    )
+                    try:
+                        robust_s3_upload_file(s3_client, output_wav, bucket_name, cp_audio_key, content_type='audio/wav')
+                    except Exception as cp_err:
+                        print(f"Audio checkpoint upload note: {cp_err}")
 
                 try:
                     blk_dur = max(1.0, float(sf.info(output_wav).duration))
@@ -2945,73 +3200,90 @@ def handler(job):
                 elif synthesized_ai_clips:
                     pexels_clips = (pexels_clips + synthesized_ai_clips)[:2]
 
-            report_live_progress(
-                job, s3_client, bucket_name, job_id,
-                step=f"Block {idx_counter+1}/{total_blocks}: Running Wav2Lip-GAN neural lip-sync & multi-scene compositor...",
-                percent=int(blk_base_pct + blk_span_pct * 0.28),
-                time_left_sec=max(5, int(time_left_blk * 0.72))
-            )
-
-            def _make_block_progress_cb(b_idx_human, b_base, b_span, b_rem):
-                def _cb(sub_frac, sub_msg):
-                    sub_pct = int(b_base + b_span * (0.28 + float(sub_frac) * 0.68))
-                    sub_rem = max(4, int(b_rem * (1.0 - float(sub_frac) * 0.75)))
-                    report_live_progress(
-                        job, s3_client, bucket_name, job_id,
-                        step=f"Block {b_idx_human}/{total_blocks}: {sub_msg}",
-                        percent=sub_pct,
-                        time_left_sec=sub_rem
-                    )
-                return _cb
-
-            # Prepare captions before block muxing so subtitles burn in a SINGLE FFmpeg pass!
-            lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
-            _, has_ass_events = create_synced_lyrics_ass(
-                text,
-                output_wav,
-                lyrics_ass,
-                block_idx=idx_counter,
-                total_blocks=total_blocks,
-                aspect_ratio=aspect_ratio,
-                caption_mode=caption_mode
-            )
+            cp_video_key = f"checkpoints/{timeline_hash}/block_{idx}_v66.mp4"
             final_chunk = f"{workspace}/final_chunk_{idx}.mp4"
-            tutorial_url = block.get('tutorial_url') or ''
-            tutorial_step = block.get('tutorial_step') or (idx_counter + 1)
-            tutorial_action = block.get('tutorial_action') or ''
-            flag_type = block.get('flag_type') or 'auto'
+            cached_video_found = check_r2_file_exists(s3_client, bucket_name, cp_video_key)
 
-            render_dynamic_lesson_block(
-                raw_avatar_path=raw_avatar_path,
-                audio_wav_path=output_wav,
-                output_mp4_path=final_chunk,
-                lesson_title=lesson_title,
-                slide_title=slide_title,
-                slide_notes=notes,
-                cf_images=[cf_img_1, cf_img_2, cf_img_3],
-                pexels_video_clips=pexels_clips,
-                block_idx=idx_counter,
-                total_blocks=total_blocks,
-                block_start_sec=blk_start_sec,
-                total_video_duration_sec=total_video_duration_sec,
-                visual_blueprint=visual_blueprint,
-                visual_template=visual_template,
-                chart_data=chart_data,
-                presenter_name=presenter_name,
-                channel_name=channel_name,
-                aspect_ratio=aspect_ratio,
-                logo_path=raw_logo_path,
-                logo_position=logo_position,
-                fps=24,
-                device=device,
-                run_ffmpeg_fn=run_ffmpeg,
-                progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk),
-                ass_subtitle_path=(lyrics_ass if has_ass_events else None),
-                tutorial_url=tutorial_url,
-                tutorial_step=tutorial_step,
-                tutorial_action=tutorial_action,
-                flag_type=flag_type
-            )
+            if cached_video_found:
+                print(f"R2 Video Checkpoint HIT: Reusing block {idx_counter+1}/{total_blocks} ({cp_video_key})")
+                report_live_progress(
+                    job, s3_client, bucket_name, job_id,
+                    step=f"Block {idx_counter+1}/{total_blocks}: [Checkpoint Cache Hit] Reusing completed block from Cloud Studio...",
+                    percent=int(blk_base_pct + blk_span_pct * 0.95),
+                    time_left_sec=max(2, int(time_left_blk * 0.15))
+                )
+                s3_client.download_file(bucket_name, cp_video_key, final_chunk)
+            else:
+                report_live_progress(
+                    job, s3_client, bucket_name, job_id,
+                    step=f"Block {idx_counter+1}/{total_blocks}: Running Wav2Lip-GAN neural lip-sync & multi-scene compositor...",
+                    percent=int(blk_base_pct + blk_span_pct * 0.28),
+                    time_left_sec=max(5, int(time_left_blk * 0.72))
+                )
+
+                def _make_block_progress_cb(b_idx_human, b_base, b_span, b_rem):
+                    def _cb(sub_frac, sub_msg):
+                        sub_pct = int(b_base + b_span * (0.28 + float(sub_frac) * 0.68))
+                        sub_rem = max(4, int(b_rem * (1.0 - float(sub_frac) * 0.75)))
+                        report_live_progress(
+                            job, s3_client, bucket_name, job_id,
+                            step=f"Block {b_idx_human}/{total_blocks}: {sub_msg}",
+                            percent=sub_pct,
+                            time_left_sec=sub_rem
+                        )
+                    return _cb
+
+                # Prepare captions before block muxing so subtitles burn in a SINGLE FFmpeg pass!
+                lyrics_ass = f"{workspace}/lyrics_{idx}.ass"
+                _, has_ass_events = create_synced_lyrics_ass(
+                    text,
+                    output_wav,
+                    lyrics_ass,
+                    block_idx=idx_counter,
+                    total_blocks=total_blocks,
+                    aspect_ratio=aspect_ratio,
+                    caption_mode=caption_mode
+                )
+                tutorial_url = block.get('tutorial_url') or ''
+                tutorial_step = block.get('tutorial_step') or (idx_counter + 1)
+                tutorial_action = block.get('tutorial_action') or ''
+                flag_type = block.get('flag_type') or 'auto'
+
+                render_dynamic_lesson_block(
+                    raw_avatar_path=raw_avatar_path,
+                    audio_wav_path=output_wav,
+                    output_mp4_path=final_chunk,
+                    lesson_title=lesson_title,
+                    slide_title=slide_title,
+                    slide_notes=notes,
+                    cf_images=[cf_img_1, cf_img_2, cf_img_3],
+                    pexels_video_clips=pexels_clips,
+                    block_idx=idx_counter,
+                    total_blocks=total_blocks,
+                    block_start_sec=blk_start_sec,
+                    total_video_duration_sec=total_video_duration_sec,
+                    visual_blueprint=visual_blueprint,
+                    visual_template=visual_template,
+                    chart_data=chart_data,
+                    presenter_name=presenter_name,
+                    channel_name=channel_name,
+                    aspect_ratio=aspect_ratio,
+                    logo_path=raw_logo_path,
+                    logo_position=logo_position,
+                    fps=24,
+                    device=device,
+                    run_ffmpeg_fn=run_ffmpeg,
+                    progress_cb=_make_block_progress_cb(idx_counter + 1, blk_base_pct, blk_span_pct, time_left_blk),
+                    ass_subtitle_path=(lyrics_ass if has_ass_events else None),
+                    tutorial_url=tutorial_url,
+                    tutorial_step=tutorial_step,
+                    tutorial_action=tutorial_action,
+                    flag_type=flag_type
+                )
+                try:
+                    robust_s3_upload_file(s3_client, final_chunk, bucket_name, cp_video_key, content_type='video/mp4')
+                except Exception as cp_err:
+                    print(f"Video checkpoint upload note: {cp_err}")
 
             # Immediately purge per-block temporary media files so /tmp never fills up on long 10-minute videos!
             for temp_f in [lyrics_ass, cf_img_1, cf_img_2, cf_img_3] + list(pexels_clips or []) + list(synthesized_ai_clips or []):
@@ -3108,14 +3380,13 @@ def handler(job):
             if os.path.exists(srt_local) and os.path.getsize(srt_local) > 4:
                 srt_r2_key = f"outputs/{job_id}/{srt_filename}"
                 srt_disp = f'attachment; filename="{srt_filename}"'
-                s3_client.upload_file(
-                    srt_local,
-                    bucket_name,
-                    srt_r2_key,
-                    ExtraArgs={
-                        'ContentType': 'text/plain; charset=utf-8',
-                        'ContentDisposition': srt_disp
-                    }
+                robust_s3_upload_file(
+                    s3_client=s3_client,
+                    file_path=srt_local,
+                    bucket_name=bucket_name,
+                    r2_key=srt_r2_key,
+                    content_type='text/plain; charset=utf-8',
+                    content_disposition=srt_disp
                 )
                 srt_url = s3_client.generate_presigned_url(
                     'get_object',
@@ -3149,14 +3420,13 @@ def handler(job):
             if os.path.exists(thumb_local):
                 thumb_r2_key = f"outputs/{job_id}/{thumbnail_filename}"
                 thumb_disp = f'attachment; filename="{thumbnail_filename}"'
-                s3_client.upload_file(
-                    thumb_local,
-                    bucket_name,
-                    thumb_r2_key,
-                    ExtraArgs={
-                        'ContentType': 'image/jpeg',
-                        'ContentDisposition': thumb_disp
-                    }
+                robust_s3_upload_file(
+                    s3_client=s3_client,
+                    file_path=thumb_local,
+                    bucket_name=bucket_name,
+                    r2_key=thumb_r2_key,
+                    content_type='image/jpeg',
+                    content_disposition=thumb_disp
                 )
                 thumbnail_url = s3_client.generate_presigned_url(
                     'get_object',
@@ -3180,14 +3450,14 @@ def handler(job):
 
         content_disp = f'attachment; filename="{download_filename}"'
         print(f"Uploading {master_file} to R2 bucket {bucket_name} as {r2_key} (filename={download_filename})...")
-        s3_client.upload_file(
-            master_file,
-            bucket_name,
-            r2_key,
-            ExtraArgs={
-                'ContentType': content_type,
-                'ContentDisposition': content_disp
-            }
+        robust_s3_upload_file(
+            s3_client=s3_client,
+            file_path=master_file,
+            bucket_name=bucket_name,
+            r2_key=r2_key,
+            content_type=content_type,
+            content_disposition=content_disp,
+            max_retries=5
         )
 
         try:
