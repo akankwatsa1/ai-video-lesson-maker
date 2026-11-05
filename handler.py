@@ -2549,23 +2549,51 @@ def publish_video_to_youtube_cloud(
         if not upload_url:
             return {"error": "YouTube API did not return a resumable Location header."}
 
+        chunk_size = 10 * 1024 * 1024  # 10 MB (40 * 256 KB) resumable chunks
+        video_id = ""
         with open(video_path, "rb") as vf:
-            up_resp = requests.put(
-                upload_url,
-                headers={
-                    "Authorization": f"Bearer {access_token}",
-                    "Content-Type": "video/mp4",
-                    "Content-Length": str(file_size),
-                },
-                data=vf,
-                timeout=600
-            )
-        if up_resp.status_code not in (200, 201):
-            print(f"YouTube video upload failed HTTP {up_resp.status_code}: {up_resp.text[:250]}")
-            return {"error": f"YouTube video transfer HTTP {up_resp.status_code}"}
+            offset = 0
+            while offset < file_size:
+                vf.seek(offset)
+                chunk_data = vf.read(chunk_size)
+                if not chunk_data:
+                    break
+                end_byte = offset + len(chunk_data) - 1
+                chunk_ok = False
+                for attempt in range(4):
+                    try:
+                        up_resp = requests.put(
+                            upload_url,
+                            headers={
+                                "Authorization": f"Bearer {access_token}",
+                                "Content-Type": "video/mp4",
+                                "Content-Length": str(len(chunk_data)),
+                                "Content-Range": f"bytes {offset}-{end_byte}/{file_size}",
+                            },
+                            data=chunk_data,
+                            timeout=180,
+                            allow_redirects=False
+                        )
+                        if up_resp.status_code == 308:
+                            rng = up_resp.headers.get("Range", "")
+                            m_rng = re.search(r"bytes=0-(\d+)", rng)
+                            offset = (int(m_rng.group(1)) + 1) if m_rng else (end_byte + 1)
+                            chunk_ok = True
+                            break
+                        elif up_resp.status_code in (200, 201):
+                            vid_json = up_resp.json() or {}
+                            video_id = vid_json.get("id", "")
+                            offset = file_size
+                            chunk_ok = True
+                            break
+                        else:
+                            print(f"YouTube chunk ({offset}-{end_byte}) HTTP {up_resp.status_code}, retrying...")
+                    except Exception as ch_e:
+                        print(f"YouTube chunk ({offset}-{end_byte}) exception on attempt {attempt+1}: {ch_e}")
+                    time.sleep(1.5 * (attempt + 1))
+                if not chunk_ok:
+                    return {"error": f"YouTube resumable chunk upload failed at byte {offset}"}
 
-        vid_json = up_resp.json() or {}
-        video_id = vid_json.get("id")
         if not video_id:
             return {"error": "YouTube upload completed without a video ID."}
 
