@@ -3277,6 +3277,37 @@ def handler(job):
                 tutorial_action = block.get('tutorial_action') or ''
                 flag_type = block.get('flag_type') or 'auto'
 
+                step_image_url = block.get('step_image') or ''
+                step_video_url = block.get('step_video') or ''
+                step_image_file = None
+                if step_image_url and isinstance(step_image_url, str) and step_image_url.startswith("http"):
+                    local_img_cand = f"{workspace}/step_img_{idx}.png"
+                    try:
+                        r_simg = requests.get(step_image_url, headers=HTTP_HEADERS, timeout=20)
+                        if r_simg.status_code == 200 and len(r_simg.content) > 1000:
+                            with open(local_img_cand, "wb") as f_out:
+                                f_out.write(r_simg.content)
+                            step_image_file = local_img_cand
+                            print(f"Downloaded step {idx_counter+1} custom image ({len(r_simg.content)} bytes)")
+                    except Exception as e_simg:
+                        print(f"Warning: Could not download step_image: {e_simg}")
+
+                step_video_file = None
+                if step_video_url and isinstance(step_video_url, str) and step_video_url.startswith("http"):
+                    local_vid_cand = f"{workspace}/step_vid_{idx}.mp4"
+                    try:
+                        r_svid = requests.get(step_video_url, headers=HTTP_HEADERS, stream=True, timeout=60)
+                        if r_svid.status_code == 200:
+                            with open(local_vid_cand, "wb") as f_out:
+                                for chunk in r_svid.iter_content(chunk_size=1024 * 512):
+                                    if chunk:
+                                        f_out.write(chunk)
+                            if os.path.exists(local_vid_cand) and os.path.getsize(local_vid_cand) > 5000:
+                                step_video_file = local_vid_cand
+                                print(f"Downloaded step {idx_counter+1} custom walkthrough video ({os.path.getsize(local_vid_cand)} bytes)")
+                    except Exception as e_svid:
+                        print(f"Warning: Could not download step_video: {e_svid}")
+
                 render_dynamic_lesson_block(
                     raw_avatar_path=raw_avatar_path,
                     audio_wav_path=output_wav,
@@ -3306,7 +3337,9 @@ def handler(job):
                     tutorial_url=tutorial_url,
                     tutorial_step=tutorial_step,
                     tutorial_action=tutorial_action,
-                    flag_type=flag_type
+                    flag_type=flag_type,
+                    step_image_path=step_image_file,
+                    step_video_path=step_video_file
                 )
                 try:
                     robust_s3_upload_file(s3_client, final_chunk, bucket_name, cp_video_key, content_type='video/mp4')
@@ -3314,7 +3347,7 @@ def handler(job):
                     print(f"Video checkpoint upload note: {cp_err}")
 
             # Immediately purge per-block temporary media files so /tmp never fills up on long 10-minute videos!
-            for temp_f in [lyrics_ass, cf_img_1, cf_img_2, cf_img_3] + list(pexels_clips or []) + list(synthesized_ai_clips or []):
+            for temp_f in [lyrics_ass, cf_img_1, cf_img_2, cf_img_3, step_image_file, step_video_file] + list(pexels_clips or []) + list(synthesized_ai_clips or []):
                 if temp_f and temp_f != hero_thumbnail_bg_img and os.path.exists(temp_f):
                     try:
                         os.remove(temp_f)
